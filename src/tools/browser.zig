@@ -82,6 +82,17 @@ pub const BrowserTool = struct {
             return ToolResult.fail("Only https:// URLs are supported for security");
         }
 
+        // Block shell metacharacters in URL to prevent command injection via
+        // cmd.exe /c start (Windows) or shell interpretation.
+        for (url) |c| {
+            if (c == '&' or c == '|' or c == ';' or c == '"' or c == '\'' or
+                c == '<' or c == '>' or c == '`' or c == '(' or c == ')' or
+                c == '^' or c == '%' or c == '!' or c == '\n' or c == '\r')
+            {
+                return ToolResult.fail("URL contains shell metacharacters — open manually for safety");
+            }
+        }
+
         // In test mode, skip actual browser spawn to avoid opening windows during CI/tests.
         if (builtin.is_test) {
             const msg = try std.fmt.allocPrint(allocator, "Opened {s} in system browser", .{url});
@@ -321,4 +332,22 @@ test "browser tool execute with empty json" {
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
+}
+
+test "browser open rejects URL with shell metacharacters" {
+    var bt = BrowserTool{};
+    const t = bt.tool();
+
+    // & can chain commands in cmd.exe
+    const p1 = try root.parseTestArgs("{\"action\": \"open\", \"url\": \"https://example.com&whoami\"}");
+    defer p1.deinit();
+    const r1 = try t.execute(std.testing.allocator, p1.value.object);
+    try std.testing.expect(!r1.success);
+    try std.testing.expect(std.mem.indexOf(u8, r1.error_msg.?, "metacharacter") != null);
+
+    // | can pipe in cmd.exe
+    const p2 = try root.parseTestArgs("{\"action\": \"open\", \"url\": \"https://example.com|calc\"}");
+    defer p2.deinit();
+    const r2 = try t.execute(std.testing.allocator, p2.value.object);
+    try std.testing.expect(!r2.success);
 }

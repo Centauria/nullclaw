@@ -7,8 +7,8 @@ const JsonObjectMap = root.JsonObjectMap;
 /// Default maximum file size to read for editing (10MB).
 const DEFAULT_MAX_FILE_SIZE: usize = 10 * 1024 * 1024;
 
-/// System-critical prefixes — always blocked even if they match allowed_paths.
-pub const SYSTEM_BLOCKED_PREFIXES = [_][]const u8{
+/// System-critical prefixes (Unix) — always blocked even if they match allowed_paths.
+const SYSTEM_BLOCKED_PREFIXES_UNIX = [_][]const u8{
     "/System",
     "/Library",
     "/bin",
@@ -25,6 +25,22 @@ pub const SYSTEM_BLOCKED_PREFIXES = [_][]const u8{
     "/proc",
     "/sys",
 };
+
+/// System-critical prefixes (Windows).
+const SYSTEM_BLOCKED_PREFIXES_WINDOWS = [_][]const u8{
+    "C:\\Windows",
+    "C:\\Program Files",
+    "C:\\Program Files (x86)",
+    "C:\\ProgramData",
+    "C:\\System32",
+    "C:\\Recovery",
+};
+
+/// Platform-selected system blocked prefixes.
+pub const SYSTEM_BLOCKED_PREFIXES: []const []const u8 = if (@import("builtin").os.tag == .windows)
+    &SYSTEM_BLOCKED_PREFIXES_WINDOWS
+else
+    &SYSTEM_BLOCKED_PREFIXES_UNIX;
 
 /// Check whether a directory-style prefix matches (exact or followed by a path separator).
 fn pathStartsWith(path: []const u8, prefix: []const u8) bool {
@@ -45,7 +61,7 @@ pub fn isResolvedPathAllowed(
     allowed_paths: []const []const u8,
 ) bool {
     // 1. System blocklist
-    for (&SYSTEM_BLOCKED_PREFIXES) |prefix| {
+    for (SYSTEM_BLOCKED_PREFIXES) |prefix| {
         if (pathStartsWith(resolved, prefix)) return false;
     }
     // 2. Workspace
