@@ -485,6 +485,47 @@ pub const CodexSseResult = union(enum) {
     skip: void,
 };
 
+fn appendResponseContentText(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, content_val: std.json.Value) !void {
+    if (content_val != .array) return;
+    for (content_val.array.items) |part| {
+        if (part != .object) continue;
+        const part_obj = part.object;
+        const type_val = part_obj.get("type") orelse continue;
+        if (type_val != .string) continue;
+        if (!std.mem.eql(u8, type_val.string, "output_text") and
+            !std.mem.eql(u8, type_val.string, "text"))
+        {
+            continue;
+        }
+        const text_val = part_obj.get("text") orelse continue;
+        if (text_val != .string or text_val.string.len == 0) continue;
+        try out.appendSlice(allocator, text_val.string);
+    }
+}
+
+fn extractCompletedText(allocator: std.mem.Allocator, root_obj: std.json.ObjectMap) !?[]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    const response_val = root_obj.get("response");
+    const output_val: ?std.json.Value = if (response_val) |resp| blk: {
+        if (resp != .object) break :blk null;
+        break :blk resp.object.get("output");
+    } else root_obj.get("output");
+
+    if (output_val == null or output_val.? != .array) return null;
+    for (output_val.?.array.items) |item| {
+        if (item != .object) continue;
+        const item_obj = item.object;
+        if (item_obj.get("content")) |content_val| {
+            try appendResponseContentText(&out, allocator, content_val);
+        }
+    }
+
+    if (out.items.len == 0) return null;
+    return try out.toOwnedSlice(allocator);
+}
+
 /// Parse a single Codex SSE event line.
 ///
 /// Codex SSE format: `event: <type>\ndata: {JSON}`
@@ -534,10 +575,31 @@ pub fn parseCodexSseEvent(allocator: std.mem.Allocator, line: []const u8) !Codex
         return .{ .delta = try allocator.dupe(u8, delta_str) };
     }
 
-    if (std.mem.eql(u8, type_str, "response.output_text.done") or
-        std.mem.eql(u8, type_str, "response.completed") or
+    if (std.mem.eql(u8, type_str, "response.refusal.delta")) {
+        const delta_val = obj.get("delta") orelse return .skip;
+        const delta_str = switch (delta_val) {
+            .string => |s| s,
+            else => return .skip,
+        };
+        if (delta_str.len == 0) return .skip;
+        return .{ .delta = try allocator.dupe(u8, delta_str) };
+    }
+
+    if (std.mem.eql(u8, type_str, "response.output_text.done")) {
+        if (obj.get("text")) |text_val| {
+            if (text_val == .string and text_val.string.len > 0) {
+                return .{ .delta = try allocator.dupe(u8, text_val.string) };
+            }
+        }
+        return .done;
+    }
+
+    if (std.mem.eql(u8, type_str, "response.completed") or
         std.mem.eql(u8, type_str, "response.done"))
     {
+        if (try extractCompletedText(allocator, obj)) |text| {
+            return .{ .delta = text };
+        }
         return .done;
     }
 
@@ -858,6 +920,44 @@ test "parseCodexSseEvent done event" {
     const line = "data: {\"type\":\"response.completed\"}";
     const result = try parseCodexSseEvent(std.testing.allocator, line);
     try std.testing.expect(result == .done);
+}
+
+test "parseCodexSseEvent output_text.done with text emits delta" {
+    const line = "data: {\"type\":\"response.output_text.done\",\"text\":\"Final answer\"}";
+    const result = try parseCodexSseEvent(std.testing.allocator, line);
+    switch (result) {
+        .delta => |text| {
+            defer std.testing.allocator.free(text);
+            try std.testing.expectEqualStrings("Final answer", text);
+        },
+        else => return error.UnexpectedResult,
+    }
+}
+
+test "parseCodexSseEvent response.completed extracts text from response output" {
+    const line =
+        \\data: {"type":"response.completed","response":{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Hello from completed"}]}]}}
+    ;
+    const result = try parseCodexSseEvent(std.testing.allocator, line);
+    switch (result) {
+        .delta => |text| {
+            defer std.testing.allocator.free(text);
+            try std.testing.expectEqualStrings("Hello from completed", text);
+        },
+        else => return error.UnexpectedResult,
+    }
+}
+
+test "parseCodexSseEvent response.refusal.delta emits delta" {
+    const line = "data: {\"type\":\"response.refusal.delta\",\"delta\":\"Cannot do that\"}";
+    const result = try parseCodexSseEvent(std.testing.allocator, line);
+    switch (result) {
+        .delta => |text| {
+            defer std.testing.allocator.free(text);
+            try std.testing.expectEqualStrings("Cannot do that", text);
+        },
+        else => return error.UnexpectedResult,
+    }
 }
 
 test "parseCodexSseEvent error event" {
