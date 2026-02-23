@@ -83,7 +83,7 @@ pub fn isContextExhaustedText(text: []const u8) bool {
         return true;
     }
 
-    return containsAsciiFold(text, "413");
+    return containsAsciiFold(text, "413") and containsAsciiFold(text, "too large");
 }
 
 fn parseStatusCode(value: std.json.Value) ?u16 {
@@ -128,6 +128,9 @@ fn classifyFromFields(
 /// Anthropic, and Gemini APIs.
 pub fn classifyErrorObject(root_obj: anytype) ?ApiErrorKind {
     const err_value = root_obj.get("error") orelse return null;
+    if (err_value == .string) {
+        return classifyFromFields(null, null, null, err_value.string);
+    }
     if (err_value != .object) return .other;
     const err_obj = err_value.object;
 
@@ -201,7 +204,6 @@ fn classifyTopLevelError(root_obj: anytype) ?ApiErrorKind {
     if (root_obj.get("message")) |v| {
         if (v == .string) {
             message = v.string;
-            has_error_signal = true;
         }
     }
 

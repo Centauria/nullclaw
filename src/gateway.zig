@@ -1997,6 +1997,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     var session_mgr_opt: ?session_mod.SessionManager = null;
     var tools_slice: []const tools_mod.Tool = &.{};
     var mem_opt: ?memory_mod.Memory = null;
+    var noop_obs_gateway = observability.NoopObserver{};
 
     if (config_opt) |cfg_ptr| {
         const cfg = cfg_ptr;
@@ -2063,11 +2064,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 .fallback_api_key = resolved_api_key,
             }) catch &.{};
 
-            // Noop observer.
-            var noop_obs = observability.NoopObserver{};
-            const obs = noop_obs.observer();
-
-            session_mgr_opt = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, obs);
+            session_mgr_opt = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, noop_obs_gateway.observer());
         }
     }
     if (state.pairing_guard == null) {

@@ -55,7 +55,7 @@ pub fn isContextExhausted(err_msg: []const u8) bool {
         std.mem.indexOf(u8, lower, "maximum") != null or
         std.mem.indexOf(u8, lower, "exceed") != null))
         return true;
-    if (std.mem.indexOf(u8, lower, "413") != null) return true;
+    if (std.mem.indexOf(u8, lower, "413") != null and std.mem.indexOf(u8, lower, "too large") != null) return true;
     return false;
 }
 

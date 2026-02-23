@@ -571,8 +571,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     var fallback_entries: std.ArrayListUnmanaged(types.ModelFallbackEntry) = .empty;
                     errdefer {
                         for (fallback_entries.items) |entry| {
-                            self.allocator.free(entry.model);
+                            for (entry.fallbacks) |fb| self.allocator.free(fb);
                             self.allocator.free(entry.fallbacks);
+                            self.allocator.free(entry.model);
                         }
                         fallback_entries.deinit(self.allocator);
                     }
@@ -595,6 +596,7 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                             .fallbacks = fallback_copy,
                         }) catch |err| {
                             self.allocator.free(model_copy);
+                            for (fallback_copy) |fb| self.allocator.free(fb);
                             self.allocator.free(fallback_copy);
                             return err;
                         };
