@@ -251,6 +251,7 @@ pub const PlatformTarget = enum {
     linux_x86_64,
     linux_aarch64,
     macos_aarch64,
+    macos_x86_64,
     windows_x86_64,
 
     pub fn assetName(self: PlatformTarget) []const u8 {
@@ -258,6 +259,7 @@ pub const PlatformTarget = enum {
             .linux_x86_64 => "nullclaw-linux-x86_64.bin",
             .linux_aarch64 => "nullclaw-linux-aarch64.bin",
             .macos_aarch64 => "nullclaw-macos-aarch64.bin",
+            .macos_x86_64 => "nullclaw-macos-x86_64.bin",
             .windows_x86_64 => "nullclaw-windows-x86_64.exe",
         };
     }
@@ -272,6 +274,7 @@ pub fn getCurrentPlatform() ?PlatformTarget {
         if (arch == .aarch64) return .linux_aarch64;
     } else if (os == .macos) {
         if (arch == .aarch64) return .macos_aarch64;
+        if (arch == .x86_64) return .macos_x86_64;
     } else if (os == .windows) {
         if (arch == .x86_64) return .windows_x86_64;
     }
