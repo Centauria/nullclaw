@@ -5,6 +5,9 @@ const platform = @import("../platform.zig");
 const config_types = @import("../config_types.zig");
 
 const log = std.log.scoped(.telegram);
+const MEDIA_GROUP_FLUSH_SECS: u64 = 3;
+const TEMP_MEDIA_SWEEP_INTERVAL_POLLS: u32 = 20;
+const TEMP_MEDIA_TTL_SECS: i64 = 24 * 60 * 60;
 
 // ════════════════════════════════════════════════════════════════════════════
 // Attachment Types
@@ -98,6 +101,66 @@ fn eqlLower(a: []const u8, comptime b: []const u8) bool {
         if (std.ascii.toLower(ac) != bc) return false;
     }
     return true;
+}
+
+fn cloneChannelMessage(allocator: std.mem.Allocator, msg: root.ChannelMessage) !root.ChannelMessage {
+    const id_dup = try allocator.dupe(u8, msg.id);
+    errdefer allocator.free(id_dup);
+    const sender_dup = try allocator.dupe(u8, msg.sender);
+    errdefer allocator.free(sender_dup);
+    const content_dup = try allocator.dupe(u8, msg.content);
+    errdefer allocator.free(content_dup);
+
+    const reply_target_dup: ?[]const u8 = if (msg.reply_target) |rt|
+        (try allocator.dupe(u8, rt))
+    else
+        null;
+    errdefer if (reply_target_dup) |rt| allocator.free(rt);
+
+    const first_name_dup: ?[]const u8 = if (msg.first_name) |fn_|
+        (try allocator.dupe(u8, fn_))
+    else
+        null;
+    errdefer if (first_name_dup) |fn_| allocator.free(fn_);
+
+    return .{
+        .id = id_dup,
+        .sender = sender_dup,
+        .content = content_dup,
+        .channel = msg.channel,
+        .timestamp = msg.timestamp,
+        .reply_target = reply_target_dup,
+        .message_id = msg.message_id,
+        .first_name = first_name_dup,
+        .is_group = msg.is_group,
+    };
+}
+
+fn mediaGroupLatestSeen(group_id: []const u8, group_ids: []const ?[]const u8, received_at: []const u64) ?u64 {
+    const n = @min(group_ids.len, received_at.len);
+    var seen = false;
+    var latest: u64 = 0;
+    for (0..n) |i| {
+        const gid = group_ids[i] orelse continue;
+        if (!std.mem.eql(u8, gid, group_id)) continue;
+        if (!seen or received_at[i] > latest) latest = received_at[i];
+        seen = true;
+    }
+    return if (seen) latest else null;
+}
+
+fn nextPendingMediaDeadline(group_ids: []const ?[]const u8, received_at: []const u64) ?u64 {
+    const n = @min(group_ids.len, received_at.len);
+    var seen = false;
+    var next_deadline: u64 = 0;
+    for (0..n) |i| {
+        const gid = group_ids[i] orelse continue;
+        const latest = mediaGroupLatestSeen(gid, group_ids, received_at) orelse continue;
+        const deadline = latest + MEDIA_GROUP_FLUSH_SECS;
+        if (!seen or deadline < next_deadline) next_deadline = deadline;
+        seen = true;
+    }
+    return if (seen) next_deadline else null;
 }
 
 /// Parse attachment markers from LLM response text.
@@ -240,8 +303,8 @@ pub const TelegramChannel = struct {
     // Pending media group messages (buffered across poll cycles until group is complete)
     pending_media_messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty,
     pending_media_group_ids: std.ArrayListUnmanaged(?[]const u8) = .empty,
-    /// Epoch seconds after which pending media groups should be flushed (0 = no pending)
-    media_group_deadline: u64 = 0,
+    pending_media_received_at: std.ArrayListUnmanaged(u64) = .empty,
+    polls_since_temp_sweep: u32 = 0,
 
     pub const MAX_MESSAGE_LEN: usize = 4096;
 
@@ -668,6 +731,164 @@ pub const TelegramChannel = struct {
         self.allocator.free(resp);
     }
 
+    fn resetPendingMediaBuffers(self: *TelegramChannel) void {
+        for (self.pending_media_messages.items) |msg| {
+            msg.deinit(self.allocator);
+        }
+        self.pending_media_messages.clearRetainingCapacity();
+
+        for (self.pending_media_group_ids.items) |mg| {
+            if (mg) |s| self.allocator.free(s);
+        }
+        self.pending_media_group_ids.clearRetainingCapacity();
+        self.pending_media_received_at.clearRetainingCapacity();
+    }
+
+    fn maybeSweepTempMediaFiles(self: *TelegramChannel) void {
+        self.polls_since_temp_sweep += 1;
+        if (self.polls_since_temp_sweep < TEMP_MEDIA_SWEEP_INTERVAL_POLLS) return;
+        self.polls_since_temp_sweep = 0;
+        self.sweepTempMediaFiles();
+    }
+
+    fn sweepTempMediaFiles(self: *TelegramChannel) void {
+        const tmp_dir = platform.getTempDir(self.allocator) catch return;
+        defer self.allocator.free(tmp_dir);
+
+        var dir = std.fs.openDirAbsolute(tmp_dir, .{ .iterate = true }) catch return;
+        defer dir.close();
+
+        const now = std.time.timestamp();
+        var iter = dir.iterate();
+        while (iter.next() catch null) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.startsWith(u8, entry.name, "nullclaw_doc_") and
+                !std.mem.startsWith(u8, entry.name, "nullclaw_photo_"))
+                continue;
+
+            const stat = dir.statFile(entry.name) catch continue;
+            const mtime_secs: i64 = @intCast(@divFloor(stat.mtime, std.time.ns_per_s));
+            if ((now - mtime_secs) < TEMP_MEDIA_TTL_SECS) continue;
+
+            dir.deleteFile(entry.name) catch continue;
+        }
+    }
+
+    fn flushMaturedPendingMediaGroups(
+        self: *TelegramChannel,
+        poll_allocator: std.mem.Allocator,
+        messages: *std.ArrayListUnmanaged(root.ChannelMessage),
+        media_group_ids: *std.ArrayListUnmanaged(?[]const u8),
+    ) void {
+        if (self.pending_media_messages.items.len == 0) return;
+        if (self.pending_media_messages.items.len != self.pending_media_group_ids.items.len or
+            self.pending_media_messages.items.len != self.pending_media_received_at.items.len)
+        {
+            log.warn("telegram pending media buffers out of sync; resetting buffers", .{});
+            self.resetPendingMediaBuffers();
+            return;
+        }
+
+        const now = root.nowEpochSecs();
+
+        var flush_groups: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer flush_groups.deinit(self.allocator);
+
+        for (self.pending_media_group_ids.items) |mg_opt| {
+            const mg = mg_opt orelse continue;
+            const latest = mediaGroupLatestSeen(mg, self.pending_media_group_ids.items, self.pending_media_received_at.items) orelse continue;
+            if (now < latest + MEDIA_GROUP_FLUSH_SECS) continue;
+
+            var already_added = false;
+            for (flush_groups.items) |existing| {
+                if (std.mem.eql(u8, existing, mg)) {
+                    already_added = true;
+                    break;
+                }
+            }
+            if (!already_added) flush_groups.append(self.allocator, mg) catch {};
+        }
+
+        if (flush_groups.items.len == 0) return;
+
+        var moved_messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+        defer {
+            for (moved_messages.items) |msg| msg.deinit(self.allocator);
+            moved_messages.deinit(self.allocator);
+        }
+
+        var moved_group_ids: std.ArrayListUnmanaged(?[]const u8) = .empty;
+        defer {
+            for (moved_group_ids.items) |mg| if (mg) |s| self.allocator.free(s);
+            moved_group_ids.deinit(self.allocator);
+        }
+
+        var i: usize = 0;
+        while (i < self.pending_media_messages.items.len) {
+            const mg = self.pending_media_group_ids.items[i] orelse {
+                i += 1;
+                continue;
+            };
+
+            var should_flush = false;
+            for (flush_groups.items) |flush_gid| {
+                if (std.mem.eql(u8, flush_gid, mg)) {
+                    should_flush = true;
+                    break;
+                }
+            }
+            if (!should_flush) {
+                i += 1;
+                continue;
+            }
+
+            const msg = self.pending_media_messages.orderedRemove(i);
+            const mgid = self.pending_media_group_ids.orderedRemove(i);
+            _ = self.pending_media_received_at.orderedRemove(i);
+
+            moved_messages.append(self.allocator, msg) catch {
+                msg.deinit(self.allocator);
+                if (mgid) |s| self.allocator.free(s);
+                continue;
+            };
+            moved_group_ids.append(self.allocator, mgid) catch {
+                const popped = moved_messages.pop().?;
+                popped.deinit(self.allocator);
+                if (mgid) |s| self.allocator.free(s);
+                continue;
+            };
+        }
+
+        mergeMediaGroups(self.allocator, &moved_messages, &moved_group_ids);
+
+        for (moved_messages.items) |pending_msg| {
+            const out_msg = cloneChannelMessage(poll_allocator, pending_msg) catch {
+                pending_msg.deinit(self.allocator);
+                continue;
+            };
+
+            messages.append(poll_allocator, out_msg) catch {
+                var tmp = out_msg;
+                tmp.deinit(poll_allocator);
+                pending_msg.deinit(self.allocator);
+                continue;
+            };
+            media_group_ids.append(poll_allocator, null) catch {
+                const popped = messages.pop().?;
+                var tmp = popped;
+                tmp.deinit(poll_allocator);
+                pending_msg.deinit(self.allocator);
+                continue;
+            };
+            pending_msg.deinit(self.allocator);
+        }
+
+        moved_messages.clearRetainingCapacity();
+
+        for (moved_group_ids.items) |mg| if (mg) |s| self.allocator.free(s);
+        moved_group_ids.clearRetainingCapacity();
+    }
+
     /// Poll for updates using long-polling (getUpdates) via curl.
     /// Returns a slice of ChannelMessages allocated on the given allocator.
     /// Voice and audio messages are automatically transcribed via Groq Whisper
@@ -676,16 +897,18 @@ pub const TelegramChannel = struct {
         var url_buf: [512]u8 = undefined;
         const url = try self.apiUrl(&url_buf, "getUpdates");
 
+        self.maybeSweepTempMediaFiles();
+
         // Build body with offset and dynamic timeout.
-        // If a media group deadline is pending, cap the timeout so we flush promptly.
+        // If pending media groups exist, cap timeout to the nearest group deadline.
         var poll_timeout: u64 = 30;
         {
             const t_now = root.nowEpochSecs();
-            if (self.media_group_deadline > 0) {
-                if (t_now >= self.media_group_deadline) {
+            if (nextPendingMediaDeadline(self.pending_media_group_ids.items, self.pending_media_received_at.items)) |deadline| {
+                if (t_now >= deadline) {
                     poll_timeout = 0; // Deadline already passed — return immediately
                 } else {
-                    poll_timeout = @min(30, self.media_group_deadline - t_now);
+                    poll_timeout = @min(30, deadline - t_now);
                 }
             }
         }
@@ -721,39 +944,8 @@ pub const TelegramChannel = struct {
             media_group_ids.deinit(allocator);
         }
 
-        // ── Flush matured pending media groups ─────────────────────────
-        // Before processing new updates, check if any buffered media groups
-        // have passed their deadline — if so, merge and prepend to output.
-        const now = root.nowEpochSecs();
-        if (self.media_group_deadline > 0 and now >= self.media_group_deadline) {
-            // Merge pending groups
-            mergeMediaGroups(allocator, &self.pending_media_messages, &self.pending_media_group_ids);
-
-            // Move all pending messages to output (messages array is empty at this point)
-            for (self.pending_media_messages.items) |pmsg| {
-                messages.append(allocator, pmsg) catch {
-                    // On OOM, free the message we couldn't insert
-                    allocator.free(pmsg.id);
-                    allocator.free(pmsg.sender);
-                    allocator.free(pmsg.content);
-                    if (pmsg.first_name) |fn_| allocator.free(fn_);
-                    continue;
-                };
-                media_group_ids.append(allocator, null) catch {
-                    // Rollback to keep arrays synchronized
-                    const popped = messages.pop().?;
-                    allocator.free(popped.id);
-                    allocator.free(popped.sender);
-                    allocator.free(popped.content);
-                    if (popped.first_name) |fn_| allocator.free(fn_);
-                };
-            }
-            // Free pending group ID strings and clear buffers
-            for (self.pending_media_group_ids.items) |mg| if (mg) |s| allocator.free(s);
-            self.pending_media_messages.clearRetainingCapacity();
-            self.pending_media_group_ids.clearRetainingCapacity();
-            self.media_group_deadline = 0;
-        }
+        // Flush matured groups buffered across previous poll cycles.
+        self.flushMaturedPendingMediaGroups(allocator, &messages, &media_group_ids);
 
         for (result_array) |update| {
             self.processUpdate(allocator, update, &messages, &media_group_ids);
@@ -764,44 +956,72 @@ pub const TelegramChannel = struct {
         // buffer instead of being returned immediately. This avoids blocking
         // and allows subsequent poll cycles to collect remaining group items.
         {
-            var added_to_pending = false;
             var i: usize = 0;
             while (i < messages.items.len) {
                 if (media_group_ids.items[i] != null) {
-                    // Transfer ownership: remove from local arrays, move to pending buffer
+                    // Transfer ownership: remove from local arrays, clone into pending buffers
+                    // owned by self.allocator, and free the poll-allocator copies.
                     const msg = messages.orderedRemove(i);
                     const mgid_opt = media_group_ids.orderedRemove(i);
 
-                    self.pending_media_messages.append(allocator, msg) catch {
-                        allocator.free(msg.id);
-                        allocator.free(msg.sender);
-                        allocator.free(msg.content);
-                        if (msg.first_name) |fn_| allocator.free(fn_);
+                    const pending_msg = cloneChannelMessage(self.allocator, msg) catch {
+                        var tmp = msg;
+                        tmp.deinit(allocator);
                         if (mgid_opt) |m| allocator.free(m);
                         continue;
                     };
-                    self.pending_media_group_ids.append(allocator, mgid_opt) catch {
-                        // Rollback to keep pending arrays synchronized
+                    const pending_mgid: []const u8 = blk: {
+                        const m = mgid_opt orelse {
+                            var dropped = msg;
+                            dropped.deinit(allocator);
+                            var rollback = pending_msg;
+                            rollback.deinit(self.allocator);
+                            continue;
+                        };
+                        defer allocator.free(m);
+                        break :blk self.allocator.dupe(u8, m) catch {
+                            var dropped = msg;
+                            dropped.deinit(allocator);
+                            var rollback = pending_msg;
+                            rollback.deinit(self.allocator);
+                            continue;
+                        };
+                    };
+
+                    var tmp = msg;
+                    tmp.deinit(allocator);
+
+                    self.pending_media_messages.append(self.allocator, pending_msg) catch {
+                        var rollback = pending_msg;
+                        rollback.deinit(self.allocator);
+                        self.allocator.free(pending_mgid);
+                        continue;
+                    };
+                    self.pending_media_group_ids.append(self.allocator, pending_mgid) catch {
                         const popped = self.pending_media_messages.pop().?;
-                        allocator.free(popped.id);
-                        allocator.free(popped.sender);
-                        allocator.free(popped.content);
-                        if (popped.first_name) |fn_| allocator.free(fn_);
-                        if (mgid_opt) |m| allocator.free(m);
+                        var rollback = popped;
+                        rollback.deinit(self.allocator);
+                        self.allocator.free(pending_mgid);
                         continue;
                     };
-                    added_to_pending = true;
-                    // Don't increment i — the remove shifted elements down
+                    self.pending_media_received_at.append(self.allocator, root.nowEpochSecs()) catch {
+                        const popped_mgid = self.pending_media_group_ids.pop().?;
+                        if (popped_mgid) |m| self.allocator.free(m);
+                        const popped_msg = self.pending_media_messages.pop().?;
+                        var rollback = popped_msg;
+                        rollback.deinit(self.allocator);
+                        continue;
+                    };
+
+                    // Don't increment i — orderedRemove shifted elements down.
                 } else {
                     i += 1;
                 }
             }
-
-            if (added_to_pending) {
-                // Set/extend deadline: flush after 3 seconds of no new group items
-                self.media_group_deadline = root.nowEpochSecs() + 3;
-            }
         }
+
+        // Flush again to emit groups that became mature in this cycle.
+        self.flushMaturedPendingMediaGroups(allocator, &messages, &media_group_ids);
 
         // toOwnedSlice MUST run before manual deinit to avoid double-free via errdefer
         const final_messages = try messages.toOwnedSlice(allocator);
@@ -1012,11 +1232,20 @@ pub const TelegramChannel = struct {
             break :blk_content null;
         };
 
-        // Fall back to text content if no voice/photo/document content
+        // Fall back to text content if no voice/photo/document content.
+        // If text is absent (e.g. document/photo upload failure), use caption.
         const final_content = content orelse blk_text: {
-            const text_val = message.object.get("text") orelse return;
-            const text_str = if (text_val == .string) text_val.string else return;
-            break :blk_text allocator.dupe(u8, text_str) catch return;
+            if (message.object.get("text")) |text_val| {
+                if (text_val == .string) {
+                    break :blk_text allocator.dupe(u8, text_val.string) catch return;
+                }
+            }
+            if (message.object.get("caption")) |cap_val| {
+                if (cap_val == .string) {
+                    break :blk_text allocator.dupe(u8, cap_val.string) catch return;
+                }
+            }
+            return;
         };
 
         // Extract media_group_id
@@ -1095,19 +1324,11 @@ pub const TelegramChannel = struct {
 
     fn vtableStop(ptr: *anyopaque) void {
         const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
-        // Clean up buffered media group messages to prevent shutdown leaks
-        for (self.pending_media_messages.items) |msg| {
-            self.allocator.free(msg.id);
-            self.allocator.free(msg.sender);
-            self.allocator.free(msg.content);
-            if (msg.first_name) |fn_| self.allocator.free(fn_);
-        }
+        // Clean up buffered media group messages to prevent shutdown leaks.
+        self.resetPendingMediaBuffers();
         self.pending_media_messages.deinit(self.allocator);
-
-        for (self.pending_media_group_ids.items) |mg| {
-            if (mg) |s| self.allocator.free(s);
-        }
         self.pending_media_group_ids.deinit(self.allocator);
+        self.pending_media_received_at.deinit(self.allocator);
     }
 
     fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
@@ -2429,4 +2650,99 @@ test "telegram mergeMediaGroups single item no merge" {
     alloc.free(messages.items[0].id);
     alloc.free(messages.items[0].sender);
     alloc.free(messages.items[0].content);
+}
+
+test "telegram flushMaturedPendingMediaGroups flushes only mature groups" {
+    const alloc = std.testing.allocator;
+    var ch = TelegramChannel.init(alloc, "123:ABC", &.{"*"}, &.{}, "allowlist");
+
+    const now = root.nowEpochSecs();
+
+    try ch.pending_media_messages.append(alloc, .{
+        .id = try alloc.dupe(u8, "user-a"),
+        .sender = try alloc.dupe(u8, "chat-a"),
+        .content = try alloc.dupe(u8, "[FILE:/tmp/a.pdf]"),
+        .channel = "telegram",
+        .timestamp = now - 10,
+    });
+    try ch.pending_media_group_ids.append(alloc, try alloc.dupe(u8, "group-a"));
+    try ch.pending_media_received_at.append(alloc, now - 10);
+
+    try ch.pending_media_messages.append(alloc, .{
+        .id = try alloc.dupe(u8, "user-b"),
+        .sender = try alloc.dupe(u8, "chat-b"),
+        .content = try alloc.dupe(u8, "[FILE:/tmp/b.pdf]"),
+        .channel = "telegram",
+        .timestamp = now,
+    });
+    try ch.pending_media_group_ids.append(alloc, try alloc.dupe(u8, "group-b"));
+    try ch.pending_media_received_at.append(alloc, now);
+
+    var out_messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer {
+        for (out_messages.items) |msg| {
+            var tmp = msg;
+            tmp.deinit(alloc);
+        }
+        out_messages.deinit(alloc);
+    }
+    var out_group_ids: std.ArrayListUnmanaged(?[]const u8) = .empty;
+    defer {
+        for (out_group_ids.items) |mg| if (mg) |s| alloc.free(s);
+        out_group_ids.deinit(alloc);
+    }
+
+    ch.flushMaturedPendingMediaGroups(alloc, &out_messages, &out_group_ids);
+
+    try std.testing.expectEqual(@as(usize, 1), out_messages.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, out_messages.items[0].content, "/tmp/a.pdf") != null);
+    try std.testing.expectEqual(@as(usize, 1), ch.pending_media_messages.items.len);
+    try std.testing.expectEqualStrings("group-b", ch.pending_media_group_ids.items[0].?);
+    try std.testing.expectEqual(@as(u64, now), ch.pending_media_received_at.items[0]);
+
+    ch.resetPendingMediaBuffers();
+    ch.pending_media_messages.deinit(alloc);
+    ch.pending_media_group_ids.deinit(alloc);
+    ch.pending_media_received_at.deinit(alloc);
+}
+
+test "telegram processUpdate falls back to caption when text is absent" {
+    const alloc = std.testing.allocator;
+    var ch = TelegramChannel.init(alloc, "123:ABC", &.{"*"}, &.{}, "allowlist");
+
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        \\{
+        \\  "update_id": 1,
+        \\  "message": {
+        \\    "message_id": 42,
+        \\    "from": {"id": 1001, "username": "tester", "first_name": "Test"},
+        \\    "chat": {"id": 2002, "type": "private"},
+        \\    "caption": "caption-only fallback"
+        \\  }
+        \\}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+    defer {
+        for (messages.items) |msg| {
+            var tmp = msg;
+            tmp.deinit(alloc);
+        }
+        messages.deinit(alloc);
+    }
+    var media_group_ids: std.ArrayListUnmanaged(?[]const u8) = .empty;
+    defer {
+        for (media_group_ids.items) |mg| if (mg) |s| alloc.free(s);
+        media_group_ids.deinit(alloc);
+    }
+
+    ch.processUpdate(alloc, parsed.value, &messages, &media_group_ids);
+
+    try std.testing.expectEqual(@as(usize, 1), messages.items.len);
+    try std.testing.expectEqualStrings("caption-only fallback", messages.items[0].content);
 }
