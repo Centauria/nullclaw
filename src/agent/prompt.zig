@@ -19,6 +19,59 @@ pub const PromptContext = struct {
     capabilities_section: ?[]const u8 = null,
 };
 
+/// Build a lightweight fingerprint for workspace prompt files.
+/// Used to detect when AGENTS/SOUL/etc changed and system prompt must be rebuilt.
+pub fn workspacePromptFingerprint(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+) !u64 {
+    var hasher = std.hash.Fnv1a_64.init();
+    const tracked_files = [_][]const u8{
+        "AGENTS.md",
+        "SOUL.md",
+        "TOOLS.md",
+        "IDENTITY.md",
+        "USER.md",
+        "HEARTBEAT.md",
+        "BOOTSTRAP.md",
+        "MEMORY.md",
+        "memory.md",
+    };
+
+    for (tracked_files) |filename| {
+        hasher.update(filename);
+        hasher.update("\n");
+
+        const path = try std.fs.path.join(allocator, &.{ workspace_dir, filename });
+        defer allocator.free(path);
+
+        const maybe_file = std.fs.openFileAbsolute(path, .{}) catch |err| blk: {
+            switch (err) {
+                error.FileNotFound => hasher.update("missing"),
+                else => hasher.update("open_err"),
+            }
+            break :blk null;
+        };
+        if (maybe_file == null) continue;
+
+        const file = maybe_file.?;
+        defer file.close();
+
+        const stat = file.stat() catch {
+            hasher.update("stat_err");
+            continue;
+        };
+        hasher.update("present");
+
+        const mtime_ns: i128 = stat.mtime;
+        const size_bytes: u64 = @intCast(stat.size);
+        hasher.update(std.mem.asBytes(&mtime_ns));
+        hasher.update(std.mem.asBytes(&size_bytes));
+    }
+
+    return hasher.final();
+}
+
 /// Build the full system prompt from workspace identity files, tools, and runtime context.
 pub fn buildSystemPrompt(
     allocator: std.mem.Allocator,
@@ -330,6 +383,49 @@ test "buildSystemPrompt injects memory.md when MEMORY.md is absent" {
         std.mem.indexOf(u8, prompt, "### MEMORY.md") != null;
     try std.testing.expect(has_memory_header);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "alt-memory") != null);
+}
+
+test "workspacePromptFingerprint is stable when files are unchanged" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("SOUL.md", .{});
+        defer f.close();
+        try f.writeAll("soul-v1");
+    }
+
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    const fp1 = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const fp2 = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    try std.testing.expectEqual(fp1, fp2);
+}
+
+test "workspacePromptFingerprint changes when tracked file changes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("SOUL.md", .{});
+        defer f.close();
+        try f.writeAll("short");
+    }
+
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace);
+
+    {
+        const f = try tmp.dir.createFile("SOUL.md", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("longer-content-after-change");
+    }
+
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    try std.testing.expect(before != after);
 }
 
 test "buildSystemPrompt prefers MEMORY.md over memory.md" {

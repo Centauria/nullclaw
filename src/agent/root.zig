@@ -289,6 +289,8 @@ pub const Agent = struct {
 
     /// Whether the system prompt has been injected.
     has_system_prompt: bool = false,
+    /// Fingerprint of workspace prompt files for the currently injected system prompt.
+    workspace_prompt_fingerprint: ?u64 = null,
 
     /// Whether compaction was performed during the last turn.
     last_turn_compacted: bool = false,
@@ -569,7 +571,12 @@ pub const Agent = struct {
             return response;
         }
 
-        // Inject system prompt on first turn
+        // Inject system prompt on first turn (or when tracked workspace files changed).
+        const workspace_fp = prompt.workspacePromptFingerprint(self.allocator, self.workspace_dir) catch null;
+        if (self.has_system_prompt and workspace_fp != null and self.workspace_prompt_fingerprint != workspace_fp) {
+            self.has_system_prompt = false;
+        }
+
         if (!self.has_system_prompt) {
             var cfg_for_caps_opt: ?Config = Config.load(self.allocator) catch null;
             defer if (cfg_for_caps_opt) |*cfg_loaded| cfg_loaded.deinit();
@@ -618,6 +625,7 @@ pub const Agent = struct {
                 });
             }
             self.has_system_prompt = true;
+            self.workspace_prompt_fingerprint = workspace_fp;
         }
 
         // Auto-save user message to memory (nanoTimestamp key to avoid collisions within the same second)
@@ -1287,6 +1295,7 @@ pub const Agent = struct {
         }
         self.history.items.len = 0;
         self.has_system_prompt = false;
+        self.workspace_prompt_fingerprint = null;
     }
 
     /// Get total tokens used.
@@ -1440,6 +1449,7 @@ test "Agent clear history" {
         .history = .empty,
         .total_tokens = 0,
         .has_system_prompt = true,
+        .workspace_prompt_fingerprint = 1234,
     };
     defer agent.deinit();
 
@@ -1458,6 +1468,7 @@ test "Agent clear history" {
 
     try std.testing.expectEqual(@as(usize, 0), agent.historyLen());
     try std.testing.expect(!agent.has_system_prompt);
+    try std.testing.expect(agent.workspace_prompt_fingerprint == null);
 }
 
 test "dispatcher module reexport" {
@@ -2612,6 +2623,93 @@ test "turn includes reasoning and usage footer when enabled" {
     try std.testing.expect(std.mem.indexOf(u8, response, "Reasoning:\nthinking trace") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "[usage] total_tokens=10") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "final answer") != null);
+}
+
+test "turn refreshes system prompt after workspace markdown change" {
+    const ReloadProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = try allocator.dupe(u8, "ok"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "reload-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("SOUL.md", .{});
+        defer f.close();
+        try f.writeAll("SOUL-V1");
+    }
+
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    var provider_state: u8 = 0;
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = ReloadProvider.chatWithSystem,
+        .chat = ReloadProvider.chat,
+        .supportsNativeTools = ReloadProvider.supportsNativeTools,
+        .getName = ReloadProvider.getName,
+        .deinit = ReloadProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = workspace,
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+    };
+    defer agent.deinit();
+
+    const first = try agent.turn("first");
+    defer allocator.free(first);
+    try std.testing.expect(agent.history.items.len > 0);
+    try std.testing.expectEqual(providers.Role.system, agent.history.items[0].role);
+    try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "SOUL-V1") != null);
+
+    {
+        const f = try tmp.dir.createFile("SOUL.md", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("SOUL-V2-UPDATED");
+    }
+
+    const second = try agent.turn("second");
+    defer allocator.free(second);
+    try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "SOUL-V2-UPDATED") != null);
 }
 
 test "exec security deny blocks shell tool execution" {
