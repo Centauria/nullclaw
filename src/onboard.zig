@@ -2465,6 +2465,35 @@ test "bootstrapTemplate is non-empty" {
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "BOOTSTRAP.md - Hello, World") != null);
 }
 
+test "workspace templates avoid OpenClaw branding in user-facing text" {
+    const allocator = std.testing.allocator;
+    const ctx = ProjectContext{};
+
+    const soul = try soulTemplate(allocator, &ctx);
+    defer allocator.free(soul);
+    const identity = try identityTemplate(allocator, &ctx);
+    defer allocator.free(identity);
+    const user = try userTemplate(allocator, &ctx);
+    defer allocator.free(user);
+    const memory = try memoryTemplate(allocator, &ctx);
+    defer allocator.free(memory);
+
+    const templates = [_][]const u8{
+        agentsTemplate(),
+        toolsTemplate(),
+        heartbeatTemplate(),
+        bootstrapTemplate(),
+        soul,
+        identity,
+        user,
+        memory,
+    };
+
+    for (templates) |tmpl| {
+        try std.testing.expect(std.ascii.indexOfIgnoreCase(tmpl, "openclaw") == null);
+    }
+}
+
 test "scaffoldWorkspace creates all prompt.zig files" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
