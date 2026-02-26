@@ -556,6 +556,10 @@ pub const Config = struct {
         // Diagnostics (with nested otel)
         try w.print("  \"diagnostics\": {{\n", .{});
         try w.print("    \"backend\": \"{s}\"", .{self.diagnostics.backend});
+        try w.print(",\n    \"log_tool_calls\": {s}", .{if (self.diagnostics.log_tool_calls) "true" else "false"});
+        try w.print(",\n    \"log_message_receipts\": {s}", .{if (self.diagnostics.log_message_receipts) "true" else "false"});
+        try w.print(",\n    \"log_message_payloads\": {s}", .{if (self.diagnostics.log_message_payloads) "true" else "false"});
+        try w.print(",\n    \"log_llm_io\": {s}", .{if (self.diagnostics.log_llm_io) "true" else "false"});
         if (self.diagnostics.otel_endpoint != null or self.diagnostics.otel_service_name != null) {
             try w.print(",\n    \"otel\": {{", .{});
             var otel_first = true;
@@ -1023,6 +1027,47 @@ test "save writes configured telegram channel account" {
     try std.testing.expect(std.mem.indexOf(u8, content, "\"main\": {") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"account_id\": \"main\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"bot_token\": \"123:ABC\"") != null);
+}
+
+test "save roundtrip preserves diagnostics logging flags" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.diagnostics.log_tool_calls = true;
+    cfg.diagnostics.log_message_receipts = true;
+    cfg.diagnostics.log_message_payloads = true;
+    cfg.diagnostics.log_llm_io = true;
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 128 * 1024);
+    defer allocator.free(content);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(content);
+
+    try std.testing.expect(loaded.diagnostics.log_tool_calls);
+    try std.testing.expect(loaded.diagnostics.log_message_receipts);
+    try std.testing.expect(loaded.diagnostics.log_message_payloads);
+    try std.testing.expect(loaded.diagnostics.log_llm_io);
 }
 
 test "save roundtrip preserves reliability settings" {
@@ -1511,11 +1556,15 @@ test "validation accepts max boundary backoff" {
 test "json parse diagnostics section" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"diagnostics": {"backend": "otel", "otel": {"endpoint": "http://localhost:4318", "service_name": "yc"}}}
+        \\{"diagnostics": {"backend": "otel", "log_tool_calls": true, "log_message_receipts": true, "log_message_payloads": true, "log_llm_io": true, "otel": {"endpoint": "http://localhost:4318", "service_name": "yc"}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
     try std.testing.expectEqualStrings("otel", cfg.diagnostics.backend);
+    try std.testing.expect(cfg.diagnostics.log_tool_calls);
+    try std.testing.expect(cfg.diagnostics.log_message_receipts);
+    try std.testing.expect(cfg.diagnostics.log_message_payloads);
+    try std.testing.expect(cfg.diagnostics.log_llm_io);
     try std.testing.expectEqualStrings("http://localhost:4318", cfg.diagnostics.otel_endpoint.?);
     try std.testing.expectEqualStrings("yc", cfg.diagnostics.otel_service_name.?);
     allocator.free(cfg.diagnostics.backend);

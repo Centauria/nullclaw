@@ -271,6 +271,8 @@ pub const Agent = struct {
     send_mode: SendMode = .inherit,
     last_turn_usage: providers.TokenUsage = .{},
     message_timeout_secs: u64 = 0,
+    log_tool_calls: bool = false,
+    log_llm_io: bool = false,
     compaction_keep_recent: u32 = compaction.DEFAULT_COMPACTION_KEEP_RECENT,
     compaction_max_summary_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SUMMARY_CHARS,
     compaction_max_source_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SOURCE_CHARS,
@@ -369,6 +371,8 @@ pub const Agent = struct {
             .max_tokens_override = cfg.max_tokens,
             .reasoning_effort = cfg.reasoning_effort,
             .message_timeout_secs = cfg.agent.message_timeout_secs,
+            .log_tool_calls = cfg.diagnostics.log_tool_calls,
+            .log_llm_io = cfg.diagnostics.log_llm_io,
             .compaction_keep_recent = cfg.agent.compaction_keep_recent,
             .compaction_max_summary_chars = cfg.agent.compaction_max_summary_chars,
             .compaction_max_source_chars = cfg.agent.compaction_max_source_chars,
@@ -776,10 +780,13 @@ pub const Agent = struct {
 
             const timer_start = std.time.milliTimestamp();
             const is_streaming = self.stream_callback != null and self.provider.supportsStreaming();
+            const native_tools_enabled = !is_streaming and self.provider.supportsNativeTools();
 
             // Call provider: streaming (no retries, no native tools) or blocking with retry
             var response: ChatResponse = undefined;
+            var response_attempt: u32 = 1;
             if (is_streaming) {
+                self.logLlmRequest(iteration + 1, 1, messages, native_tools_enabled, true);
                 const stream_result = self.provider.streamChat(
                     self.allocator,
                     .{
@@ -814,6 +821,7 @@ pub const Agent = struct {
                     .model = stream_result.model,
                 };
             } else {
+                self.logLlmRequest(iteration + 1, 1, messages, native_tools_enabled, false);
                 response = self.provider.chat(
                     self.allocator,
                     .{
@@ -821,7 +829,7 @@ pub const Agent = struct {
                         .model = self.model_name,
                         .temperature = self.temperature,
                         .max_tokens = self.max_tokens,
-                        .tools = if (self.provider.supportsNativeTools()) self.tool_specs else null,
+                        .tools = if (native_tools_enabled) self.tool_specs else null,
                         .timeout_secs = self.message_timeout_secs,
                         .reasoning_effort = self.reasoning_effort,
                     },
@@ -847,6 +855,8 @@ pub const Agent = struct {
                     {
                         self.context_was_compacted = true;
                         const recovery_msgs = self.buildProviderMessages(arena) catch |prep_err| return prep_err;
+                        response_attempt = 2;
+                        self.logLlmRequest(iteration + 1, 2, recovery_msgs, native_tools_enabled, false);
                         break :retry_blk self.provider.chat(
                             self.allocator,
                             .{
@@ -854,7 +864,7 @@ pub const Agent = struct {
                                 .model = self.model_name,
                                 .temperature = self.temperature,
                                 .max_tokens = self.max_tokens,
-                                .tools = if (self.provider.supportsNativeTools()) self.tool_specs else null,
+                                .tools = if (native_tools_enabled) self.tool_specs else null,
                                 .timeout_secs = self.message_timeout_secs,
                                 .reasoning_effort = self.reasoning_effort,
                             },
@@ -865,6 +875,8 @@ pub const Agent = struct {
 
                     // Retry once
                     std.Thread.sleep(500 * std.time.ns_per_ms);
+                    response_attempt = 2;
+                    self.logLlmRequest(iteration + 1, 2, messages, native_tools_enabled, false);
                     break :retry_blk self.provider.chat(
                         self.allocator,
                         .{
@@ -872,7 +884,7 @@ pub const Agent = struct {
                             .model = self.model_name,
                             .temperature = self.temperature,
                             .max_tokens = self.max_tokens,
-                            .tools = if (self.provider.supportsNativeTools()) self.tool_specs else null,
+                            .tools = if (native_tools_enabled) self.tool_specs else null,
                             .timeout_secs = self.message_timeout_secs,
                             .reasoning_effort = self.reasoning_effort,
                         },
@@ -884,6 +896,8 @@ pub const Agent = struct {
                         if (self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and self.forceCompressHistory()) {
                             self.context_was_compacted = true;
                             const recovery_msgs = self.buildProviderMessages(arena) catch |prep_err| return prep_err;
+                            response_attempt = 3;
+                            self.logLlmRequest(iteration + 1, 3, recovery_msgs, native_tools_enabled, false);
                             break :retry_blk self.provider.chat(
                                 self.allocator,
                                 .{
@@ -891,7 +905,7 @@ pub const Agent = struct {
                                     .model = self.model_name,
                                     .temperature = self.temperature,
                                     .max_tokens = self.max_tokens,
-                                    .tools = if (self.provider.supportsNativeTools()) self.tool_specs else null,
+                                    .tools = if (native_tools_enabled) self.tool_specs else null,
                                     .timeout_secs = self.message_timeout_secs,
                                     .reasoning_effort = self.reasoning_effort,
                                 },
@@ -903,6 +917,7 @@ pub const Agent = struct {
                     };
                 };
             }
+            self.logLlmResponse(iteration + 1, response_attempt, &response);
 
             const duration_ms: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
             const resp_event = ObserverEvent{ .llm_response = .{
@@ -1110,13 +1125,32 @@ pub const Agent = struct {
             defer results_buf.deinit(self.allocator);
             try results_buf.ensureTotalCapacity(self.allocator, parsed_calls.len);
 
-            for (parsed_calls) |call| {
+            const session_hash: u64 = if (self.memory_session_id) |sid| std.hash.Wyhash.hash(0, sid) else 0;
+            if (self.log_tool_calls) {
+                log.info("tool-call batch session=0x{x} count={d}", .{ session_hash, parsed_calls.len });
+            }
+
+            for (parsed_calls, 0..) |call, idx| {
+                if (self.log_tool_calls) {
+                    log.info(
+                        "tool-call start session=0x{x} index={d} name={s} id={s}",
+                        .{ session_hash, idx + 1, call.name, call.tool_call_id orelse "-" },
+                    );
+                }
+
                 const tool_start_event = ObserverEvent{ .tool_call_start = .{ .tool = call.name } };
                 self.observer.recordEvent(&tool_start_event);
 
                 const tool_timer = std.time.milliTimestamp();
                 const result = self.executeTool(arena, call);
                 const tool_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - tool_timer)));
+
+                if (self.log_tool_calls) {
+                    log.info(
+                        "tool-call done session=0x{x} index={d} name={s} success={} duration_ms={d}",
+                        .{ session_hash, idx + 1, call.name, result.success, tool_duration },
+                    );
+                }
 
                 const tool_event = ObserverEvent{ .tool_call = .{
                     .tool = call.name,
@@ -1173,6 +1207,7 @@ pub const Agent = struct {
         };
         defer self.allocator.free(summary_messages);
 
+        self.logLlmRequest(self.max_tool_iterations + 1, 1, summary_messages, false, false);
         var summary_response = self.provider.chat(
             self.allocator,
             .{
@@ -1192,6 +1227,7 @@ pub const Agent = struct {
             self.observer.recordEvent(&complete_event);
             return fallback;
         };
+        self.logLlmResponse(self.max_tool_iterations + 1, 1, &summary_response);
         defer self.freeResponseFields(&summary_response);
 
         const summary_text = summary_response.contentOrEmpty();
@@ -1302,6 +1338,104 @@ pub const Agent = struct {
             .success = false,
             .tool_call_id = call.tool_call_id,
         };
+    }
+
+    const LLM_LOG_MAX_BYTES: usize = 8192;
+
+    fn llmLogPreview(text: []const u8) struct { slice: []const u8, truncated: bool } {
+        if (text.len <= LLM_LOG_MAX_BYTES) {
+            return .{ .slice = text, .truncated = false };
+        }
+        return .{ .slice = text[0..LLM_LOG_MAX_BYTES], .truncated = true };
+    }
+
+    fn logLlmRequest(self: *Agent, iteration: u32, attempt: u32, messages: []const ChatMessage, native_tools_enabled: bool, is_streaming: bool) void {
+        if (!self.log_llm_io) return;
+        const session_hash: u64 = if (self.memory_session_id) |sid| std.hash.Wyhash.hash(0, sid) else 0;
+        log.info(
+            "llm request session=0x{x} iter={d} attempt={d} provider={s} model={s} messages={d} native_tools={} streaming={}",
+            .{
+                session_hash,
+                iteration,
+                attempt,
+                self.provider.getName(),
+                self.model_name,
+                messages.len,
+                native_tools_enabled,
+                is_streaming,
+            },
+        );
+        for (messages, 0..) |msg, idx| {
+            const preview = llmLogPreview(msg.content);
+            const parts_count: usize = if (msg.content_parts) |parts| parts.len else 0;
+            log.info(
+                "llm request msg session=0x{x} iter={d} attempt={d} index={d} role={s} bytes={d} parts={d} content={f}{s}",
+                .{
+                    session_hash,
+                    iteration,
+                    attempt,
+                    idx + 1,
+                    msg.role.toSlice(),
+                    msg.content.len,
+                    parts_count,
+                    std.json.fmt(preview.slice, .{}),
+                    if (preview.truncated) " [truncated]" else "",
+                },
+            );
+        }
+    }
+
+    fn logLlmResponse(self: *Agent, iteration: u32, attempt: u32, response: *const ChatResponse) void {
+        if (!self.log_llm_io) return;
+        const session_hash: u64 = if (self.memory_session_id) |sid| std.hash.Wyhash.hash(0, sid) else 0;
+        const content = response.contentOrEmpty();
+        const preview = llmLogPreview(content);
+        log.info(
+            "llm response session=0x{x} iter={d} attempt={d} model={s} bytes={d} tool_calls={d} usage={f} content={f}{s}",
+            .{
+                session_hash,
+                iteration,
+                attempt,
+                if (response.model.len > 0) response.model else self.model_name,
+                content.len,
+                response.tool_calls.len,
+                std.json.fmt(response.usage, .{}),
+                std.json.fmt(preview.slice, .{}),
+                if (preview.truncated) " [truncated]" else "",
+            },
+        );
+
+        if (response.reasoning_content) |reasoning| {
+            const r_preview = llmLogPreview(reasoning);
+            log.info(
+                "llm response reasoning session=0x{x} iter={d} attempt={d} bytes={d} content={f}{s}",
+                .{
+                    session_hash,
+                    iteration,
+                    attempt,
+                    reasoning.len,
+                    std.json.fmt(r_preview.slice, .{}),
+                    if (r_preview.truncated) " [truncated]" else "",
+                },
+            );
+        }
+
+        for (response.tool_calls, 0..) |tc, idx| {
+            const args_preview = llmLogPreview(tc.arguments);
+            log.info(
+                "llm response tool-call session=0x{x} iter={d} attempt={d} index={d} id={s} name={s} args={f}{s}",
+                .{
+                    session_hash,
+                    iteration,
+                    attempt,
+                    idx + 1,
+                    if (tc.id.len > 0) tc.id else "-",
+                    tc.name,
+                    std.json.fmt(args_preview.slice, .{}),
+                    if (args_preview.truncated) " [truncated]" else "",
+                },
+            );
+        }
     }
 
     /// Build provider-ready ChatMessage slice from owned history.

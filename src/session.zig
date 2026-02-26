@@ -22,6 +22,15 @@ const Observer = observability.Observer;
 const tools_mod = @import("tools/root.zig");
 const Tool = tools_mod.Tool;
 const SecurityPolicy = @import("security/policy.zig").SecurityPolicy;
+const log = std.log.scoped(.session);
+const MESSAGE_LOG_MAX_BYTES: usize = 4096;
+
+fn messageLogPreview(text: []const u8) struct { slice: []const u8, truncated: bool } {
+    if (text.len <= MESSAGE_LOG_MAX_BYTES) {
+        return .{ .slice = text, .truncated = false };
+    }
+    return .{ .slice = text[0..MESSAGE_LOG_MAX_BYTES], .truncated = true };
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Session
@@ -180,6 +189,26 @@ pub const SessionManager = struct {
     /// Process a message within a session context.
     /// Finds or creates the session, locks it, runs agent.turn(), returns owned response.
     pub fn processMessage(self: *SessionManager, session_key: []const u8, content: []const u8, conversation_context: ?ConversationContext) ![]const u8 {
+        const channel = if (conversation_context) |ctx| (ctx.channel orelse "unknown") else "unknown";
+        const session_hash = std.hash.Wyhash.hash(0, session_key);
+
+        if (self.config.diagnostics.log_message_receipts) {
+            log.info("message receipt channel={s} session=0x{x} bytes={d}", .{ channel, session_hash, content.len });
+        }
+        if (self.config.diagnostics.log_message_payloads) {
+            const preview = messageLogPreview(content);
+            log.info(
+                "message inbound channel={s} session=0x{x} bytes={d} content={f}{s}",
+                .{
+                    channel,
+                    session_hash,
+                    content.len,
+                    std.json.fmt(preview.slice, .{}),
+                    if (preview.truncated) " [truncated]" else "",
+                },
+            );
+        }
+
         const session = try self.getOrCreate(session_key);
 
         session.mutex.lock();
@@ -211,6 +240,20 @@ pub const SessionManager = struct {
                 store.saveMessage(session_key, "user", content) catch {};
                 store.saveMessage(session_key, "assistant", response) catch {};
             }
+        }
+
+        if (self.config.diagnostics.log_message_payloads) {
+            const preview = messageLogPreview(response);
+            log.info(
+                "message outbound channel={s} session=0x{x} bytes={d} content={f}{s}",
+                .{
+                    channel,
+                    session_hash,
+                    response.len,
+                    std.json.fmt(preview.slice, .{}),
+                    if (preview.truncated) " [truncated]" else "",
+                },
+            );
         }
 
         return response;
