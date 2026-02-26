@@ -117,6 +117,16 @@ fn setModelName(self: anytype, model: []const u8) !void {
     }
 }
 
+fn setDefaultProvider(self: anytype, provider_name: []const u8) !void {
+    if (!@hasField(@TypeOf(self.*), "default_provider")) return;
+    const owned_provider = try self.allocator.dupe(u8, provider_name);
+    if (@hasField(@TypeOf(self.*), "default_provider_owned")) {
+        if (self.default_provider_owned) self.allocator.free(self.default_provider);
+        self.default_provider_owned = true;
+    }
+    self.default_provider = owned_provider;
+}
+
 fn isConfiguredProviderName(self: anytype, provider_name: []const u8) bool {
     if (!@hasField(@TypeOf(self.*), "configured_providers")) return false;
     for (self.configured_providers) |entry| {
@@ -259,6 +269,69 @@ test "parseSlashCommand strips bot mention with colon separator" {
     const parsed = parseSlashCommand("/model@nullclaw_bot: gpt-5.2") orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("model", parsed.name);
     try std.testing.expectEqualStrings("gpt-5.2", parsed.arg);
+}
+
+test "hotApplyConfigChange updates model primary as provider plus model" {
+    const allocator = std.testing.allocator;
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        model_name_owned: bool,
+        default_provider: []const u8,
+        default_provider_owned: bool,
+        default_model: []const u8,
+    }{
+        .allocator = allocator,
+        .model_name = "old-model",
+        .model_name_owned = false,
+        .default_provider = "old-provider",
+        .default_provider_owned = false,
+        .default_model = "old-model",
+    };
+    defer if (dummy.model_name_owned) allocator.free(dummy.model_name);
+    defer if (dummy.default_provider_owned) allocator.free(dummy.default_provider);
+
+    const applied = try hotApplyConfigChange(
+        &dummy,
+        .set,
+        "agents.defaults.model.primary",
+        "\"openrouter/inception/mercury\"",
+    );
+    try std.testing.expect(applied);
+    try std.testing.expectEqualStrings("inception/mercury", dummy.model_name);
+    try std.testing.expectEqualStrings("inception/mercury", dummy.default_model);
+    try std.testing.expectEqualStrings("openrouter", dummy.default_provider);
+}
+
+test "hotApplyConfigChange rejects malformed model primary" {
+    const allocator = std.testing.allocator;
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        model_name_owned: bool,
+        default_provider: []const u8,
+        default_provider_owned: bool,
+        default_model: []const u8,
+    }{
+        .allocator = allocator,
+        .model_name = "stable-model",
+        .model_name_owned = false,
+        .default_provider = "openrouter",
+        .default_provider_owned = false,
+        .default_model = "stable-model",
+    };
+    defer if (dummy.model_name_owned) allocator.free(dummy.model_name);
+    defer if (dummy.default_provider_owned) allocator.free(dummy.default_provider);
+
+    const applied = try hotApplyConfigChange(
+        &dummy,
+        .set,
+        "agents.defaults.model.primary",
+        "\"malformed\"",
+    );
+    try std.testing.expect(!applied);
+    try std.testing.expectEqualStrings("stable-model", dummy.model_name);
+    try std.testing.expectEqualStrings("openrouter", dummy.default_provider);
 }
 
 fn setExecNodeId(self: anytype, value: ?[]const u8) !void {
@@ -1506,6 +1579,15 @@ fn parseJsonU64(raw: []const u8) ?u64 {
     };
 }
 
+fn splitPrimaryModelRef(primary: []const u8) ?struct { provider: []const u8, model: []const u8 } {
+    const slash = std.mem.indexOfScalar(u8, primary, '/') orelse return null;
+    if (slash == 0 or slash + 1 >= primary.len) return null;
+    return .{
+        .provider = primary[0..slash],
+        .model = primary[slash + 1 ..],
+    };
+}
+
 fn hotApplyConfigChange(
     self: anytype,
     action: config_mutator.MutationAction,
@@ -1515,9 +1597,11 @@ fn hotApplyConfigChange(
     if (action == .unset) return false;
 
     if (std.mem.eql(u8, path, "agents.defaults.model.primary")) {
-        const model = try parseJsonStringOwned(self.allocator, new_value_json) orelse return false;
-        defer self.allocator.free(model);
-        try setModelName(self, model);
+        const primary = try parseJsonStringOwned(self.allocator, new_value_json) orelse return false;
+        defer self.allocator.free(primary);
+        const parsed = splitPrimaryModelRef(primary) orelse return false;
+        try setModelName(self, parsed.model);
+        try setDefaultProvider(self, parsed.provider);
         if (@hasField(@TypeOf(self.*), "default_model")) {
             self.default_model = self.model_name;
         }

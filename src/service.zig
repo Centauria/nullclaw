@@ -428,7 +428,9 @@ fn assertLinuxSystemdUserAvailable(allocator: std.mem.Allocator) !void {
 
 fn runChecked(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     var child = std.process.Child.init(argv, allocator);
-    child.stderr_behavior = .Pipe;
+    // Avoid deadlocks: we do not consume pipes in runChecked.
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
     child.spawn() catch |err| switch (err) {
         error.FileNotFound => {
             if (argv.len > 0 and std.mem.eql(u8, argv[0], "systemctl")) return error.SystemctlUnavailable;
@@ -446,7 +448,8 @@ fn runChecked(allocator: std.mem.Allocator, argv: []const []const u8) !void {
 fn runCapture(allocator: std.mem.Allocator, argv: []const []const u8) ![]u8 {
     var child = std.process.Child.init(argv, allocator);
     child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
+    // We only need stdout here; inheriting/ignoring stderr prevents pipe backpressure hangs.
+    child.stderr_behavior = .Ignore;
     child.spawn() catch |err| switch (err) {
         error.FileNotFound => {
             if (argv.len > 0 and std.mem.eql(u8, argv[0], "systemctl")) return error.SystemctlUnavailable;

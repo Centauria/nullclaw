@@ -225,6 +225,7 @@ pub const Agent = struct {
     model_name: []const u8,
     model_name_owned: bool = false,
     default_provider: []const u8 = "openrouter",
+    default_provider_owned: bool = false,
     default_model: []const u8 = "anthropic/claude-sonnet-4",
     configured_providers: []const config_types.ProviderEntry = &.{},
     fallback_providers: []const []const u8 = &.{},
@@ -374,6 +375,7 @@ pub const Agent = struct {
 
     pub fn deinit(self: *Agent) void {
         if (self.model_name_owned) self.allocator.free(self.model_name);
+        if (self.default_provider_owned) self.allocator.free(self.default_provider);
         if (self.exec_node_id_owned and self.exec_node_id != null) self.allocator.free(self.exec_node_id.?);
         if (self.tts_provider_owned and self.tts_provider != null) self.allocator.free(self.tts_provider.?);
         if (self.pending_exec_command_owned and self.pending_exec_command != null) self.allocator.free(self.pending_exec_command.?);
