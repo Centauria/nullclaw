@@ -678,7 +678,9 @@ test "resolveOpenclawConfigPath finds parent config for workspace layout" {
     const resolved = try resolveOpenclawConfigPath(std.testing.allocator, workspace_abs);
     defer if (resolved) |p| std.testing.allocator.free(p);
     try std.testing.expect(resolved != null);
-    try std.testing.expect(std.mem.endsWith(u8, resolved.?, ".openclaw/config.json"));
+    try std.testing.expect(std.mem.eql(u8, std.fs.path.basename(resolved.?), "config.json"));
+    const resolved_parent = std.fs.path.dirname(resolved.?) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.eql(u8, std.fs.path.basename(resolved_parent), ".openclaw"));
 }
 
 test "migrateOpenclawConfig copies and normalizes config json" {

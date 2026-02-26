@@ -376,8 +376,8 @@ test "git cwd inside workspace works without allowed_paths" {
     const ws_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_path);
 
-    var args_buf: [512]u8 = undefined;
-    const args = try std.fmt.bufPrint(&args_buf, "{{\"operation\":\"unknown_op\",\"cwd\":\"{s}\"}}", .{ws_path});
+    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"operation\":\"unknown_op\",\"cwd\":{f}}}", .{std.json.fmt(ws_path, .{})});
+    defer std.testing.allocator.free(args);
 
     var gt = GitTool{ .workspace_dir = ws_path };
     const t = gt.tool();
@@ -402,8 +402,8 @@ test "git cwd outside workspace without allowed_paths is rejected" {
     const other_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "other" });
     defer std.testing.allocator.free(other_path);
 
-    var args_buf: [768]u8 = undefined;
-    const args = try std.fmt.bufPrint(&args_buf, "{{\"operation\":\"status\",\"cwd\":\"{s}\"}}", .{other_path});
+    const args = try std.fmt.allocPrint(std.testing.allocator, "{{\"operation\":\"status\",\"cwd\":{f}}}", .{std.json.fmt(other_path, .{})});
+    defer std.testing.allocator.free(args);
 
     var gt = GitTool{ .workspace_dir = ws_path };
     const t = gt.tool();

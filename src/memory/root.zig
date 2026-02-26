@@ -1235,6 +1235,23 @@ fn requireBackendEnabledForTests(name: []const u8) !void {
     if (findBackend(name) == null) return error.SkipZigTest;
 }
 
+const TestTmpDir = @TypeOf(std.testing.tmpDir(.{}));
+const TestWorkspace = struct {
+    tmp: TestTmpDir,
+    path: []u8,
+
+    fn init(allocator: std.mem.Allocator) !TestWorkspace {
+        var tmp = std.testing.tmpDir(.{});
+        const path = try tmp.dir.realpathAlloc(allocator, ".");
+        return .{ .tmp = tmp, .path = path };
+    }
+
+    fn deinit(self: *TestWorkspace, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        self.tmp.cleanup();
+    }
+};
+
 test "initRuntime none returns valid runtime" {
     try requireBackendEnabledForTests("none");
 
@@ -1274,7 +1291,10 @@ test "initRuntime none has null db_path" {
 
 test "initRuntime sqlite returns full runtime" {
     if (!build_options.enable_memory_sqlite) return;
-    var rt = initRuntime(std.testing.allocator, &.{ .backend = "sqlite" }, "/tmp") orelse
+    var ws = try TestWorkspace.init(std.testing.allocator);
+    defer ws.deinit(std.testing.allocator);
+
+    var rt = initRuntime(std.testing.allocator, &.{ .backend = "sqlite" }, ws.path) orelse
         return error.TestUnexpectedResult;
     defer rt.deinit();
 
@@ -1308,6 +1328,9 @@ test "initRuntime with cache enabled creates ResponseCache" {
     if (!build_options.enable_sqlite) return error.SkipZigTest;
     try requireBackendEnabledForTests("none");
 
+    var ws = try TestWorkspace.init(std.testing.allocator);
+    defer ws.deinit(std.testing.allocator);
+
     var rt = initRuntime(std.testing.allocator, &.{
         .backend = "none",
         .response_cache = .{
@@ -1315,7 +1338,7 @@ test "initRuntime with cache enabled creates ResponseCache" {
             .ttl_minutes = 5,
             .max_entries = 100,
         },
-    }, "/tmp") orelse return;
+    }, ws.path) orelse return;
     defer rt.deinit();
     try std.testing.expect(rt.response_cache != null);
     try std.testing.expect(rt._cache_db_path != null);
@@ -1462,6 +1485,9 @@ test "initRuntime with search.provider=none has no vector store" {
 
 test "initRuntime resolves sqlite_sidecar mode when explicitly configured" {
     if (!build_options.enable_memory_sqlite) return;
+    var ws = try TestWorkspace.init(std.testing.allocator);
+    defer ws.deinit(std.testing.allocator);
+
     var rt = initRuntime(std.testing.allocator, &.{
         .backend = "sqlite",
         .search = .{
@@ -1469,7 +1495,7 @@ test "initRuntime resolves sqlite_sidecar mode when explicitly configured" {
             .query = .{ .hybrid = .{ .enabled = true } },
             .store = .{ .kind = "sqlite_sidecar" },
         },
-    }, "/tmp") orelse return error.TestUnexpectedResult;
+    }, ws.path) orelse return error.TestUnexpectedResult;
     defer rt.deinit();
 
     try std.testing.expect(rt._vector_store != null);
@@ -1478,6 +1504,9 @@ test "initRuntime resolves sqlite_sidecar mode when explicitly configured" {
 
 test "initRuntime uses configured relative sqlite_sidecar path" {
     if (!build_options.enable_memory_sqlite) return;
+    var ws = try TestWorkspace.init(std.testing.allocator);
+    defer ws.deinit(std.testing.allocator);
+
     var rt = initRuntime(std.testing.allocator, &.{
         .backend = "sqlite",
         .search = .{
@@ -1488,15 +1517,23 @@ test "initRuntime uses configured relative sqlite_sidecar path" {
                 .sidecar_path = "vectors-custom.db",
             },
         },
-    }, "/tmp") orelse return error.TestUnexpectedResult;
+    }, ws.path) orelse return error.TestUnexpectedResult;
     defer rt.deinit();
 
+    const expected_path = try std.fs.path.join(std.testing.allocator, &.{ ws.path, "vectors-custom.db" });
+    defer std.testing.allocator.free(expected_path);
+
     try std.testing.expect(rt._sidecar_db_path != null);
-    try std.testing.expectEqualStrings("/tmp/vectors-custom.db", std.mem.span(rt._sidecar_db_path.?));
+    try std.testing.expectEqualStrings(expected_path, std.mem.span(rt._sidecar_db_path.?));
 }
 
 test "initRuntime uses configured absolute sqlite_sidecar path" {
     if (!build_options.enable_memory_sqlite) return;
+    var ws = try TestWorkspace.init(std.testing.allocator);
+    defer ws.deinit(std.testing.allocator);
+    const absolute_sidecar_path = try std.fs.path.join(std.testing.allocator, &.{ ws.path, "vectors-absolute.db" });
+    defer std.testing.allocator.free(absolute_sidecar_path);
+
     var rt = initRuntime(std.testing.allocator, &.{
         .backend = "sqlite",
         .search = .{
@@ -1504,18 +1541,21 @@ test "initRuntime uses configured absolute sqlite_sidecar path" {
             .query = .{ .hybrid = .{ .enabled = true } },
             .store = .{
                 .kind = "sqlite_sidecar",
-                .sidecar_path = "/tmp/vectors-absolute.db",
+                .sidecar_path = absolute_sidecar_path,
             },
         },
-    }, "/tmp") orelse return error.TestUnexpectedResult;
+    }, ws.path) orelse return error.TestUnexpectedResult;
     defer rt.deinit();
 
     try std.testing.expect(rt._sidecar_db_path != null);
-    try std.testing.expectEqualStrings("/tmp/vectors-absolute.db", std.mem.span(rt._sidecar_db_path.?));
+    try std.testing.expectEqualStrings(absolute_sidecar_path, std.mem.span(rt._sidecar_db_path.?));
 }
 
 test "initRuntime respects search.enabled=false" {
     if (!build_options.enable_memory_sqlite) return;
+    var ws = try TestWorkspace.init(std.testing.allocator);
+    defer ws.deinit(std.testing.allocator);
+
     var rt = initRuntime(std.testing.allocator, &.{
         .backend = "sqlite",
         .search = .{
@@ -1523,7 +1563,7 @@ test "initRuntime respects search.enabled=false" {
             .provider = "openai",
             .query = .{ .hybrid = .{ .enabled = true } },
         },
-    }, "/tmp") orelse return error.TestUnexpectedResult;
+    }, ws.path) orelse return error.TestUnexpectedResult;
     defer rt.deinit();
 
     try std.testing.expect(rt._engine == null);
@@ -1538,6 +1578,9 @@ test "initRuntime respects search.enabled=false" {
 
 test "initRuntime durable_outbox uses max of embed/vector retry config" {
     if (!build_options.enable_memory_sqlite) return;
+    var ws = try TestWorkspace.init(std.testing.allocator);
+    defer ws.deinit(std.testing.allocator);
+
     var rt = initRuntime(std.testing.allocator, &.{
         .backend = "sqlite",
         .search = .{
@@ -1549,7 +1592,7 @@ test "initRuntime durable_outbox uses max of embed/vector retry config" {
                 .vector_max_retries = 5,
             },
         },
-    }, "/tmp") orelse return error.TestUnexpectedResult;
+    }, ws.path) orelse return error.TestUnexpectedResult;
     defer rt.deinit();
 
     const ob = rt._outbox orelse return error.TestUnexpectedResult;
@@ -1606,6 +1649,9 @@ test "initRuntime fail_fast returns null when durable outbox is unavailable" {
 
 test "syncVectorAfterStore enqueues when durable outbox is active" {
     if (!build_options.enable_memory_sqlite) return;
+    var ws = try TestWorkspace.init(std.testing.allocator);
+    defer ws.deinit(std.testing.allocator);
+
     var rt = initRuntime(std.testing.allocator, &.{
         .backend = "sqlite",
         .search = .{
@@ -1615,7 +1661,7 @@ test "syncVectorAfterStore enqueues when durable outbox is active" {
                 .mode = "durable_outbox",
             },
         },
-    }, "/tmp") orelse return error.TestUnexpectedResult;
+    }, ws.path) orelse return error.TestUnexpectedResult;
     defer rt.deinit();
 
     const ob = rt._outbox orelse return error.TestUnexpectedResult;
@@ -1627,6 +1673,9 @@ test "syncVectorAfterStore enqueues when durable outbox is active" {
 
 test "deleteFromVectorStore enqueues delete when durable outbox is active" {
     if (!build_options.enable_memory_sqlite) return;
+    var ws = try TestWorkspace.init(std.testing.allocator);
+    defer ws.deinit(std.testing.allocator);
+
     var rt = initRuntime(std.testing.allocator, &.{
         .backend = "sqlite",
         .search = .{
@@ -1636,7 +1685,7 @@ test "deleteFromVectorStore enqueues delete when durable outbox is active" {
                 .mode = "durable_outbox",
             },
         },
-    }, "/tmp") orelse return error.TestUnexpectedResult;
+    }, ws.path) orelse return error.TestUnexpectedResult;
     defer rt.deinit();
 
     const ob = rt._outbox orelse return error.TestUnexpectedResult;
