@@ -232,6 +232,7 @@ pub const Agent = struct {
     model_fallbacks: []const config_types.ModelFallbackEntry = &.{},
     temperature: f64,
     workspace_dir: []const u8,
+    allowed_paths: []const []const u8 = &.{},
     max_tool_iterations: u32,
     max_history_messages: u32,
     auto_save: bool,
@@ -354,6 +355,7 @@ pub const Agent = struct {
             .model_fallbacks = cfg.reliability.model_fallbacks,
             .temperature = cfg.default_temperature,
             .workspace_dir = cfg.workspace_dir,
+            .allowed_paths = cfg.autonomy.allowed_paths,
             .max_tool_iterations = cfg.agent.max_tool_iterations,
             .max_history_messages = cfg.agent.max_history_messages,
             .auto_save = cfg.memory.auto_save,
@@ -1218,34 +1220,49 @@ pub const Agent = struct {
             return error.ProviderDoesNotSupportVision;
         }
 
-        // Allow reading from the platform temp dir (where Telegram photos are saved).
-        const tmp_dir = platform.getTempDir(arena) catch null;
-        const allowed: []const []const u8 = if (tmp_dir) |td| blk: {
-            const trimmed_tmp = std.mem.trimRight(u8, td, "/\\");
-            if (trimmed_tmp.len == 0) break :blk &.{};
-
-            const resolved_tmp = std.fs.realpathAlloc(arena, trimmed_tmp) catch null;
-            if (resolved_tmp) |rt| {
-                // Include both env TMPDIR and canonical realpath to handle
-                // /var vs /private/var aliases on macOS.
-                if (!std.mem.eql(u8, rt, trimmed_tmp)) {
-                    const dirs = try arena.alloc([]const u8, 2);
-                    dirs[0] = trimmed_tmp;
-                    dirs[1] = rt;
-                    break :blk dirs;
-                }
-            }
-
-            const dirs = try arena.alloc([]const u8, 1);
-            // Strip trailing separator so pathStartsWith works correctly
-            // (TMPDIR on macOS ends with '/')
-            dirs[0] = trimmed_tmp;
-            break :blk dirs;
-        } else &.{};
+        // Allow local multimodal reads from:
+        // - workspace (e.g. screenshot tool output),
+        // - autonomy.allowed_paths,
+        // - platform temp dir (e.g. Telegram downloaded files).
+        var allowed_dirs_list: std.ArrayListUnmanaged([]const u8) = .empty;
+        try appendMultimodalAllowedDir(arena, &allowed_dirs_list, self.workspace_dir);
+        for (self.allowed_paths) |dir| {
+            try appendMultimodalAllowedDir(arena, &allowed_dirs_list, dir);
+        }
+        if (platform.getTempDir(arena) catch null) |tmp_dir| {
+            try appendMultimodalAllowedDir(arena, &allowed_dirs_list, tmp_dir);
+        }
+        const allowed = try allowed_dirs_list.toOwnedSlice(arena);
 
         return multimodal.prepareMessagesForProvider(arena, m, .{
             .allowed_dirs = allowed,
         });
+    }
+
+    fn appendMultimodalAllowedDir(
+        arena: std.mem.Allocator,
+        dirs: *std.ArrayListUnmanaged([]const u8),
+        raw_dir: []const u8,
+    ) !void {
+        const trimmed = std.mem.trimRight(u8, raw_dir, "/\\");
+        if (trimmed.len == 0) return;
+
+        if (!containsMultimodalDir(dirs.items, trimmed)) {
+            try dirs.append(arena, trimmed);
+        }
+
+        // Add canonical path variant too (/var <-> /private/var on macOS).
+        const canonical = std.fs.realpathAlloc(arena, trimmed) catch return;
+        if (!containsMultimodalDir(dirs.items, canonical)) {
+            try dirs.append(arena, canonical);
+        }
+    }
+
+    fn containsMultimodalDir(dirs: []const []const u8, target: []const u8) bool {
+        for (dirs) |dir| {
+            if (std.mem.eql(u8, dir, target)) return true;
+        }
+        return false;
     }
 
     /// Build a flat ChatMessage slice from owned history.
@@ -1816,6 +1833,97 @@ test "Agent buildProviderMessages uses model-aware vision capability" {
     const messages = try agent.buildProviderMessages(arena);
     try std.testing.expectEqual(@as(usize, 1), messages.len);
     try std.testing.expect(messages[0].content_parts != null);
+}
+
+test "Agent buildProviderMessages allows workspace image paths" {
+    const DummyProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{};
+        }
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+        fn supportsVision(_: *anyopaque) bool {
+            return true;
+        }
+        fn supportsVisionForModel(_: *anyopaque, _: []const u8) bool {
+            return true;
+        }
+        fn getName(_: *anyopaque) []const u8 {
+            return "dummy";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "screen.png",
+        .data = "\x89PNG\x0d\x0a\x1a\x0a",
+    });
+
+    const allocator = std.testing.allocator;
+    const workspace_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace_path);
+    const image_path = try std.fs.path.join(allocator, &.{ workspace_path, "screen.png" });
+    defer allocator.free(image_path);
+
+    var dummy: u8 = 0;
+    const vtable = Provider.VTable{
+        .chatWithSystem = DummyProvider.chatWithSystem,
+        .chat = DummyProvider.chat,
+        .supportsNativeTools = DummyProvider.supportsNativeTools,
+        .supports_vision = DummyProvider.supportsVision,
+        .supports_vision_for_model = DummyProvider.supportsVisionForModel,
+        .getName = DummyProvider.getName,
+        .deinit = DummyProvider.deinitFn,
+    };
+    const prov = Provider{ .ptr = @ptrCast(&dummy), .vtable = &vtable };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = prov,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "vision-model",
+        .temperature = 0.7,
+        .workspace_dir = workspace_path,
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try std.fmt.allocPrint(allocator, "Inspect [IMAGE:{s}]", .{image_path}),
+    });
+
+    var arena_impl = std.heap.ArenaAllocator.init(allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    const messages = try agent.buildProviderMessages(arena);
+
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expect(messages[0].content_parts != null);
+    const parts = messages[0].content_parts.?;
+    var has_image_part = false;
+    for (parts) |part| {
+        if (part == .image_base64) {
+            has_image_part = true;
+            break;
+        }
+    }
+    try std.testing.expect(has_image_part);
 }
 
 test "Agent max_tool_iterations default" {
