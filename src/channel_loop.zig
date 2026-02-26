@@ -347,6 +347,9 @@ pub fn runTelegramLoop(
         tg_ptr.last_update_id = saved_update_id;
     }
 
+    // Ensure polling mode is active without dropping queued updates.
+    tg_ptr.deleteWebhookKeepPending();
+
     // Register bot commands
     tg_ptr.setMyCommands();
     var persisted_update_id: i64 = tg_ptr.last_update_id;

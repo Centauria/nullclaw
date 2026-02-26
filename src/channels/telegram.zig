@@ -545,6 +545,19 @@ pub const TelegramChannel = struct {
         self.allocator.free(resp);
     }
 
+    /// Disable webhook mode before polling, preserving queued updates.
+    pub fn deleteWebhookKeepPending(self: *TelegramChannel) void {
+        var url_buf: [512]u8 = undefined;
+        const url = self.apiUrl(&url_buf, "deleteWebhook") catch return;
+
+        const body = "{\"drop_pending_updates\":false}";
+        const resp = root.http_util.curlPostWithProxy(self.allocator, url, body, &.{}, self.proxy, "10") catch |err| {
+            log.warn("deleteWebhook failed: {}", .{err});
+            return;
+        };
+        self.allocator.free(resp);
+    }
+
     /// Skip all pending updates accumulated while bot was offline.
     /// Fetches with offset=-1 to get only the latest update, then advances past it.
     pub fn dropPendingUpdates(self: *TelegramChannel) void {

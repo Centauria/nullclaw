@@ -1869,6 +1869,8 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         tg.last_update_id = saved_update_id;
     }
 
+    tg.deleteWebhookKeepPending();
+
     // Register bot commands in Telegram's "/" menu
     tg.setMyCommands();
 
