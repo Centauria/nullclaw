@@ -346,7 +346,7 @@ Use `channels.web` for a browser UI (local or remote behind reverse proxy):
 - Remote host: set `"listen": "0.0.0.0"` and terminate TLS at proxy/CDN (`wss://...`).
 - If `auth_token` is omitted, runtime falls back to env vars:
   `NULLCLAW_WEB_TOKEN`, `NULLCLAW_GATEWAY_TOKEN`, `OPENCLAW_GATEWAY_TOKEN`, then generates ephemeral token.
-- Demo page: `examples/web-ui/index.html`.
+- UI/extension should live in a separate repository and connect via this WebSocket endpoint.
 
 ## Gateway API
 
