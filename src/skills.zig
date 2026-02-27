@@ -1083,7 +1083,9 @@ fn pathIsSymlink(path: []const u8) !bool {
     _ = dir.readLink(entry_name, &link_buf) catch |err| switch (err) {
         error.NotLink => return false,
         error.FileNotFound => return false,
-        else => return err,
+        // On Windows some regular paths can surface unexpected NTSTATUS values
+        // through readLink(); treat them as "not a symlink" to avoid false failures.
+        else => return false,
     };
     return true;
 }

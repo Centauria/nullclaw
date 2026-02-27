@@ -37,6 +37,9 @@ fn workspaceFileDeviceId(file: *const std.fs.File) ?u64 {
 fn pathStartsWith(path: []const u8, prefix: []const u8) bool {
     if (!std.mem.startsWith(u8, path, prefix)) return false;
     if (path.len == prefix.len) return true;
+    if (prefix.len > 0 and (prefix[prefix.len - 1] == '/' or prefix[prefix.len - 1] == '\\')) {
+        return true;
+    }
     const c = path[prefix.len];
     return c == '/' or c == '\\';
 }
@@ -602,6 +605,13 @@ fn workspaceFileExists(
 // ═══════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════
+
+test "pathStartsWith handles root prefixes" {
+    try std.testing.expect(pathStartsWith("/tmp/workspace", "/"));
+    try std.testing.expect(pathStartsWith("C:\\tmp\\workspace", "C:\\"));
+    try std.testing.expect(pathStartsWith("/tmp/workspace", "/tmp"));
+    try std.testing.expect(!pathStartsWith("/tmpx/workspace", "/tmp"));
+}
 
 test "buildSystemPrompt includes core sections" {
     const allocator = std.testing.allocator;
