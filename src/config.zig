@@ -697,9 +697,13 @@ pub const Config = struct {
         InvalidPort,
         InvalidRetryCount,
         InvalidBackoffMs,
+        InvalidWebTransport,
         InvalidWebPath,
         InvalidWebAuthToken,
         InvalidWebOrigin,
+        MissingWebRelayUrl,
+        InvalidWebRelayUrl,
+        InvalidWebRelayAgentId,
     };
 
     pub fn validate(self: *const Config) ValidationError!void {
@@ -728,7 +732,11 @@ pub const Config = struct {
             return ValidationError.InvalidBackoffMs;
         }
         for (self.channels.web) |web_cfg| {
-            if (!config_types.WebConfig.isPathWellFormed(web_cfg.path)) {
+            if (!config_types.WebConfig.isValidTransport(web_cfg.transport)) {
+                return ValidationError.InvalidWebTransport;
+            }
+            const relay_transport = config_types.WebConfig.isRelayTransport(web_cfg.transport);
+            if (!relay_transport and !config_types.WebConfig.isPathWellFormed(web_cfg.path)) {
                 return ValidationError.InvalidWebPath;
             }
             if (web_cfg.auth_token) |token| {
@@ -736,9 +744,24 @@ pub const Config = struct {
                     return ValidationError.InvalidWebAuthToken;
                 }
             }
-            for (web_cfg.allowed_origins) |origin| {
-                if (!config_types.WebConfig.isValidAllowedOrigin(origin)) {
-                    return ValidationError.InvalidWebOrigin;
+            if (web_cfg.relay_token) |token| {
+                if (!config_types.WebConfig.isValidAuthToken(token)) {
+                    return ValidationError.InvalidWebAuthToken;
+                }
+            }
+            if (relay_transport) {
+                const relay_url = web_cfg.relay_url orelse return ValidationError.MissingWebRelayUrl;
+                if (!config_types.WebConfig.isValidRelayUrl(relay_url)) {
+                    return ValidationError.InvalidWebRelayUrl;
+                }
+                if (!config_types.WebConfig.isValidRelayAgentId(web_cfg.relay_agent_id)) {
+                    return ValidationError.InvalidWebRelayAgentId;
+                }
+            } else {
+                for (web_cfg.allowed_origins) |origin| {
+                    if (!config_types.WebConfig.isValidAllowedOrigin(origin)) {
+                        return ValidationError.InvalidWebOrigin;
+                    }
                 }
             }
         }
@@ -767,9 +790,13 @@ pub const Config = struct {
             ValidationError.InvalidPort => std.debug.print("Config error: gateway port must be non-zero.\n", .{}),
             ValidationError.InvalidRetryCount => std.debug.print("Config error: provider_retries must be <= 100.\n", .{}),
             ValidationError.InvalidBackoffMs => std.debug.print("Config error: provider_backoff_ms must be <= 600000.\n", .{}),
+            ValidationError.InvalidWebTransport => std.debug.print("Config error: channels.web.accounts.<id>.transport must be 'local' or 'relay'.\n", .{}),
             ValidationError.InvalidWebPath => std.debug.print("Config error: channels.web.accounts.<id>.path must start with '/'.\n", .{}),
-            ValidationError.InvalidWebAuthToken => std.debug.print("Config error: channels.web.accounts.<id>.auth_token must be 16-128 printable chars without whitespace.\n", .{}),
+            ValidationError.InvalidWebAuthToken => std.debug.print("Config error: channels.web.accounts.<id>.auth_token/relay_token must be 16-128 printable chars without whitespace.\n", .{}),
             ValidationError.InvalidWebOrigin => std.debug.print("Config error: channels.web.accounts.<id>.allowed_origins entries must be '*', 'null', or absolute origins (scheme://...).\n", .{}),
+            ValidationError.MissingWebRelayUrl => std.debug.print("Config error: channels.web.accounts.<id>.relay_url is required when transport='relay'.\n", .{}),
+            ValidationError.InvalidWebRelayUrl => std.debug.print("Config error: channels.web.accounts.<id>.relay_url must be an absolute wss:// URL.\n", .{}),
+            ValidationError.InvalidWebRelayAgentId => std.debug.print("Config error: channels.web.accounts.<id>.relay_agent_id must be non-empty, <=64 chars, and contain no whitespace.\n", .{}),
         }
     }
 
@@ -1645,6 +1672,110 @@ test "validation accepts well formed web channel config" {
             .path = "/ws",
             .auth_token = "relay-token-0123456789",
             .allowed_origins = &origins,
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .web = &web_accounts,
+        },
+    };
+    try cfg.validate();
+}
+
+test "validation rejects unknown web transport mode" {
+    const web_accounts = [_]WebConfig{
+        .{
+            .account_id = "default",
+            .transport = "direct",
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .web = &web_accounts,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidWebTransport, cfg.validate());
+}
+
+test "validation rejects relay transport without relay_url" {
+    const web_accounts = [_]WebConfig{
+        .{
+            .account_id = "default",
+            .transport = "relay",
+            .relay_agent_id = "agent-1",
+            .relay_token = "relay-token-0123456789",
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .web = &web_accounts,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.MissingWebRelayUrl, cfg.validate());
+}
+
+test "validation rejects malformed relay url and agent id" {
+    const bad_url_accounts = [_]WebConfig{
+        .{
+            .account_id = "default",
+            .transport = "relay",
+            .relay_url = "https://relay.nullclaw.io/ws",
+            .relay_agent_id = "agent-1",
+            .relay_token = "relay-token-0123456789",
+        },
+    };
+    const cfg_bad_url = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .web = &bad_url_accounts,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidWebRelayUrl, cfg_bad_url.validate());
+
+    const bad_agent_accounts = [_]WebConfig{
+        .{
+            .account_id = "default",
+            .transport = "relay",
+            .relay_url = "wss://relay.nullclaw.io/ws",
+            .relay_agent_id = "bad agent",
+            .relay_token = "relay-token-0123456789",
+        },
+    };
+    const cfg_bad_agent = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .web = &bad_agent_accounts,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidWebRelayAgentId, cfg_bad_agent.validate());
+}
+
+test "validation accepts well formed web relay config" {
+    const web_accounts = [_]WebConfig{
+        .{
+            .account_id = "default",
+            .transport = "relay",
+            .relay_url = "wss://relay.nullclaw.io/ws/agent",
+            .relay_agent_id = "agent-1",
+            .relay_token = "relay-token-0123456789",
         },
     };
     const cfg = Config{
@@ -2794,6 +2925,30 @@ test "parse web accounts with auth token path and allowed origins" {
     allocator.free(wc.auth_token.?);
     for (wc.allowed_origins) |origin| allocator.free(origin);
     allocator.free(wc.allowed_origins);
+    allocator.free(cfg.channels.web);
+}
+
+test "parse web relay account fields" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"channels": {"web": {"accounts": {"default": {"transport": "relay", "relay_url": "wss://relay.nullclaw.io/ws/agent", "relay_agent_id": "edge-1", "relay_token": "relay-token-999999"}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.channels.web.len);
+    const wc = cfg.channels.web[0];
+    try std.testing.expectEqualStrings("default", wc.account_id);
+    try std.testing.expectEqualStrings("relay", wc.transport);
+    try std.testing.expectEqualStrings("wss://relay.nullclaw.io/ws/agent", wc.relay_url.?);
+    try std.testing.expectEqualStrings("edge-1", wc.relay_agent_id);
+    try std.testing.expectEqualStrings("relay-token-999999", wc.relay_token.?);
+
+    allocator.free(wc.account_id);
+    allocator.free(wc.transport);
+    allocator.free(wc.relay_url.?);
+    allocator.free(wc.relay_agent_id);
+    allocator.free(wc.relay_token.?);
     allocator.free(cfg.channels.web);
 }
 

@@ -322,7 +322,7 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
 
 ### Web UI / Browser Relay
 
-Use `channels.web` for a browser UI (local or remote behind reverse proxy):
+Use `channels.web` for browser UI events (WebChannel v1):
 
 ```json
 {
@@ -330,6 +330,7 @@ Use `channels.web` for a browser UI (local or remote behind reverse proxy):
     "web": {
       "accounts": {
         "default": {
+          "transport": "local",
           "listen": "127.0.0.1",
           "port": 32123,
           "path": "/ws",
@@ -347,6 +348,27 @@ Use `channels.web` for a browser UI (local or remote behind reverse proxy):
 - If `auth_token` is omitted, runtime falls back to env vars:
   `NULLCLAW_WEB_TOKEN`, `NULLCLAW_GATEWAY_TOKEN`, `OPENCLAW_GATEWAY_TOKEN`, then generates ephemeral token.
 - UI/extension should live in a separate repository and connect via this WebSocket endpoint.
+- Relay transport (outbound agent socket) is configured via:
+
+```json
+{
+  "channels": {
+    "web": {
+      "accounts": {
+        "default": {
+          "transport": "relay",
+          "relay_url": "wss://relay.nullclaw.io/ws/agent",
+          "relay_agent_id": "default",
+          "relay_token": "replace-with-relay-token"
+        }
+      }
+    }
+  }
+}
+```
+
+- Relay token fallback env vars (in order): `NULLCLAW_RELAY_TOKEN`, `NULLCLAW_WEB_TOKEN`, `NULLCLAW_GATEWAY_TOKEN`, `OPENCLAW_GATEWAY_TOKEN`.
+- WebChannel event envelope is defined in [`spec/webchannel_v1.json`](spec/webchannel_v1.json).
 
 ## Gateway API
 

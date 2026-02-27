@@ -364,10 +364,15 @@ pub const MaixCamConfig = struct {
 
 pub const WebConfig = struct {
     pub const DEFAULT_PATH: []const u8 = "/ws";
+    pub const DEFAULT_TRANSPORT: []const u8 = "local";
     pub const MIN_AUTH_TOKEN_LEN: usize = 16;
     pub const MAX_AUTH_TOKEN_LEN: usize = 128;
+    pub const MAX_RELAY_AGENT_ID_LEN: usize = 64;
 
     account_id: []const u8 = "default",
+    /// "local" starts an inbound WS listener in nullclaw.
+    /// "relay" keeps a single outbound WS connection to a relay service.
+    transport: []const u8 = DEFAULT_TRANSPORT,
     port: u16 = 32123,
     listen: []const u8 = "127.0.0.1",
     path: []const u8 = DEFAULT_PATH,
@@ -379,6 +384,12 @@ pub const WebConfig = struct {
     /// Optional allowlist for Origin header values (exact match, supports "*").
     /// Empty = allow any origin.
     allowed_origins: []const []const u8 = &.{},
+    /// Relay endpoint for transport="relay" (must be wss://...).
+    relay_url: ?[]const u8 = null,
+    /// Stable logical agent identity on relay side.
+    relay_agent_id: []const u8 = "default",
+    /// Optional dedicated relay auth token. Falls back to auth_token and env vars.
+    relay_token: ?[]const u8 = null,
 
     fn trimTrailingSlash(value: []const u8) []const u8 {
         if (value.len <= 1) return value;
@@ -397,6 +408,16 @@ pub const WebConfig = struct {
         if (trimmed.len == 0 or trimmed[0] != '/') return false;
         if (std.mem.indexOfAny(u8, trimmed, "?#")) |_| return false;
         return true;
+    }
+
+    pub fn isValidTransport(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        return std.mem.eql(u8, trimmed, "local") or std.mem.eql(u8, trimmed, "relay");
+    }
+
+    pub fn isRelayTransport(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        return std.mem.eql(u8, trimmed, "relay");
     }
 
     fn isAllowedTokenByte(byte: u8) bool {
@@ -424,6 +445,25 @@ pub const WebConfig = struct {
         const authority = normalized[scheme_sep + 3 ..];
         if (authority.len == 0) return false;
         if (std.mem.indexOfAny(u8, authority, "/?#")) |_| return false;
+        return true;
+    }
+
+    pub fn isValidRelayUrl(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (!std.mem.startsWith(u8, trimmed, "wss://")) return false;
+        const no_scheme = trimmed["wss://".len..];
+        if (no_scheme.len == 0) return false;
+        const path_pos = std.mem.indexOfAny(u8, no_scheme, "/?");
+        const authority = if (path_pos) |idx| no_scheme[0..idx] else no_scheme;
+        if (authority.len == 0) return false;
+        if (std.mem.indexOfAny(u8, authority, " \t\r\n")) |_| return false;
+        return true;
+    }
+
+    pub fn isValidRelayAgentId(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0 or trimmed.len > MAX_RELAY_AGENT_ID_LEN) return false;
+        if (std.mem.indexOfAny(u8, trimmed, " \t\r\n")) |_| return false;
         return true;
     }
 };
@@ -1002,12 +1042,16 @@ pub const SessionConfig = struct {
 test "WebConfig defaults" {
     const cfg = WebConfig{};
     try std.testing.expectEqualStrings("default", cfg.account_id);
+    try std.testing.expectEqualStrings(WebConfig.DEFAULT_TRANSPORT, cfg.transport);
     try std.testing.expectEqual(@as(u16, 32123), cfg.port);
     try std.testing.expectEqualStrings("127.0.0.1", cfg.listen);
     try std.testing.expectEqualStrings(WebConfig.DEFAULT_PATH, cfg.path);
     try std.testing.expectEqual(@as(u16, 10), cfg.max_connections);
     try std.testing.expect(cfg.auth_token == null);
     try std.testing.expectEqual(@as(usize, 0), cfg.allowed_origins.len);
+    try std.testing.expect(cfg.relay_url == null);
+    try std.testing.expectEqualStrings("default", cfg.relay_agent_id);
+    try std.testing.expect(cfg.relay_token == null);
 }
 
 test "WebConfig normalizePath trims and normalizes" {
@@ -1034,4 +1078,26 @@ test "WebConfig origin validation accepts wildcard and absolute origins" {
     try std.testing.expect(!WebConfig.isValidAllowedOrigin(""));
     try std.testing.expect(!WebConfig.isValidAllowedOrigin("relay.nullclaw.io"));
     try std.testing.expect(!WebConfig.isValidAllowedOrigin("https://relay.nullclaw.io/path"));
+}
+
+test "WebConfig transport validation supports local and relay" {
+    try std.testing.expect(WebConfig.isValidTransport("local"));
+    try std.testing.expect(WebConfig.isValidTransport("relay"));
+    try std.testing.expect(!WebConfig.isValidTransport("direct"));
+    try std.testing.expect(WebConfig.isRelayTransport("relay"));
+    try std.testing.expect(!WebConfig.isRelayTransport("local"));
+}
+
+test "WebConfig relay URL validation requires wss authority" {
+    try std.testing.expect(WebConfig.isValidRelayUrl("wss://relay.nullclaw.io/ws"));
+    try std.testing.expect(WebConfig.isValidRelayUrl("wss://relay.nullclaw.io"));
+    try std.testing.expect(!WebConfig.isValidRelayUrl("ws://relay.nullclaw.io/ws"));
+    try std.testing.expect(!WebConfig.isValidRelayUrl("https://relay.nullclaw.io/ws"));
+    try std.testing.expect(!WebConfig.isValidRelayUrl("wss://"));
+}
+
+test "WebConfig relay agent id validation enforces non-empty id" {
+    try std.testing.expect(WebConfig.isValidRelayAgentId("default"));
+    try std.testing.expect(!WebConfig.isValidRelayAgentId(""));
+    try std.testing.expect(!WebConfig.isValidRelayAgentId("agent id with spaces"));
 }

@@ -1,0 +1,81 @@
+{
+  "name": "webchannel_v1",
+  "version": 1,
+  "envelope": {
+    "required": [
+      "v",
+      "type",
+      "session_id"
+    ],
+    "optional": [
+      "agent_id",
+      "request_id",
+      "payload"
+    ],
+    "fields": {
+      "v": "integer (must be 1)",
+      "type": "string event name",
+      "session_id": "string conversation/session id",
+      "agent_id": "string logical agent id",
+      "request_id": "string request correlation id",
+      "payload": "object event-specific payload"
+    }
+  },
+  "events": {
+    "user_message": {
+      "direction": "ui_to_core",
+      "payload": {
+        "content": "string required",
+        "sender_id": "string optional"
+      }
+    },
+    "assistant_chunk": {
+      "direction": "core_to_ui",
+      "payload": {
+        "content": "string required"
+      }
+    },
+    "assistant_final": {
+      "direction": "core_to_ui",
+      "payload": {
+        "content": "string required"
+      }
+    },
+    "tool_call": {
+      "direction": "core_to_ui",
+      "payload": {
+        "name": "string required",
+        "arguments": "object required"
+      }
+    },
+    "tool_result": {
+      "direction": "core_to_ui",
+      "payload": {
+        "ok": "boolean required",
+        "result": "any optional",
+        "error": "string optional"
+      }
+    },
+    "approval_request": {
+      "direction": "core_to_ui",
+      "payload": {
+        "action": "string required",
+        "reason": "string optional"
+      }
+    },
+    "approval_response": {
+      "direction": "ui_to_core",
+      "payload": {
+        "approved": "boolean required",
+        "reason": "string optional"
+      }
+    },
+    "error": {
+      "direction": "both",
+      "payload": {
+        "message": "string required",
+        "code": "string optional"
+      }
+    }
+  }
+}
