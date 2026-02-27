@@ -366,7 +366,15 @@ pub const WebConfig = struct {
     account_id: []const u8 = "default",
     port: u16 = 32123,
     listen: []const u8 = "127.0.0.1",
+    path: []const u8 = "/ws",
     max_connections: u16 = 10,
+    /// Static auth token for browser/extension clients.
+    /// If null, WebChannel falls back to env (NULLCLAW_WEB_TOKEN/NULLCLAW_GATEWAY_TOKEN/OPENCLAW_GATEWAY_TOKEN),
+    /// then to an ephemeral runtime token.
+    auth_token: ?[]const u8 = null,
+    /// Optional allowlist for Origin header values (exact match, supports "*").
+    /// Empty = allow any origin.
+    allowed_origins: []const []const u8 = &.{},
 };
 
 pub const ChannelsConfig = struct {
@@ -945,5 +953,8 @@ test "WebConfig defaults" {
     try std.testing.expectEqualStrings("default", cfg.account_id);
     try std.testing.expectEqual(@as(u16, 32123), cfg.port);
     try std.testing.expectEqualStrings("127.0.0.1", cfg.listen);
+    try std.testing.expectEqualStrings("/ws", cfg.path);
     try std.testing.expectEqual(@as(u16, 10), cfg.max_connections);
+    try std.testing.expect(cfg.auth_token == null);
+    try std.testing.expectEqual(@as(usize, 0), cfg.allowed_origins.len);
 }

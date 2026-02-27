@@ -320,6 +320,34 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
 }
 ```
 
+### Web UI / Browser Relay
+
+Use `channels.web` for a browser UI (local or remote behind reverse proxy):
+
+```json
+{
+  "channels": {
+    "web": {
+      "accounts": {
+        "default": {
+          "listen": "127.0.0.1",
+          "port": 32123,
+          "path": "/ws",
+          "auth_token": "replace-with-long-random-token",
+          "allowed_origins": ["http://localhost:5173", "chrome-extension://your-extension-id"]
+        }
+      }
+    }
+  }
+}
+```
+
+- Local: keep `"listen": "127.0.0.1"`.
+- Remote host: set `"listen": "0.0.0.0"` and terminate TLS at proxy/CDN (`wss://...`).
+- If `auth_token` is omitted, runtime falls back to env vars:
+  `NULLCLAW_WEB_TOKEN`, `NULLCLAW_GATEWAY_TOKEN`, `OPENCLAW_GATEWAY_TOKEN`, then generates ephemeral token.
+- Demo page: `examples/web-ui/index.html`.
+
 ## Gateway API
 
 | Endpoint | Method | Auth | Description |

@@ -11,12 +11,16 @@ pub const WebChannel = struct {
     allocator: std.mem.Allocator,
     port: u16,
     listen_address: []const u8,
+    ws_path: []const u8,
     max_connections: u16,
     account_id: []const u8,
+    configured_auth_token: ?[]const u8,
+    allowed_origins: []const []const u8,
     bus: ?*bus_mod.Bus = null,
 
-    // Auth token: 32 random bytes → 64 hex chars
-    token: [64]u8 = undefined,
+    // Active auth token (configured/env/generate).
+    token: [128]u8 = [_]u8{0} ** 128,
+    token_len: u8 = 0,
     token_initialized: bool = false,
 
     // Runtime state
@@ -42,12 +46,20 @@ pub const WebChannel = struct {
             @intCast(ConnectionList.MAX_TRACKED)
         else
             cfg.max_connections;
+        const trimmed_path = std.mem.trim(u8, cfg.path, " \t\r\n");
+        const normalized_path = if (trimmed_path.len == 0 or trimmed_path[0] != '/')
+            "/ws"
+        else
+            trimTrailingSlash(trimmed_path);
         return .{
             .allocator = allocator,
             .port = cfg.port,
             .listen_address = cfg.listen,
+            .ws_path = normalized_path,
             .max_connections = clamped_max_connections,
             .account_id = cfg.account_id,
+            .configured_auth_token = cfg.auth_token,
+            .allowed_origins = cfg.allowed_origins,
         };
     }
 
@@ -59,26 +71,64 @@ pub const WebChannel = struct {
         self.bus = b;
     }
 
+    fn setActiveToken(self: *WebChannel, raw: []const u8) !void {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len < 16 or trimmed.len > self.token.len) return error.InvalidAuthToken;
+        @memset(self.token[0..], 0);
+        @memcpy(self.token[0..trimmed.len], trimmed);
+        self.token_len = @intCast(trimmed.len);
+        self.token_initialized = true;
+    }
+
+    fn loadTokenFromEnv(self: *WebChannel) !bool {
+        const env_candidates = [_][]const u8{
+            "NULLCLAW_WEB_TOKEN",
+            "NULLCLAW_GATEWAY_TOKEN",
+            "OPENCLAW_GATEWAY_TOKEN",
+        };
+        inline for (env_candidates) |name| {
+            if (std.process.getEnvVarOwned(self.allocator, name)) |raw| {
+                defer self.allocator.free(raw);
+                try self.setActiveToken(raw);
+                log.info("Web channel auth token loaded from env {s}", .{name});
+                return true;
+            } else |_| {}
+        }
+        return false;
+    }
+
     /// Generate a random auth token (64 hex chars from 32 random bytes).
     pub fn generateToken(self: *WebChannel) void {
         var random_bytes: [32]u8 = undefined;
         std.crypto.random.bytes(&random_bytes);
-        self.token = std.fmt.bytesToHex(random_bytes, .lower);
+        const hex = std.fmt.bytesToHex(random_bytes, .lower);
+        @memset(self.token[0..], 0);
+        @memcpy(self.token[0..hex.len], &hex);
+        self.token_len = @intCast(hex.len);
         self.token_initialized = true;
     }
 
     /// Validate a token string against the stored token.
     pub fn validateToken(self: *const WebChannel, candidate: []const u8) bool {
         if (!self.token_initialized) return false;
-        if (candidate.len != 64) return false;
-        return std.crypto.timing_safe.eql([64]u8, candidate[0..64].*, self.token);
+        const active = self.token[0..self.token_len];
+        if (candidate.len != active.len) return false;
+        var diff: u8 = 0;
+        for (candidate, active) |a, b| diff |= a ^ b;
+        return diff == 0;
     }
 
     // ── vtable implementations ──
 
     fn wsStart(ctx: *anyopaque) anyerror!void {
         const self: *WebChannel = @ptrCast(@alignCast(ctx));
-        self.generateToken();
+        if (self.configured_auth_token) |token| {
+            try self.setActiveToken(token);
+            log.info("Web channel auth token loaded from channels.web auth_token", .{});
+        } else if (!(try self.loadTokenFromEnv())) {
+            self.generateToken();
+            log.warn("Web channel using ephemeral auth token; set channels.web.accounts.<id>.auth_token for stable UI access", .{});
+        }
 
         self.server = WsServer.init(self.allocator, .{
             .port = self.port,
@@ -99,8 +149,8 @@ pub const WebChannel = struct {
             return err;
         };
 
-        log.info("Web channel ready on {s}:{d}", .{ self.listen_address, self.port });
-        log.info("Web channel auth token generated (hidden in logs)", .{});
+        log.info("Web channel ready on ws://{s}:{d}{s}", .{ self.listen_address, self.port, self.ws_path });
+        log.info("Web channel auth token active (hidden in logs)", .{});
     }
 
     fn serverListenThread(self: *WebChannel) void {
@@ -260,9 +310,27 @@ pub const WebChannel = struct {
         session_len: u8 = 0,
 
         pub fn init(h: *websocket.Handshake, conn: *websocket.Conn, web_channel: *WebChannel) !WsHandler {
-            // Validate token from URL query string: /ws?token=<64hex>
             const url = h.url;
-            const token = extractQueryParam(url, "token") orelse {
+            const path = trimTrailingSlash(extractPath(url));
+            if (!std.mem.eql(u8, path, web_channel.ws_path)) {
+                log.warn("WS connection rejected: invalid path '{s}'", .{path});
+                return error.Forbidden;
+            }
+
+            if (web_channel.allowed_origins.len > 0) {
+                const origin = h.headers.get("origin") orelse {
+                    log.warn("WS connection rejected: missing origin", .{});
+                    return error.Forbidden;
+                };
+                if (!isOriginAllowed(web_channel.allowed_origins, origin)) {
+                    log.warn("WS connection rejected: origin not allowed", .{});
+                    return error.Forbidden;
+                }
+            }
+
+            const auth_header = h.headers.get("authorization");
+            const token = extractQueryParam(url, "token") orelse
+                extractBearerToken(auth_header orelse "") orelse {
                 log.warn("WS connection rejected: no token", .{});
                 return error.Forbidden;
             };
@@ -398,6 +466,37 @@ fn extractQueryParam(url: []const u8, param_name: []const u8) ?[]const u8 {
     return null;
 }
 
+fn extractPath(url: []const u8) []const u8 {
+    const qmark = std.mem.indexOfScalar(u8, url, '?') orelse return url;
+    return url[0..qmark];
+}
+
+fn trimTrailingSlash(value: []const u8) []const u8 {
+    if (value.len <= 1) return value;
+    if (value[value.len - 1] == '/') return value[0 .. value.len - 1];
+    return value;
+}
+
+fn isOriginAllowed(allowed_origins: []const []const u8, origin: []const u8) bool {
+    const normalized_origin = trimTrailingSlash(std.mem.trim(u8, origin, " \t\r\n"));
+    for (allowed_origins) |entry_raw| {
+        const entry = trimTrailingSlash(std.mem.trim(u8, entry_raw, " \t\r\n"));
+        if (std.mem.eql(u8, entry, "*")) return true;
+        if (std.ascii.eqlIgnoreCase(entry, normalized_origin)) return true;
+    }
+    return false;
+}
+
+fn extractBearerToken(authorization_header: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, authorization_header, " \t\r\n");
+    const prefix = "Bearer ";
+    if (trimmed.len <= prefix.len) return null;
+    if (!std.ascii.eqlIgnoreCase(trimmed[0..prefix.len], prefix)) return null;
+    const token = std.mem.trim(u8, trimmed[prefix.len..], " \t\r\n");
+    if (token.len == 0) return null;
+    return token;
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════
@@ -406,23 +505,43 @@ test "WebChannel initFromConfig uses defaults" {
     const ch = WebChannel.initFromConfig(std.testing.allocator, .{});
     try std.testing.expectEqual(@as(u16, 32123), ch.port);
     try std.testing.expectEqualStrings("127.0.0.1", ch.listen_address);
+    try std.testing.expectEqualStrings("/ws", ch.ws_path);
     try std.testing.expectEqual(@as(u16, 10), ch.max_connections);
     try std.testing.expectEqualStrings("default", ch.account_id);
+    try std.testing.expect(ch.configured_auth_token == null);
+    try std.testing.expectEqual(@as(usize, 0), ch.allowed_origins.len);
     try std.testing.expect(ch.bus == null);
     try std.testing.expect(!ch.running.load(.acquire));
 }
 
 test "WebChannel initFromConfig uses custom values" {
+    const origins = [_][]const u8{
+        "http://localhost:5173",
+        "chrome-extension://testid",
+    };
     const ch = WebChannel.initFromConfig(std.testing.allocator, .{
         .port = 8080,
         .listen = "0.0.0.0",
+        .path = "/relay/",
         .max_connections = 5,
         .account_id = "web-main",
+        .auth_token = "test-token-123456",
+        .allowed_origins = &origins,
     });
     try std.testing.expectEqual(@as(u16, 8080), ch.port);
     try std.testing.expectEqualStrings("0.0.0.0", ch.listen_address);
+    try std.testing.expectEqualStrings("/relay", ch.ws_path);
     try std.testing.expectEqual(@as(u16, 5), ch.max_connections);
     try std.testing.expectEqualStrings("web-main", ch.account_id);
+    try std.testing.expectEqualStrings("test-token-123456", ch.configured_auth_token.?);
+    try std.testing.expectEqual(@as(usize, 2), ch.allowed_origins.len);
+}
+
+test "WebChannel initFromConfig falls back to default path for invalid value" {
+    const ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .path = "relay",
+    });
+    try std.testing.expectEqualStrings("/ws", ch.ws_path);
 }
 
 test "WebChannel initFromConfig clamps max_connections to tracked limit" {
@@ -443,8 +562,8 @@ test "WebChannel generateToken produces 64 hex chars" {
     try std.testing.expect(!ch.token_initialized);
     ch.generateToken();
     try std.testing.expect(ch.token_initialized);
-    try std.testing.expectEqual(@as(usize, 64), ch.token.len);
-    for (&ch.token) |c| {
+    try std.testing.expectEqual(@as(usize, 64), ch.token_len);
+    for (ch.token[0..ch.token_len]) |c| {
         try std.testing.expect((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'));
     }
 }
@@ -452,7 +571,7 @@ test "WebChannel generateToken produces 64 hex chars" {
 test "WebChannel validateToken accepts correct token" {
     var ch = WebChannel.initFromConfig(std.testing.allocator, .{});
     ch.generateToken();
-    try std.testing.expect(ch.validateToken(&ch.token));
+    try std.testing.expect(ch.validateToken(ch.token[0..ch.token_len]));
 }
 
 test "WebChannel validateToken rejects wrong token" {
@@ -460,7 +579,7 @@ test "WebChannel validateToken rejects wrong token" {
     ch.generateToken();
     var bad_token: [64]u8 = undefined;
     @memset(&bad_token, 'x');
-    try std.testing.expect(!ch.validateToken(&bad_token));
+    try std.testing.expect(!ch.validateToken(bad_token[0..]));
 }
 
 test "WebChannel validateToken rejects wrong length" {
@@ -487,7 +606,7 @@ test "WebChannel two instances have different tokens" {
     var ch2 = WebChannel.initFromConfig(std.testing.allocator, .{});
     ch1.generateToken();
     ch2.generateToken();
-    try std.testing.expect(!std.mem.eql(u8, &ch1.token, &ch2.token));
+    try std.testing.expect(!std.mem.eql(u8, ch1.token[0..ch1.token_len], ch2.token[0..ch2.token_len]));
 }
 
 test "extractQueryParam finds token" {
@@ -503,6 +622,31 @@ test "extractQueryParam returns null for missing param" {
     try std.testing.expect(extractQueryParam("/ws?token=abc", "session_id") == null);
     try std.testing.expect(extractQueryParam("/ws", "token") == null);
     try std.testing.expect(extractQueryParam("/ws?", "token") == null);
+}
+
+test "extractPath strips query" {
+    try std.testing.expectEqualStrings("/ws", extractPath("/ws?token=abc"));
+    try std.testing.expectEqualStrings("/relay", extractPath("/relay"));
+}
+
+test "isOriginAllowed handles exact wildcard and slash normalization" {
+    const allowed = [_][]const u8{
+        "http://localhost:5173/",
+        "chrome-extension://abc",
+    };
+    try std.testing.expect(isOriginAllowed(&allowed, "http://localhost:5173"));
+    try std.testing.expect(isOriginAllowed(&allowed, "chrome-extension://abc/"));
+    try std.testing.expect(!isOriginAllowed(&allowed, "https://example.com"));
+
+    const wildcard = [_][]const u8{"*"};
+    try std.testing.expect(isOriginAllowed(&wildcard, "https://anything.example"));
+}
+
+test "extractBearerToken parses bearer auth header" {
+    try std.testing.expectEqualStrings("tok123", extractBearerToken("Bearer tok123").?);
+    try std.testing.expectEqualStrings("tok123", extractBearerToken("bearer tok123").?);
+    try std.testing.expect(extractBearerToken("Basic abc") == null);
+    try std.testing.expect(extractBearerToken("") == null);
 }
 
 test "ConnectionList add and remove" {

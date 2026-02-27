@@ -2661,6 +2661,34 @@ test "parse maixcam multi-account sorted with custom names" {
     try std.testing.expectEqual(@as(u16, 8888), cfg.channels.maixcam[1].port);
 }
 
+test "parse web accounts with auth token path and allowed origins" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"channels": {"web": {"accounts": {"default": {"listen": "0.0.0.0", "port": 32123, "path": "/ws", "auth_token": "relay-token-123456", "allowed_origins": ["https://relay.nullclaw.io", "chrome-extension://abc"]}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.channels.web.len);
+    const wc = cfg.channels.web[0];
+    try std.testing.expectEqualStrings("default", wc.account_id);
+    try std.testing.expectEqualStrings("0.0.0.0", wc.listen);
+    try std.testing.expectEqual(@as(u16, 32123), wc.port);
+    try std.testing.expectEqualStrings("/ws", wc.path);
+    try std.testing.expectEqualStrings("relay-token-123456", wc.auth_token.?);
+    try std.testing.expectEqual(@as(usize, 2), wc.allowed_origins.len);
+    try std.testing.expectEqualStrings("https://relay.nullclaw.io", wc.allowed_origins[0]);
+    try std.testing.expectEqualStrings("chrome-extension://abc", wc.allowed_origins[1]);
+
+    allocator.free(wc.account_id);
+    allocator.free(wc.listen);
+    allocator.free(wc.path);
+    allocator.free(wc.auth_token.?);
+    for (wc.allowed_origins) |origin| allocator.free(origin);
+    allocator.free(wc.allowed_origins);
+    allocator.free(cfg.channels.web);
+}
+
 test "multi-account channels keep all accounts sorted by account id" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
