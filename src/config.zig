@@ -39,6 +39,7 @@ pub const QQGroupPolicy = config_types.QQGroupPolicy;
 pub const QQConfig = config_types.QQConfig;
 pub const OneBotConfig = config_types.OneBotConfig;
 pub const MaixCamConfig = config_types.MaixCamConfig;
+pub const WebConfig = config_types.WebConfig;
 pub const ChannelsConfig = config_types.ChannelsConfig;
 pub const MemoryConfig = config_types.MemoryConfig;
 pub const TunnelConfig = config_types.TunnelConfig;
@@ -696,6 +697,9 @@ pub const Config = struct {
         InvalidPort,
         InvalidRetryCount,
         InvalidBackoffMs,
+        InvalidWebPath,
+        InvalidWebAuthToken,
+        InvalidWebOrigin,
     };
 
     pub fn validate(self: *const Config) ValidationError!void {
@@ -723,6 +727,21 @@ pub const Config = struct {
         if (self.reliability.provider_backoff_ms > 600_000) {
             return ValidationError.InvalidBackoffMs;
         }
+        for (self.channels.web) |web_cfg| {
+            if (!config_types.WebConfig.isPathWellFormed(web_cfg.path)) {
+                return ValidationError.InvalidWebPath;
+            }
+            if (web_cfg.auth_token) |token| {
+                if (!config_types.WebConfig.isValidAuthToken(token)) {
+                    return ValidationError.InvalidWebAuthToken;
+                }
+            }
+            for (web_cfg.allowed_origins) |origin| {
+                if (!config_types.WebConfig.isValidAllowedOrigin(origin)) {
+                    return ValidationError.InvalidWebOrigin;
+                }
+            }
+        }
     }
 
     /// Print a human-readable validation error to stderr.
@@ -748,6 +767,9 @@ pub const Config = struct {
             ValidationError.InvalidPort => std.debug.print("Config error: gateway port must be non-zero.\n", .{}),
             ValidationError.InvalidRetryCount => std.debug.print("Config error: provider_retries must be <= 100.\n", .{}),
             ValidationError.InvalidBackoffMs => std.debug.print("Config error: provider_backoff_ms must be <= 600000.\n", .{}),
+            ValidationError.InvalidWebPath => std.debug.print("Config error: channels.web.accounts.<id>.path must start with '/'.\n", .{}),
+            ValidationError.InvalidWebAuthToken => std.debug.print("Config error: channels.web.accounts.<id>.auth_token must be URL-safe and at least 16 chars.\n", .{}),
+            ValidationError.InvalidWebOrigin => std.debug.print("Config error: channels.web.accounts.<id>.allowed_origins entries must be '*' or absolute origins (scheme://...).\n", .{}),
         }
     }
 
@@ -1548,6 +1570,92 @@ test "validation accepts max boundary backoff" {
         .allocator = std.testing.allocator,
     };
     cfg.reliability.provider_backoff_ms = 600_000;
+    try cfg.validate();
+}
+
+test "validation rejects malformed web path" {
+    const web_accounts = [_]WebConfig{
+        .{
+            .account_id = "default",
+            .path = "relay",
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .web = &web_accounts,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidWebPath, cfg.validate());
+}
+
+test "validation rejects malformed web auth token" {
+    const web_accounts = [_]WebConfig{
+        .{
+            .account_id = "default",
+            .path = "/ws",
+            .auth_token = "bad token",
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .web = &web_accounts,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidWebAuthToken, cfg.validate());
+}
+
+test "validation rejects malformed web origin entry" {
+    const origins = [_][]const u8{"relay.nullclaw.io"};
+    const web_accounts = [_]WebConfig{
+        .{
+            .account_id = "default",
+            .path = "/ws",
+            .auth_token = "relay-token-0123456789",
+            .allowed_origins = &origins,
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .web = &web_accounts,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidWebOrigin, cfg.validate());
+}
+
+test "validation accepts well formed web channel config" {
+    const origins = [_][]const u8{
+        "https://relay.nullclaw.io",
+        "chrome-extension://abcdefghijklmnop",
+    };
+    const web_accounts = [_]WebConfig{
+        .{
+            .account_id = "default",
+            .path = "/ws",
+            .auth_token = "relay-token-0123456789",
+            .allowed_origins = &origins,
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .web = &web_accounts,
+        },
+    };
     try cfg.validate();
 }
 

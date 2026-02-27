@@ -46,11 +46,7 @@ pub const WebChannel = struct {
             @intCast(ConnectionList.MAX_TRACKED)
         else
             cfg.max_connections;
-        const trimmed_path = std.mem.trim(u8, cfg.path, " \t\r\n");
-        const normalized_path = if (trimmed_path.len == 0 or trimmed_path[0] != '/')
-            "/ws"
-        else
-            trimTrailingSlash(trimmed_path);
+        const normalized_path = config_types.WebConfig.normalizePath(cfg.path);
         return .{
             .allocator = allocator,
             .port = cfg.port,
@@ -72,8 +68,8 @@ pub const WebChannel = struct {
     }
 
     fn setActiveToken(self: *WebChannel, raw: []const u8) !void {
+        if (!config_types.WebConfig.isValidAuthToken(raw)) return error.InvalidAuthToken;
         const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-        if (trimmed.len < 16 or trimmed.len > self.token.len) return error.InvalidAuthToken;
         @memset(self.token[0..], 0);
         @memcpy(self.token[0..trimmed.len], trimmed);
         self.token_len = @intCast(trimmed.len);
@@ -86,10 +82,16 @@ pub const WebChannel = struct {
             "NULLCLAW_GATEWAY_TOKEN",
             "OPENCLAW_GATEWAY_TOKEN",
         };
-        inline for (env_candidates) |name| {
+        for (env_candidates) |name| {
             if (std.process.getEnvVarOwned(self.allocator, name)) |raw| {
                 defer self.allocator.free(raw);
-                try self.setActiveToken(raw);
+                self.setActiveToken(raw) catch |err| {
+                    if (err == error.InvalidAuthToken) {
+                        log.warn("Ignoring invalid Web channel auth token from env {s}", .{name});
+                        continue;
+                    }
+                    return err;
+                };
                 log.info("Web channel auth token loaded from env {s}", .{name});
                 return true;
             } else |_| {}
@@ -505,7 +507,7 @@ test "WebChannel initFromConfig uses defaults" {
     const ch = WebChannel.initFromConfig(std.testing.allocator, .{});
     try std.testing.expectEqual(@as(u16, 32123), ch.port);
     try std.testing.expectEqualStrings("127.0.0.1", ch.listen_address);
-    try std.testing.expectEqualStrings("/ws", ch.ws_path);
+    try std.testing.expectEqualStrings(config_types.WebConfig.DEFAULT_PATH, ch.ws_path);
     try std.testing.expectEqual(@as(u16, 10), ch.max_connections);
     try std.testing.expectEqualStrings("default", ch.account_id);
     try std.testing.expect(ch.configured_auth_token == null);
@@ -541,7 +543,7 @@ test "WebChannel initFromConfig falls back to default path for invalid value" {
     const ch = WebChannel.initFromConfig(std.testing.allocator, .{
         .path = "relay",
     });
-    try std.testing.expectEqualStrings("/ws", ch.ws_path);
+    try std.testing.expectEqualStrings(config_types.WebConfig.DEFAULT_PATH, ch.ws_path);
 }
 
 test "WebChannel initFromConfig clamps max_connections to tracked limit" {
@@ -647,6 +649,11 @@ test "extractBearerToken parses bearer auth header" {
     try std.testing.expectEqualStrings("tok123", extractBearerToken("bearer tok123").?);
     try std.testing.expect(extractBearerToken("Basic abc") == null);
     try std.testing.expect(extractBearerToken("") == null);
+}
+
+test "WebChannel setActiveToken rejects non url-safe tokens" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{});
+    try std.testing.expectError(error.InvalidAuthToken, ch.setActiveToken("bad token with spaces"));
 }
 
 test "ConnectionList add and remove" {

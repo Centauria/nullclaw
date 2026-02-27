@@ -363,10 +363,14 @@ pub const MaixCamConfig = struct {
 };
 
 pub const WebConfig = struct {
+    pub const DEFAULT_PATH: []const u8 = "/ws";
+    pub const MIN_AUTH_TOKEN_LEN: usize = 16;
+    pub const MAX_AUTH_TOKEN_LEN: usize = 128;
+
     account_id: []const u8 = "default",
     port: u16 = 32123,
     listen: []const u8 = "127.0.0.1",
-    path: []const u8 = "/ws",
+    path: []const u8 = DEFAULT_PATH,
     max_connections: u16 = 10,
     /// Static auth token for browser/extension clients.
     /// If null, WebChannel falls back to env (NULLCLAW_WEB_TOKEN/NULLCLAW_GATEWAY_TOKEN/OPENCLAW_GATEWAY_TOKEN),
@@ -375,6 +379,47 @@ pub const WebConfig = struct {
     /// Optional allowlist for Origin header values (exact match, supports "*").
     /// Empty = allow any origin.
     allowed_origins: []const []const u8 = &.{},
+
+    fn trimTrailingSlash(value: []const u8) []const u8 {
+        if (value.len <= 1) return value;
+        if (value[value.len - 1] == '/') return value[0 .. value.len - 1];
+        return value;
+    }
+
+    pub fn normalizePath(raw: []const u8) []const u8 {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0 or trimmed[0] != '/') return DEFAULT_PATH;
+        return trimTrailingSlash(trimmed);
+    }
+
+    pub fn isPathWellFormed(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0 or trimmed[0] != '/') return false;
+        if (std.mem.indexOfAny(u8, trimmed, "?#")) |_| return false;
+        return true;
+    }
+
+    fn isAllowedTokenByte(byte: u8) bool {
+        return std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '_' or byte == '.' or byte == '~';
+    }
+
+    pub fn isValidAuthToken(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len < MIN_AUTH_TOKEN_LEN or trimmed.len > MAX_AUTH_TOKEN_LEN) return false;
+        for (trimmed) |byte| {
+            if (!isAllowedTokenByte(byte)) return false;
+        }
+        return true;
+    }
+
+    pub fn isValidAllowedOrigin(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) return false;
+        if (std.mem.eql(u8, trimmed, "*")) return true;
+        if (std.mem.indexOfAny(u8, trimmed, " \t\r\n")) |_| return false;
+        const scheme_sep = std.mem.indexOf(u8, trimmed, "://") orelse return false;
+        return scheme_sep + 3 < trimmed.len;
+    }
 };
 
 pub const ChannelsConfig = struct {
@@ -953,8 +998,30 @@ test "WebConfig defaults" {
     try std.testing.expectEqualStrings("default", cfg.account_id);
     try std.testing.expectEqual(@as(u16, 32123), cfg.port);
     try std.testing.expectEqualStrings("127.0.0.1", cfg.listen);
-    try std.testing.expectEqualStrings("/ws", cfg.path);
+    try std.testing.expectEqualStrings(WebConfig.DEFAULT_PATH, cfg.path);
     try std.testing.expectEqual(@as(u16, 10), cfg.max_connections);
     try std.testing.expect(cfg.auth_token == null);
     try std.testing.expectEqual(@as(usize, 0), cfg.allowed_origins.len);
+}
+
+test "WebConfig normalizePath trims and normalizes" {
+    try std.testing.expectEqualStrings("/ws", WebConfig.normalizePath("/ws/"));
+    try std.testing.expectEqualStrings("/relay", WebConfig.normalizePath(" /relay/ "));
+    try std.testing.expectEqualStrings(WebConfig.DEFAULT_PATH, WebConfig.normalizePath("relay"));
+    try std.testing.expectEqualStrings(WebConfig.DEFAULT_PATH, WebConfig.normalizePath(""));
+}
+
+test "WebConfig token validation enforces url-safe constraints" {
+    try std.testing.expect(WebConfig.isValidAuthToken("relay-token-0123456789"));
+    try std.testing.expect(!WebConfig.isValidAuthToken("short"));
+    try std.testing.expect(!WebConfig.isValidAuthToken("invalid token with spaces"));
+    try std.testing.expect(!WebConfig.isValidAuthToken("contains/slash-0123456789"));
+}
+
+test "WebConfig origin validation accepts wildcard and absolute origins" {
+    try std.testing.expect(WebConfig.isValidAllowedOrigin("*"));
+    try std.testing.expect(WebConfig.isValidAllowedOrigin("https://relay.nullclaw.io"));
+    try std.testing.expect(WebConfig.isValidAllowedOrigin("chrome-extension://abcdefghijklmnop"));
+    try std.testing.expect(!WebConfig.isValidAllowedOrigin(""));
+    try std.testing.expect(!WebConfig.isValidAllowedOrigin("relay.nullclaw.io"));
 }

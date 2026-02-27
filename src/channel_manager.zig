@@ -23,6 +23,7 @@ const onebot = channels_mod.onebot;
 const maixcam = channels_mod.maixcam;
 const slack = channels_mod.slack;
 const irc = channels_mod.irc;
+const web = channels_mod.web;
 const Channel = channels_mod.Channel;
 
 const log = std.log.scoped(.channel_manager);
@@ -1023,7 +1024,12 @@ test "ChannelManager collects web channel from config" {
     const allocator = arena.allocator();
 
     const web_accounts = [_]config_types.WebConfig{
-        .{ .account_id = "local", .port = 32123 },
+        .{
+            .account_id = "local",
+            .port = 32123,
+            .path = "/relay/",
+            .auth_token = "relay-token-0123456789",
+        },
     };
 
     const config = Config{
@@ -1051,4 +1057,9 @@ test "ChannelManager collects web channel from config" {
     // Verify it was registered with correct listener type
     const web_entry = findEntryByNameAccount(mgr.channelEntries(), "web", "local").?;
     try std.testing.expectEqual(ListenerType.gateway_loop, web_entry.listener_type);
+
+    const web_ptr: *web.WebChannel = @ptrCast(@alignCast(web_entry.channel.ptr));
+    try std.testing.expect(web_ptr.bus == &event_bus);
+    try std.testing.expectEqualStrings("/relay", web_ptr.ws_path);
+    try std.testing.expectEqualStrings("relay-token-0123456789", web_ptr.configured_auth_token.?);
 }
