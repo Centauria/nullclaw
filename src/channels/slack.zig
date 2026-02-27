@@ -1078,12 +1078,8 @@ test "slack channel health check" {
     try std.testing.expect(ch.healthCheck());
 }
 
-test "slack socket thread stack size is architecture-aware" {
-    if (builtin.cpu.arch == .aarch64 or builtin.cpu.arch == .arm) {
-        try std.testing.expectEqual(@as(usize, 1024 * 1024), SlackChannel.SOCKET_THREAD_STACK_SIZE);
-    } else {
-        try std.testing.expectEqual(@as(usize, 256 * 1024), SlackChannel.SOCKET_THREAD_STACK_SIZE);
-    }
+test "slack socket thread stack size is 2MB" {
+    try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024), SlackChannel.SOCKET_THREAD_STACK_SIZE);
 }
 
 test "slack fallback to polling when app token is missing and polling targets exist" {

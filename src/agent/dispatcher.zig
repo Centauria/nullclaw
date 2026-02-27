@@ -892,15 +892,29 @@ fn parseInvokeTagCall(allocator: std.mem.Allocator, inner: []const u8) !ParsedTo
     const tool_name = std.mem.trim(u8, after_prefix[1 .. name_end + 1], " \t\r\n");
     if (tool_name.len == 0) return error.EmptyToolName;
 
+
     const invoke_close_tag = "</invoke>";
     // Look for the '>' that closes the <invoke ...> tag. 
     // It might not be immediately after the name (e.g. models sometimes insert a comma or space).
-    const invoke_tag_end_pos = std.mem.indexOfScalar(u8, after_prefix[name_end + 1 ..], '>') orelse return error.InvalidInvokeFormat;
-    const full_invoke_content = after_prefix[name_end + 1 + invoke_tag_end_pos + 1 ..];
+    // Robustness: if we find "<parameter" before ">", then the ">" was missing entirely.
+    const invoke_tag_end_pos = blk: {
+        const next_gt = std.mem.indexOfScalar(u8, after_prefix[name_end + 1 ..], '>');
+        const next_param = std.mem.indexOf(u8, after_prefix[name_end + 1 ..], "<parameter");
+        if (next_gt) |gt_pos| {
+            if (next_param) |p_pos| {
+                if (p_pos < gt_pos) break :blk name_end; // missing '>', started param
+            }
+            break :blk name_end + 1 + gt_pos;
+        }
+        break :blk name_end;
+    };
+
+    const full_invoke_content = after_prefix[invoke_tag_end_pos + 1 ..];
     const invoke_body = if (std.mem.indexOf(u8, full_invoke_content, invoke_close_tag)) |ic|
         full_invoke_content[0..ic]
     else
         full_invoke_content;
+
 
     var args_buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer args_buf.deinit(allocator);
@@ -909,11 +923,19 @@ fn parseInvokeTagCall(allocator: std.mem.Allocator, inner: []const u8) !ParsedTo
 
     var remaining = invoke_body;
     var first = true;
-    const param_prefix = "<parameter name=";
     const param_close = "</parameter>";
 
-    while (std.mem.indexOf(u8, remaining, param_prefix)) |ps| {
-        const after_param = remaining[ps + param_prefix.len ..];
+    while (remaining.len > 0) {
+        const ps = std.mem.indexOf(u8, remaining, "parameter name=") orelse break;
+        // Find the '<' before 'parameter'
+        var tag_start = ps;
+        while (tag_start > 0 and remaining[tag_start] != '<') tag_start -= 1;
+        if (remaining[tag_start] != '<') {
+            remaining = if (ps + 15 < remaining.len) remaining[ps + 15 ..] else "";
+            continue;
+        }
+
+        const after_param = remaining[ps + 15 ..];
         const p_name_quote = if (after_param.len > 0) after_param[0] else ' ';
         if (p_name_quote != '"' and p_name_quote != '\'') break;
 
@@ -1014,19 +1036,27 @@ fn parseHybridTagCall(allocator: std.mem.Allocator, inner: []const u8) !ParsedTo
     defer found_keys.deinit();
 
     // Look for XML parameters
-    const p_prefix = "<parameter name=";
     const p_close = "</parameter>";
     var search_idx: usize = 0;
-    while (std.mem.indexOf(u8, remaining[search_idx..], p_prefix)) |ps| {
+    while (search_idx < remaining.len) {
+        const ps = std.mem.indexOf(u8, remaining[search_idx..], "parameter name=") orelse break;
         const absolute_ps = search_idx + ps;
-        const after_param = remaining[absolute_ps + p_prefix.len ..];
+        // Find the '<' before 'parameter'
+        var tag_start = absolute_ps;
+        while (tag_start > 0 and remaining[tag_start] != '<') tag_start -= 1;
+        if (remaining[tag_start] != '<') {
+            search_idx = absolute_ps + 15;
+            continue;
+        }
+
+        const after_param = remaining[absolute_ps + 15 ..];
         if (after_param.len == 0) {
-            search_idx = absolute_ps + p_prefix.len;
+            search_idx = absolute_ps + 15;
             continue;
         }
         const quote = after_param[0];
         if (quote != '"' and quote != '\'') {
-            search_idx = absolute_ps + p_prefix.len;
+            search_idx = absolute_ps + 15;
             continue;
         }
         if (std.mem.indexOfScalar(u8, after_param[1..], quote)) |q_end| {
@@ -1048,12 +1078,12 @@ fn parseHybridTagCall(allocator: std.mem.Allocator, inner: []const u8) !ParsedTo
                         try w.writeAll(val_json);
                         try found_keys.put(key, {});
                     }
-                    search_idx = absolute_ps + p_prefix.len + q_end + 1 + tag_end + 1 + val_end + p_close.len;
+                    search_idx = absolute_ps + 15 + q_end + 1 + tag_end + 1 + val_end + p_close.len;
                     continue;
                 }
             }
         }
-        search_idx = absolute_ps + p_prefix.len;
+        search_idx = absolute_ps + 15;
     }
 
     // Look for JSON-style simple key-value pairs (only strings for now as greedy fallback)
