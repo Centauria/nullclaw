@@ -28,6 +28,7 @@ const Command = enum {
     hardware,
     migrate,
     memory,
+    workspace,
     capabilities,
     models,
     auth,
@@ -52,6 +53,7 @@ fn parseCommand(arg: []const u8) ?Command {
         .{ "hardware", .hardware },
         .{ "migrate", .migrate },
         .{ "memory", .memory },
+        .{ "workspace", .workspace },
         .{ "capabilities", .capabilities },
         .{ "models", .models },
         .{ "auth", .auth },
@@ -102,6 +104,7 @@ pub fn main() !void {
         .hardware => try runHardware(allocator, sub_args),
         .migrate => try runMigrate(allocator, sub_args),
         .memory => try runMemory(allocator, sub_args),
+        .workspace => try runWorkspace(allocator, sub_args),
         .capabilities => try runCapabilities(allocator, sub_args),
         .models => try runModels(allocator, sub_args),
         .auth => try runAuth(allocator, sub_args),
@@ -624,6 +627,21 @@ fn printMemoryUsage() void {
     , .{});
 }
 
+fn printWorkspaceUsage() void {
+    std.debug.print(
+        \\Usage: nullclaw workspace <command> [args]
+        \\
+        \\Commands:
+        \\  reset-md [--dry-run] [--include-bootstrap] [--clear-memory-md]
+        \\      Reset prompt markdown files (AGENTS/SOUL/TOOLS/IDENTITY/USER/HEARTBEAT)
+        \\      to bundled defaults.
+        \\      --include-bootstrap  Also rewrite BOOTSTRAP.md
+        \\      --clear-memory-md    Remove MEMORY.md and memory.md if present
+        \\      --dry-run            Show what would be changed without modifying files
+        \\
+    , .{});
+}
+
 fn parsePositiveUsize(arg: []const u8) ?usize {
     const n = std.fmt.parseInt(usize, arg, 10) catch return null;
     if (n == 0) return null;
@@ -881,6 +899,69 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     std.debug.print("Unknown memory command: {s}\n\n", .{subcmd});
     printMemoryUsage();
     std.process.exit(1);
+}
+
+fn runWorkspace(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    if (sub_args.len < 1) {
+        printWorkspaceUsage();
+        std.process.exit(1);
+    }
+
+    var cfg = yc.config.Config.load(allocator) catch {
+        std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
+        std.process.exit(1);
+    };
+    defer cfg.deinit();
+
+    const subcmd = sub_args[0];
+    if (!std.mem.eql(u8, subcmd, "reset-md")) {
+        std.debug.print("Unknown workspace command: {s}\n\n", .{subcmd});
+        printWorkspaceUsage();
+        std.process.exit(1);
+    }
+
+    var include_bootstrap = false;
+    var clear_memory_md = false;
+    var dry_run = false;
+
+    var i: usize = 1;
+    while (i < sub_args.len) : (i += 1) {
+        const arg = sub_args[i];
+        if (std.mem.eql(u8, arg, "--include-bootstrap")) {
+            include_bootstrap = true;
+        } else if (std.mem.eql(u8, arg, "--clear-memory-md")) {
+            clear_memory_md = true;
+        } else if (std.mem.eql(u8, arg, "--dry-run")) {
+            dry_run = true;
+        } else {
+            std.debug.print("Unknown option for workspace reset-md: {s}\n\n", .{arg});
+            printWorkspaceUsage();
+            std.process.exit(1);
+        }
+    }
+
+    const report = try yc.onboard.resetWorkspacePromptFiles(
+        allocator,
+        cfg.workspace_dir,
+        &yc.onboard.ProjectContext{},
+        .{
+            .include_bootstrap = include_bootstrap,
+            .clear_memory_markdown = clear_memory_md,
+            .dry_run = dry_run,
+        },
+    );
+
+    if (dry_run) {
+        std.debug.print(
+            "Dry run complete: would rewrite {d} file(s), would remove {d} file(s).\n",
+            .{ report.rewritten_files, report.removed_files },
+        );
+    } else {
+        std.debug.print(
+            "Workspace markdown reset complete: rewrote {d} file(s), removed {d} file(s).\n",
+            .{ report.rewritten_files, report.removed_files },
+        );
+    }
 }
 
 fn runCapabilities(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
@@ -2337,6 +2418,7 @@ fn printUsage() void {
         \\  hardware    Discover and manage hardware
         \\  migrate     Migrate data from other agent runtimes
         \\  memory      Inspect and maintain memory subsystem
+        \\  workspace   Maintain workspace markdown/bootstrap files
         \\  capabilities Show runtime capabilities manifest
         \\  models      Manage provider model catalogs
         \\  auth        Manage OAuth authentication (OpenAI Codex)
@@ -2355,6 +2437,7 @@ fn printUsage() void {
         \\  hardware <discover|introspect|info> [ARGS]
         \\  migrate openclaw [--dry-run] [--source PATH]
         \\  memory <stats|count|reindex|search|get|list|drain-outbox|forget> [ARGS]
+        \\  workspace reset-md [--dry-run] [--include-bootstrap] [--clear-memory-md]
         \\  capabilities [--json]
         \\  models refresh
         \\  auth <login|status|logout> <provider> [--import-codex]
@@ -2373,6 +2456,7 @@ test "parse known commands" {
     try std.testing.expectEqual(.service, parseCommand("service").?);
     try std.testing.expectEqual(.migrate, parseCommand("migrate").?);
     try std.testing.expectEqual(.memory, parseCommand("memory").?);
+    try std.testing.expectEqual(.workspace, parseCommand("workspace").?);
     try std.testing.expectEqual(.capabilities, parseCommand("capabilities").?);
     try std.testing.expectEqual(.models, parseCommand("models").?);
     try std.testing.expectEqual(.auth, parseCommand("auth").?);

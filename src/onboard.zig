@@ -1573,6 +1573,117 @@ pub fn scaffoldWorkspace(allocator: std.mem.Allocator, workspace_dir: []const u8
     try ensureBootstrapLifecycle(allocator, workspace_dir, identity_tmpl, user_tmpl, had_legacy_user_content);
 }
 
+pub const ResetWorkspacePromptFilesOptions = struct {
+    include_bootstrap: bool = false,
+    clear_memory_markdown: bool = false,
+    dry_run: bool = false,
+};
+
+pub const ResetWorkspacePromptFilesReport = struct {
+    rewritten_files: usize = 0,
+    removed_files: usize = 0,
+};
+
+/// Reset workspace prompt markdown files to bundled defaults.
+/// This intentionally overwrites existing files.
+pub fn resetWorkspacePromptFiles(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+    ctx: *const ProjectContext,
+    options: ResetWorkspacePromptFilesOptions,
+) !ResetWorkspacePromptFilesReport {
+    if (std.fs.path.dirname(workspace_dir)) |parent| {
+        std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    }
+    std.fs.makeDirAbsolute(workspace_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    var report = ResetWorkspacePromptFilesReport{};
+
+    const soul_tmpl = try soulTemplate(allocator, ctx);
+    defer allocator.free(soul_tmpl);
+    const identity_tmpl = try identityTemplate(allocator, ctx);
+    defer allocator.free(identity_tmpl);
+    const user_tmpl = try userTemplate(allocator, ctx);
+    defer allocator.free(user_tmpl);
+
+    const files = [_]struct {
+        filename: []const u8,
+        content: []const u8,
+    }{
+        .{ .filename = "SOUL.md", .content = soul_tmpl },
+        .{ .filename = "AGENTS.md", .content = agentsTemplate() },
+        .{ .filename = "TOOLS.md", .content = toolsTemplate() },
+        .{ .filename = "IDENTITY.md", .content = identity_tmpl },
+        .{ .filename = "USER.md", .content = user_tmpl },
+        .{ .filename = "HEARTBEAT.md", .content = heartbeatTemplate() },
+    };
+
+    for (files) |entry| {
+        _ = try overwriteWorkspaceFile(allocator, workspace_dir, entry.filename, entry.content, options.dry_run);
+        report.rewritten_files += 1;
+    }
+
+    if (options.include_bootstrap) {
+        _ = try overwriteWorkspaceFile(allocator, workspace_dir, "BOOTSTRAP.md", bootstrapTemplate(), options.dry_run);
+        report.rewritten_files += 1;
+    }
+
+    if (options.clear_memory_markdown) {
+        if (try removeWorkspaceFileIfExists(allocator, workspace_dir, "MEMORY.md", options.dry_run)) {
+            report.removed_files += 1;
+        }
+        if (try removeWorkspaceFileIfExists(allocator, workspace_dir, "memory.md", options.dry_run)) {
+            report.removed_files += 1;
+        }
+    }
+
+    return report;
+}
+
+fn overwriteWorkspaceFile(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+    filename: []const u8,
+    content: []const u8,
+    dry_run: bool,
+) !bool {
+    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ workspace_dir, filename });
+    defer allocator.free(path);
+
+    if (dry_run) return true;
+
+    const file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(content);
+    return true;
+}
+
+fn removeWorkspaceFileIfExists(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+    filename: []const u8,
+    dry_run: bool,
+) !bool {
+    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ workspace_dir, filename });
+    defer allocator.free(path);
+
+    if (dry_run) {
+        return fileExistsAbsolute(path);
+    }
+
+    std.fs.deleteFileAbsolute(path) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
 fn writeIfMissing(allocator: std.mem.Allocator, dir: []const u8, filename: []const u8, content: []const u8) !void {
     const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, filename });
     defer allocator.free(path);
@@ -2107,6 +2218,103 @@ test "scaffoldWorkspace is idempotent" {
     try scaffoldWorkspace(std.testing.allocator, base, &ctx);
     // Running again should not fail
     try scaffoldWorkspace(std.testing.allocator, base, &ctx);
+}
+
+test "resetWorkspacePromptFiles overwrites prompt files with defaults" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("AGENTS.md", .{});
+        defer f.close();
+        try f.writeAll("custom-agents-content");
+    }
+    {
+        const f = try tmp.dir.createFile("USER.md", .{});
+        defer f.close();
+        try f.writeAll("custom-user-content");
+    }
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    const report = try resetWorkspacePromptFiles(std.testing.allocator, base, &ProjectContext{}, .{});
+    try std.testing.expectEqual(@as(usize, 6), report.rewritten_files);
+    try std.testing.expectEqual(@as(usize, 0), report.removed_files);
+
+    const agents_content = try tmp.dir.readFileAlloc(std.testing.allocator, "AGENTS.md", 64 * 1024);
+    defer std.testing.allocator.free(agents_content);
+    try std.testing.expect(std.mem.indexOf(u8, agents_content, "AGENTS.md - Your Workspace") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agents_content, "custom-agents-content") == null);
+
+    const user_content = try tmp.dir.readFileAlloc(std.testing.allocator, "USER.md", 64 * 1024);
+    defer std.testing.allocator.free(user_content);
+    try std.testing.expect(std.mem.indexOf(u8, user_content, "USER.md - About Your Human") != null);
+    try std.testing.expect(std.mem.indexOf(u8, user_content, "custom-user-content") == null);
+}
+
+test "resetWorkspacePromptFiles supports dry-run and clearing memory markdown files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("MEMORY.md", .{});
+        defer f.close();
+        try f.writeAll("custom-memory");
+    }
+
+    var has_distinct_case_memory_file = true;
+    const alt = tmp.dir.createFile("memory.md", .{ .exclusive = true }) catch |err| switch (err) {
+        error.PathAlreadyExists => blk: {
+            has_distinct_case_memory_file = false;
+            break :blk null;
+        },
+        else => return err,
+    };
+    if (alt) |f| {
+        defer f.close();
+        try f.writeAll("custom-memory-lower");
+    }
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    const dry_report = try resetWorkspacePromptFiles(std.testing.allocator, base, &ProjectContext{}, .{
+        .clear_memory_markdown = true,
+        .dry_run = true,
+    });
+    try std.testing.expectEqual(@as(usize, 6), dry_report.rewritten_files);
+    try std.testing.expect(dry_report.removed_files >= 1);
+    const memory_file = try tmp.dir.openFile("MEMORY.md", .{});
+    memory_file.close();
+
+    const reset_report = try resetWorkspacePromptFiles(std.testing.allocator, base, &ProjectContext{}, .{
+        .clear_memory_markdown = true,
+    });
+    try std.testing.expectEqual(@as(usize, 6), reset_report.rewritten_files);
+    try std.testing.expect(reset_report.removed_files >= 1);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("MEMORY.md", .{}));
+    if (has_distinct_case_memory_file) {
+        try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("memory.md", .{}));
+    }
+}
+
+test "resetWorkspacePromptFiles creates missing workspace directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const nested = try std.fmt.allocPrint(std.testing.allocator, "{s}/nested/workspace", .{base});
+    defer std.testing.allocator.free(nested);
+
+    const report = try resetWorkspacePromptFiles(std.testing.allocator, nested, &ProjectContext{}, .{});
+    try std.testing.expectEqual(@as(usize, 6), report.rewritten_files);
+
+    const agents_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/AGENTS.md", .{nested});
+    defer std.testing.allocator.free(agents_path);
+    const agents_file = try std.fs.openFileAbsolute(agents_path, .{});
+    agents_file.close();
 }
 
 test "scaffoldWorkspace seeds bootstrap marker for new workspace" {
