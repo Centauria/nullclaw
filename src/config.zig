@@ -704,6 +704,9 @@ pub const Config = struct {
         MissingWebRelayUrl,
         InvalidWebRelayUrl,
         InvalidWebRelayAgentId,
+        InvalidWebRelayPairingCodeTtl,
+        InvalidWebRelayUiTokenTtl,
+        InvalidWebRelayTokenTtl,
     };
 
     pub fn validate(self: *const Config) ValidationError!void {
@@ -757,6 +760,15 @@ pub const Config = struct {
                 if (!config_types.WebConfig.isValidRelayAgentId(web_cfg.relay_agent_id)) {
                     return ValidationError.InvalidWebRelayAgentId;
                 }
+                if (!config_types.WebConfig.isValidRelayPairingCodeTtl(web_cfg.relay_pairing_code_ttl_secs)) {
+                    return ValidationError.InvalidWebRelayPairingCodeTtl;
+                }
+                if (!config_types.WebConfig.isValidRelayUiTokenTtl(web_cfg.relay_ui_token_ttl_secs)) {
+                    return ValidationError.InvalidWebRelayUiTokenTtl;
+                }
+                if (!config_types.WebConfig.isValidRelayTokenTtl(web_cfg.relay_token_ttl_secs)) {
+                    return ValidationError.InvalidWebRelayTokenTtl;
+                }
             } else {
                 for (web_cfg.allowed_origins) |origin| {
                     if (!config_types.WebConfig.isValidAllowedOrigin(origin)) {
@@ -797,6 +809,9 @@ pub const Config = struct {
             ValidationError.MissingWebRelayUrl => std.debug.print("Config error: channels.web.accounts.<id>.relay_url is required when transport='relay'.\n", .{}),
             ValidationError.InvalidWebRelayUrl => std.debug.print("Config error: channels.web.accounts.<id>.relay_url must be an absolute wss:// URL.\n", .{}),
             ValidationError.InvalidWebRelayAgentId => std.debug.print("Config error: channels.web.accounts.<id>.relay_agent_id must be non-empty, <=64 chars, and contain no whitespace.\n", .{}),
+            ValidationError.InvalidWebRelayPairingCodeTtl => std.debug.print("Config error: channels.web.accounts.<id>.relay_pairing_code_ttl_secs must be in [60, 300].\n", .{}),
+            ValidationError.InvalidWebRelayUiTokenTtl => std.debug.print("Config error: channels.web.accounts.<id>.relay_ui_token_ttl_secs must be in [300, 2592000].\n", .{}),
+            ValidationError.InvalidWebRelayTokenTtl => std.debug.print("Config error: channels.web.accounts.<id>.relay_token_ttl_secs must be in [3600, 31536000].\n", .{}),
         }
     }
 
@@ -1788,6 +1803,71 @@ test "validation accepts well formed web relay config" {
         },
     };
     try cfg.validate();
+}
+
+test "validation rejects relay ttl values outside supported ranges" {
+    const bad_pair_ttl = [_]WebConfig{
+        .{
+            .account_id = "default",
+            .transport = "relay",
+            .relay_url = "wss://relay.nullclaw.io/ws/agent",
+            .relay_agent_id = "agent-1",
+            .relay_token = "relay-token-0123456789",
+            .relay_pairing_code_ttl_secs = 30,
+        },
+    };
+    const cfg_bad_pair_ttl = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .web = &bad_pair_ttl,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidWebRelayPairingCodeTtl, cfg_bad_pair_ttl.validate());
+
+    const bad_ui_ttl = [_]WebConfig{
+        .{
+            .account_id = "default",
+            .transport = "relay",
+            .relay_url = "wss://relay.nullclaw.io/ws/agent",
+            .relay_agent_id = "agent-1",
+            .relay_token = "relay-token-0123456789",
+            .relay_ui_token_ttl_secs = 120,
+        },
+    };
+    const cfg_bad_ui_ttl = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .web = &bad_ui_ttl,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidWebRelayUiTokenTtl, cfg_bad_ui_ttl.validate());
+
+    const bad_relay_token_ttl = [_]WebConfig{
+        .{
+            .account_id = "default",
+            .transport = "relay",
+            .relay_url = "wss://relay.nullclaw.io/ws/agent",
+            .relay_agent_id = "agent-1",
+            .relay_token = "relay-token-0123456789",
+            .relay_token_ttl_secs = 120,
+        },
+    };
+    const cfg_bad_relay_token_ttl = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .web = &bad_relay_token_ttl,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidWebRelayTokenTtl, cfg_bad_relay_token_ttl.validate());
 }
 
 // ── JSON parse: sub-config sections ─────────────────────────────
@@ -2931,7 +3011,7 @@ test "parse web accounts with auth token path and allowed origins" {
 test "parse web relay account fields" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"channels": {"web": {"accounts": {"default": {"transport": "relay", "relay_url": "wss://relay.nullclaw.io/ws/agent", "relay_agent_id": "edge-1", "relay_token": "relay-token-999999"}}}}}
+        \\{"channels": {"web": {"accounts": {"default": {"transport": "relay", "relay_url": "wss://relay.nullclaw.io/ws/agent", "relay_agent_id": "edge-1", "relay_token": "relay-token-999999", "relay_token_ttl_secs": 7200, "relay_pairing_code_ttl_secs": 180, "relay_ui_token_ttl_secs": 86400, "relay_e2e_required": true}}}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -2943,6 +3023,10 @@ test "parse web relay account fields" {
     try std.testing.expectEqualStrings("wss://relay.nullclaw.io/ws/agent", wc.relay_url.?);
     try std.testing.expectEqualStrings("edge-1", wc.relay_agent_id);
     try std.testing.expectEqualStrings("relay-token-999999", wc.relay_token.?);
+    try std.testing.expectEqual(@as(u32, 7200), wc.relay_token_ttl_secs);
+    try std.testing.expectEqual(@as(u32, 180), wc.relay_pairing_code_ttl_secs);
+    try std.testing.expectEqual(@as(u32, 86_400), wc.relay_ui_token_ttl_secs);
+    try std.testing.expect(wc.relay_e2e_required);
 
     allocator.free(wc.account_id);
     allocator.free(wc.transport);

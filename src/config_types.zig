@@ -368,6 +368,12 @@ pub const WebConfig = struct {
     pub const MIN_AUTH_TOKEN_LEN: usize = 16;
     pub const MAX_AUTH_TOKEN_LEN: usize = 128;
     pub const MAX_RELAY_AGENT_ID_LEN: usize = 64;
+    pub const MIN_RELAY_PAIRING_CODE_TTL_SECS: u32 = 60;
+    pub const MAX_RELAY_PAIRING_CODE_TTL_SECS: u32 = 300;
+    pub const MIN_RELAY_UI_TOKEN_TTL_SECS: u32 = 300;
+    pub const MAX_RELAY_UI_TOKEN_TTL_SECS: u32 = 2_592_000; // 30 days
+    pub const MIN_RELAY_TOKEN_TTL_SECS: u32 = 3_600;
+    pub const MAX_RELAY_TOKEN_TTL_SECS: u32 = 31_536_000; // 365 days
 
     account_id: []const u8 = "default",
     /// "local" starts an inbound WS listener in nullclaw.
@@ -388,8 +394,18 @@ pub const WebConfig = struct {
     relay_url: ?[]const u8 = null,
     /// Stable logical agent identity on relay side.
     relay_agent_id: []const u8 = "default",
-    /// Optional dedicated relay auth token. Falls back to auth_token and env vars.
+    /// Optional dedicated relay auth token.
+    /// If omitted, relay lifecycle resolves token from NULLCLAW_RELAY_TOKEN,
+    /// then persisted `web-relay-<account_id>` credential, then generates one.
     relay_token: ?[]const u8 = null,
+    /// Expiry for persisted relay token lifecycle (seconds).
+    relay_token_ttl_secs: u32 = 2_592_000,
+    /// One-time pairing code lifetime for relay UI binding (seconds).
+    relay_pairing_code_ttl_secs: u32 = 300,
+    /// UI access token (JWT) TTL in relay mode (seconds).
+    relay_ui_token_ttl_secs: u32 = 86_400,
+    /// Require E2E payload encryption for relay user_message events.
+    relay_e2e_required: bool = false,
 
     fn trimTrailingSlash(value: []const u8) []const u8 {
         if (value.len <= 1) return value;
@@ -471,6 +487,18 @@ pub const WebConfig = struct {
         if (trimmed.len == 0 or trimmed.len > MAX_RELAY_AGENT_ID_LEN) return false;
         if (std.mem.indexOfAny(u8, trimmed, " \t\r\n")) |_| return false;
         return true;
+    }
+
+    pub fn isValidRelayPairingCodeTtl(ttl_secs: u32) bool {
+        return ttl_secs >= MIN_RELAY_PAIRING_CODE_TTL_SECS and ttl_secs <= MAX_RELAY_PAIRING_CODE_TTL_SECS;
+    }
+
+    pub fn isValidRelayUiTokenTtl(ttl_secs: u32) bool {
+        return ttl_secs >= MIN_RELAY_UI_TOKEN_TTL_SECS and ttl_secs <= MAX_RELAY_UI_TOKEN_TTL_SECS;
+    }
+
+    pub fn isValidRelayTokenTtl(ttl_secs: u32) bool {
+        return ttl_secs >= MIN_RELAY_TOKEN_TTL_SECS and ttl_secs <= MAX_RELAY_TOKEN_TTL_SECS;
     }
 };
 
@@ -1058,6 +1086,10 @@ test "WebConfig defaults" {
     try std.testing.expect(cfg.relay_url == null);
     try std.testing.expectEqualStrings("default", cfg.relay_agent_id);
     try std.testing.expect(cfg.relay_token == null);
+    try std.testing.expectEqual(@as(u32, 2_592_000), cfg.relay_token_ttl_secs);
+    try std.testing.expectEqual(@as(u32, 300), cfg.relay_pairing_code_ttl_secs);
+    try std.testing.expectEqual(@as(u32, 86_400), cfg.relay_ui_token_ttl_secs);
+    try std.testing.expect(!cfg.relay_e2e_required);
 }
 
 test "WebConfig normalizePath trims and normalizes" {
@@ -1108,4 +1140,19 @@ test "WebConfig relay agent id validation enforces non-empty id" {
     try std.testing.expect(WebConfig.isValidRelayAgentId("default"));
     try std.testing.expect(!WebConfig.isValidRelayAgentId(""));
     try std.testing.expect(!WebConfig.isValidRelayAgentId("agent id with spaces"));
+}
+
+test "WebConfig relay ttl validation enforces documented ranges" {
+    try std.testing.expect(WebConfig.isValidRelayPairingCodeTtl(60));
+    try std.testing.expect(WebConfig.isValidRelayPairingCodeTtl(300));
+    try std.testing.expect(!WebConfig.isValidRelayPairingCodeTtl(59));
+    try std.testing.expect(!WebConfig.isValidRelayPairingCodeTtl(301));
+
+    try std.testing.expect(WebConfig.isValidRelayUiTokenTtl(300));
+    try std.testing.expect(WebConfig.isValidRelayUiTokenTtl(86_400));
+    try std.testing.expect(!WebConfig.isValidRelayUiTokenTtl(299));
+
+    try std.testing.expect(WebConfig.isValidRelayTokenTtl(3_600));
+    try std.testing.expect(WebConfig.isValidRelayTokenTtl(2_592_000));
+    try std.testing.expect(!WebConfig.isValidRelayTokenTtl(3_599));
 }

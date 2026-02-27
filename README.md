@@ -359,7 +359,11 @@ Use `channels.web` for browser UI events (WebChannel v1):
           "transport": "relay",
           "relay_url": "wss://relay.nullclaw.io/ws/agent",
           "relay_agent_id": "default",
-          "relay_token": "replace-with-relay-token"
+          "relay_token": "replace-with-relay-token",
+          "relay_token_ttl_secs": 2592000,
+          "relay_pairing_code_ttl_secs": 300,
+          "relay_ui_token_ttl_secs": 86400,
+          "relay_e2e_required": false
         }
       }
     }
@@ -367,7 +371,10 @@ Use `channels.web` for browser UI events (WebChannel v1):
 }
 ```
 
-- Relay token fallback env vars (in order): `NULLCLAW_RELAY_TOKEN`, `NULLCLAW_WEB_TOKEN`, `NULLCLAW_GATEWAY_TOKEN`, `OPENCLAW_GATEWAY_TOKEN`.
+- Relay token lifecycle (dedicated): `relay_token` (config) -> `NULLCLAW_RELAY_TOKEN` (env) -> persisted `web-relay-<account_id>` credential -> generated token.
+- Relay UI handshake: send `pairing_request` with one-time `pairing_code`, receive `pairing_result` with UI `access_token` JWT (and optional `set_cookie` string for relay HTTP layer).
+- Relay `user_message` must include valid UI JWT in `access_token` (top-level or `payload.access_token`).
+- If E2E is enabled (`relay_e2e_required=true`), UI and agent exchange X25519 keys during pairing and send encrypted payloads in `payload.e2e`.
 - WebChannel event envelope is defined in [`spec/webchannel_v1.json`](spec/webchannel_v1.json).
 
 ## Gateway API
