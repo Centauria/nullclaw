@@ -78,7 +78,7 @@ const SIGNAL_REST_HEALTH_ENDPOINT = "/v1/health";
 /// REST endpoint for sending messages.
 const SIGNAL_REST_SEND_ENDPOINT = "/v2/send";
 
-/// WebSocket endpoint prefix for receiving messages.
+/// REST receive endpoint prefix for polling messages.
 const SIGNAL_REST_RECEIVE_ENDPOINT = "/v1/receive/";
 
 /// Maximum message length for Signal messages (signal-cli has no hard limit,
@@ -104,7 +104,7 @@ pub const RecipientTarget = union(enum) {
 /// Signal channel with dual transport support.
 ///
 /// Default mode uses signal-cli daemon JSON-RPC + SSE.
-/// When SIGNAL_USE_REST_API=1, uses REST + WebSocket endpoints.
+/// When SIGNAL_USE_REST_API=1, uses signal-cli-rest-api REST endpoints.
 pub const SignalChannel = struct {
     allocator: std.mem.Allocator,
     account_id: []const u8 = "default",
@@ -124,7 +124,7 @@ pub const SignalChannel = struct {
     ignore_attachments: bool,
     /// Skip story messages.
     ignore_stories: bool,
-    /// Transport switch (env-gated): false = daemon JSON-RPC/SSE, true = REST/WS.
+    /// Transport switch (env-gated): false = daemon JSON-RPC/SSE, true = REST.
     use_rest_api: bool = false,
     /// Persistent SSE connection for streaming message delivery.
     /// Initialized on first poll, maintained across polls for real-time delivery.
@@ -319,7 +319,9 @@ pub const SignalChannel = struct {
                 const payload = try allocator.alloc(u8, plen);
                 defer allocator.free(payload);
                 if (plen > 0) try self.readExact(payload);
-                if (masked and plen > 0) for (payload, 0..) |*b, i| b.* ^= mask_key[i % 4];
+                if (masked and plen > 0) {
+                    for (payload, 0..) |*b, i| b.* ^= mask_key[i % 4];
+                }
 
                 switch (opcode) {
                     0x8 => return error.ConnectionClosed,
@@ -440,6 +442,21 @@ pub const SignalChannel = struct {
         try w.writeAll(host_with_port);
         try w.writeAll(SIGNAL_REST_RECEIVE_ENDPOINT);
         try w.writeAll(self.account);
+        return fbs.getWritten();
+    }
+
+    /// Build REST receive polling URL.
+    pub fn receivePollUrl(self: *const SignalChannel, buf: []u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const w = fbs.writer();
+        try w.writeAll(self.http_url);
+        try w.writeAll(SIGNAL_REST_RECEIVE_ENDPOINT);
+        try w.writeAll(self.account);
+        try w.writeAll("?timeout=1");
+        try w.writeAll("&ignore_attachments=");
+        try w.writeAll(if (self.ignore_attachments) "true" else "false");
+        try w.writeAll("&ignore_stories=");
+        try w.writeAll(if (self.ignore_stories) "true" else "false");
         return fbs.getWritten();
     }
 
@@ -783,20 +800,14 @@ pub const SignalChannel = struct {
         var body: std.ArrayListUnmanaged(u8) = .empty;
         errdefer body.deinit(allocator);
 
-        try body.appendSlice(allocator, "{");
-        switch (target) {
-            .direct => |id| {
-                try body.appendSlice(allocator, "\"recipient\":");
-                try root.json_util.appendJsonString(&body, allocator, id);
-            },
-            .group => |gid| {
-                try body.appendSlice(allocator, "\"groupId\":");
-                try root.json_util.appendJsonString(&body, allocator, gid);
-            },
-        }
-
-        try body.appendSlice(allocator, ",\"account\":");
+        try body.appendSlice(allocator, "{\"number\":");
         try root.json_util.appendJsonString(&body, allocator, self.account);
+        try body.appendSlice(allocator, ",\"recipients\":[");
+        switch (target) {
+            .direct => |id| try root.json_util.appendJsonString(&body, allocator, id),
+            .group => |gid| try root.json_util.appendJsonString(&body, allocator, gid),
+        }
+        try body.appendSlice(allocator, "]");
 
         if (message) |msg| {
             try body.appendSlice(allocator, ",\"message\":");
@@ -1209,12 +1220,9 @@ pub const SignalChannel = struct {
         };
     }
 
-    fn parseSSEEnvelope(self: *const SignalChannel, allocator: std.mem.Allocator, envelope_json: []const u8) !?root.ChannelMessage {
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, envelope_json, .{}) catch return null;
-        defer parsed.deinit();
-
-        if (parsed.value != .object) return null;
-        const envelope = parsed.value.object.get("envelope") orelse return null;
+    fn parseEnvelopeValue(self: *const SignalChannel, allocator: std.mem.Allocator, value: std.json.Value) !?root.ChannelMessage {
+        if (value != .object) return null;
+        const envelope = value.object.get("envelope") orelse return null;
         if (envelope != .object) return null;
         const env_obj = envelope.object;
 
@@ -1291,6 +1299,12 @@ pub const SignalChannel = struct {
         );
     }
 
+    fn parseSSEEnvelope(self: *const SignalChannel, allocator: std.mem.Allocator, envelope_json: []const u8) !?root.ChannelMessage {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, envelope_json, .{}) catch return null;
+        defer parsed.deinit();
+        return self.parseEnvelopeValue(allocator, parsed.value);
+    }
+
     fn appendReceivedEnvelope(
         self: *SignalChannel,
         allocator: std.mem.Allocator,
@@ -1303,6 +1317,42 @@ pub const SignalChannel = struct {
                 try messages.append(allocator, msg);
             }
         } else |_| {}
+    }
+
+    fn pollMessagesRest(self: *SignalChannel, allocator: std.mem.Allocator) ![]root.ChannelMessage {
+        var url_buf: [1200]u8 = undefined;
+        const url = try self.receivePollUrl(&url_buf);
+        const resp = root.http_util.curlGet(self.allocator, url, &.{}, "10") catch |err| {
+            log.warn("Signal REST receive failed: {}", .{err});
+            return &.{};
+        };
+        defer self.allocator.free(resp);
+
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch |err| {
+            log.warn("Signal REST receive parse failed: {}", .{err});
+            return &.{};
+        };
+        defer parsed.deinit();
+        if (parsed.value != .array) return &.{};
+
+        var messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty;
+        errdefer {
+            for (messages.items) |*msg| msg.deinit(allocator);
+            messages.deinit(allocator);
+        }
+
+        for (parsed.value.array.items) |item| {
+            if (item == .string) {
+                try self.appendReceivedEnvelope(allocator, &messages, item.string);
+            } else if (item == .object) {
+                if (try self.parseEnvelopeValue(allocator, item)) |msg| {
+                    log.debug("Received message from {s} on signal ({d} chars) timestamp={d}", .{ msg.sender, msg.content.len, msg.timestamp });
+                    try messages.append(allocator, msg);
+                }
+            }
+        }
+
+        return try messages.toOwnedSlice(allocator);
     }
 
     fn pollMessagesWs(self: *SignalChannel, allocator: std.mem.Allocator) ![]root.ChannelMessage {
@@ -1369,7 +1419,7 @@ pub const SignalChannel = struct {
     /// Returns a slice of ChannelMessages allocated on the given allocator.
     pub fn pollMessages(self: *SignalChannel, allocator: std.mem.Allocator) ![]root.ChannelMessage {
         if (builtin.is_test) return &.{};
-        if (self.use_rest_api) return self.pollMessagesWs(allocator);
+        if (self.use_rest_api) return self.pollMessagesRest(allocator);
 
         // Initialize SSE connection on first poll.
         // Retry is rate-limited with backoff, but each poll call stays bounded.
@@ -2084,9 +2134,64 @@ test "rest urls built correctly when enabled" {
     const ws_url = try ch.receiveWsUrl(&ws_buf);
     try std.testing.expectEqualStrings("ws://127.0.0.1:8686/v1/receive/+1234567890", ws_url);
 
+    var poll_buf: [1200]u8 = undefined;
+    const poll_url = try ch.receivePollUrl(&poll_buf);
+    try std.testing.expectEqualStrings(
+        "http://127.0.0.1:8686/v1/receive/+1234567890?timeout=1&ignore_attachments=true&ignore_stories=true",
+        poll_url,
+    );
+
     var health_buf: [1024]u8 = undefined;
     const health_url = try ch.healthUrl(&health_buf);
     try std.testing.expectEqualStrings("http://127.0.0.1:8686/v1/health", health_url);
+}
+
+test "build rest body direct uses v2 send schema keys" {
+    const ch = SignalChannel.init(
+        std.testing.allocator,
+        "http://127.0.0.1:8686",
+        "+1234567890",
+        &.{},
+        &.{},
+        true,
+        true,
+    );
+    const body = try ch.buildRestBody(
+        std.testing.allocator,
+        .{ .direct = "+5555555555" },
+        "hello",
+        &.{"YWJj"},
+    );
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"number\":\"+1234567890\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"recipients\":[\"+5555555555\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"base64_attachments\":[\"YWJj\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"recipient\":") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"account\":") == null);
+}
+
+test "build rest body group uses recipients array" {
+    const ch = SignalChannel.init(
+        std.testing.allocator,
+        "http://127.0.0.1:8686",
+        "+1234567890",
+        &.{},
+        &.{},
+        true,
+        true,
+    );
+    const body = try ch.buildRestBody(
+        std.testing.allocator,
+        .{ .group = "abc123" },
+        "hello group",
+        &.{},
+    );
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"number\":\"+1234567890\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"recipients\":[\"abc123\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"groupId\":") == null);
 }
 
 // ── JSON-RPC Body Tests ─────────────────────────────────────────────
