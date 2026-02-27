@@ -86,6 +86,7 @@ pub const WebChannel = struct {
     relay_pairing_issued_at: i64 = 0,
     jwt_signing_key: [32]u8 = [_]u8{0} ** 32,
     jwt_ready: bool = false,
+    relay_security_mu: std.Thread.Mutex = .{},
     session_client_bindings: std.StringHashMapUnmanaged([]const u8) = .empty,
     e2e_sessions: std.StringHashMapUnmanaged(E2eSession) = .empty,
 
@@ -260,7 +261,7 @@ pub const WebChannel = struct {
         };
     }
 
-    fn clearSessionBindings(self: *WebChannel) void {
+    fn clearSessionBindingsUnlocked(self: *WebChannel) void {
         var it = self.session_client_bindings.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -270,7 +271,7 @@ pub const WebChannel = struct {
         self.session_client_bindings = .empty;
     }
 
-    fn clearE2eSessions(self: *WebChannel) void {
+    fn clearE2eSessionsUnlocked(self: *WebChannel) void {
         var it = self.e2e_sessions.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -280,6 +281,9 @@ pub const WebChannel = struct {
     }
 
     fn deinitRelaySecurityState(self: *WebChannel) void {
+        self.relay_security_mu.lock();
+        defer self.relay_security_mu.unlock();
+
         if (self.relay_pairing_guard) |*guard| {
             guard.deinit();
         }
@@ -287,8 +291,8 @@ pub const WebChannel = struct {
         self.relay_pairing_issued_at = 0;
         self.jwt_ready = false;
         @memset(self.jwt_signing_key[0..], 0);
-        self.clearSessionBindings();
-        self.clearE2eSessions();
+        self.clearSessionBindingsUnlocked();
+        self.clearE2eSessionsUnlocked();
     }
 
     fn initRelaySecurityState(self: *WebChannel) !void {
@@ -451,6 +455,9 @@ pub const WebChannel = struct {
     }
 
     fn upsertSessionBinding(self: *WebChannel, session_id: []const u8, client_sub: []const u8) !void {
+        self.relay_security_mu.lock();
+        defer self.relay_security_mu.unlock();
+
         if (self.session_client_bindings.getPtr(session_id)) |existing| {
             self.allocator.free(existing.*);
             existing.* = try self.allocator.dupe(u8, client_sub);
@@ -465,6 +472,9 @@ pub const WebChannel = struct {
     }
 
     fn upsertE2eSession(self: *WebChannel, client_sub: []const u8, e2e: E2eSession) !void {
+        self.relay_security_mu.lock();
+        defer self.relay_security_mu.unlock();
+
         if (self.e2e_sessions.getPtr(client_sub)) |existing| {
             existing.* = e2e;
             return;
@@ -475,13 +485,20 @@ pub const WebChannel = struct {
     }
 
     fn e2eSessionByClient(self: *WebChannel, client_sub: []const u8) ?E2eSession {
+        self.relay_security_mu.lock();
+        defer self.relay_security_mu.unlock();
+
         if (self.e2e_sessions.get(client_sub)) |session| return session;
         return null;
     }
 
     fn e2eSessionByChat(self: *WebChannel, session_id: []const u8) ?E2eSession {
+        self.relay_security_mu.lock();
+        defer self.relay_security_mu.unlock();
+
         const client_sub = self.session_client_bindings.get(session_id) orelse return null;
-        return self.e2eSessionByClient(client_sub);
+        if (self.e2e_sessions.get(client_sub)) |session| return session;
+        return null;
     }
 
     fn deriveE2eSession(self: *WebChannel, client_pub_b64: []const u8) !struct { session: E2eSession, agent_public_b64: []u8 } {
