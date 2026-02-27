@@ -1014,3 +1014,41 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
         try std.testing.expectEqualStrings("slack-admin", slack_ptr.policy.allowlist[0]);
     }
 }
+
+test "ChannelManager collects web channel from config" {
+    if (!channel_catalog.isBuildEnabled(.web)) return;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const web_accounts = [_]config_types.WebConfig{
+        .{ .account_id = "local", .port = 32123 },
+    };
+
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .channels = .{
+            .web = &web_accounts,
+        },
+    };
+
+    var reg = dispatch.ChannelRegistry.init(allocator);
+    defer reg.deinit();
+
+    var event_bus = bus_mod.Bus.init();
+
+    const mgr = try ChannelManager.init(allocator, &config, &reg);
+    defer mgr.deinit();
+    mgr.setEventBus(&event_bus);
+
+    try mgr.collectConfiguredChannels();
+
+    try expectEntryPresence(mgr.channelEntries(), "web", "local", true);
+
+    // Verify it was registered with correct listener type
+    const web_entry = findEntryByNameAccount(mgr.channelEntries(), "web", "local").?;
+    try std.testing.expectEqual(ListenerType.gateway_loop, web_entry.listener_type);
+}
