@@ -347,6 +347,7 @@ fn downloadWithRedirects(allocator: std.mem.Allocator, url: []const u8) ![]u8 {
     const result = std.process.Child.run(.{
         .allocator = allocator,
         .argv = &.{ "curl", "-sfL", "--max-time", "60", url },
+        .max_output_bytes = 10 * 1024 * 1024,
     }) catch |err| {
         log.err("curl failed: {}", .{err});
         return error.CurlFailed;
