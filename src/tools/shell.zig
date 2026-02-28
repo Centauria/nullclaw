@@ -51,7 +51,12 @@ pub const ShellTool = struct {
                 return switch (err) {
                     error.CommandNotAllowed => ToolResult.fail("Command not allowed by security policy"),
                     error.HighRiskBlocked => ToolResult.fail("High-risk command blocked by security policy"),
-                    error.ApprovalRequired => ToolResult.fail("Command requires approval (medium/high risk)"),
+                    error.ApprovalRequired => blk: {
+                        const msg = std.fmt.allocPrint(allocator,
+                            "Command requires approval (medium/high risk): {s}",
+                            .{command}) catch "Command requires approval (medium/high risk)";
+                        break :blk ToolResult{ .success = false, .output = "", .error_msg = msg };
+                    },
                 };
             };
         }
@@ -339,4 +344,31 @@ test "shell cwd with allowed_paths runs in cwd" {
 
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, tmp_path) != null);
+}
+
+test "shell ApprovalRequired error includes command name" {
+    const policy_mod = @import("../security/policy.zig");
+    var tracker = policy_mod.RateTracker.init(std.testing.allocator, 100);
+    defer tracker.deinit();
+    const allowed = [_][]const u8{ "git", "ls", "cat", "grep", "echo", "touch" };
+    var policy = policy_mod.SecurityPolicy{
+        .autonomy = .supervised,
+        .workspace_dir = "/tmp",
+        .require_approval_for_medium_risk = true,
+        .block_high_risk_commands = false,
+        .tracker = &tracker,
+        .allowed_commands = &allowed,
+    };
+
+    var st = ShellTool{ .workspace_dir = "/tmp", .policy = &policy };
+    const parsed = try root.parseTestArgs("{\"command\": \"touch test.txt\"}");
+    defer parsed.deinit();
+    const result = try st.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(result.error_msg != null);
+    defer std.testing.allocator.free(result.error_msg.?);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "touch test.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "approval") != null);
 }
