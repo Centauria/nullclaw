@@ -361,6 +361,10 @@ pub const OtelSpan = struct {
     attributes: std.ArrayListUnmanaged(OtelAttribute),
 
     pub fn deinit(self: *OtelSpan, allocator: std.mem.Allocator) void {
+        for (self.attributes.items) |attr| {
+            allocator.free(attr.key);
+            allocator.free(attr.value);
+        }
         self.attributes.deinit(allocator);
     }
 };
@@ -442,7 +446,19 @@ pub const OtelObserver = struct {
 
         var attributes: std.ArrayListUnmanaged(OtelAttribute) = .empty;
         for (attrs) |attr| {
-            attributes.append(self.allocator, attr) catch break;
+            const key_owned = self.allocator.dupe(u8, attr.key) catch break;
+            const value_owned = self.allocator.dupe(u8, attr.value) catch {
+                self.allocator.free(key_owned);
+                break;
+            };
+            attributes.append(self.allocator, .{
+                .key = key_owned,
+                .value = value_owned,
+            }) catch {
+                self.allocator.free(value_owned);
+                self.allocator.free(key_owned);
+                break;
+            };
         }
 
         self.spans.append(self.allocator, .{
@@ -452,7 +468,14 @@ pub const OtelObserver = struct {
             .start_ns = start_ns,
             .end_ns = end_ns,
             .attributes = attributes,
-        }) catch return;
+        }) catch {
+            for (attributes.items) |attr| {
+                self.allocator.free(attr.key);
+                self.allocator.free(attr.value);
+            }
+            attributes.deinit(self.allocator);
+            return;
+        };
 
         if (self.spans.items.len >= max_batch_size) {
             self.flushLocked();
@@ -620,11 +643,10 @@ pub const OtelObserver = struct {
 
             for (span.attributes.items, 0..) |attr, j| {
                 if (j > 0) try w.writeByte(',');
-                try w.writeAll("{\"key\":\"");
-                try w.writeAll(attr.key);
-                try w.writeAll("\",\"value\":{\"stringValue\":\"");
-                try w.writeAll(attr.value);
-                try w.writeAll("\"}}");
+                try w.print(
+                    "{{\"key\":{f},\"value\":{{\"stringValue\":{f}}}}}",
+                    .{ std.json.fmt(attr.key, .{}), std.json.fmt(attr.value, .{}) },
+                );
             }
 
             try w.writeAll("],\"status\":{\"code\":1}}");
@@ -1161,6 +1183,80 @@ test "OtelObserver tool_call includes detail attribute" {
         }
     }
     try std.testing.expect(found_detail);
+}
+
+test "OtelObserver spans keep independent attribute values" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const first = ObserverEvent{ .tool_call = .{
+        .tool = "shell",
+        .duration_ms = 111,
+        .success = false,
+        .detail = "first detail",
+    } };
+    const second = ObserverEvent{ .tool_call = .{
+        .tool = "shell",
+        .duration_ms = 222,
+        .success = false,
+        .detail = "second detail",
+    } };
+    obs.recordEvent(&first);
+    obs.recordEvent(&second);
+
+    try std.testing.expectEqual(@as(usize, 2), otel.spans.items.len);
+
+    const first_span = otel.spans.items[0];
+    const second_span = otel.spans.items[1];
+
+    var first_duration: ?[]const u8 = null;
+    var second_duration: ?[]const u8 = null;
+    var first_detail: ?[]const u8 = null;
+    var second_detail: ?[]const u8 = null;
+
+    for (first_span.attributes.items) |attr| {
+        if (std.mem.eql(u8, attr.key, "duration_ms")) first_duration = attr.value;
+        if (std.mem.eql(u8, attr.key, "detail")) first_detail = attr.value;
+    }
+    for (second_span.attributes.items) |attr| {
+        if (std.mem.eql(u8, attr.key, "duration_ms")) second_duration = attr.value;
+        if (std.mem.eql(u8, attr.key, "detail")) second_detail = attr.value;
+    }
+
+    try std.testing.expect(first_duration != null);
+    try std.testing.expect(second_duration != null);
+    try std.testing.expect(first_detail != null);
+    try std.testing.expect(second_detail != null);
+    try std.testing.expectEqualStrings("111", first_duration.?);
+    try std.testing.expectEqualStrings("222", second_duration.?);
+    try std.testing.expectEqualStrings("first detail", first_detail.?);
+    try std.testing.expectEqualStrings("second detail", second_detail.?);
+}
+
+test "OtelObserver JSON serialization escapes tool_call detail" {
+    var otel = OtelObserver.init(std.testing.allocator, null, null);
+    defer otel.deinit();
+    const obs = otel.observer();
+
+    const start = ObserverEvent{ .agent_start = .{ .provider = "openrouter", .model = "claude" } };
+    const event = ObserverEvent{ .tool_call = .{
+        .tool = "shell",
+        .duration_ms = 5,
+        .success = false,
+        .detail = "exit code 1: \"denied\"\nline2",
+    } };
+    obs.recordEvent(&start);
+    obs.recordEvent(&event);
+
+    const json = try otel.serializeSpans();
+    defer std.testing.allocator.free(json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\\\"denied\\\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\\nline2") != null);
 }
 
 test "OtelObserver JSON serialization" {
