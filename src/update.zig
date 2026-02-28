@@ -198,6 +198,7 @@ pub fn getLatestRelease(allocator: std.mem.Allocator) !ReleaseInfo {
     const result = std.process.Child.run(.{
         .allocator = allocator,
         .argv = &.{ "curl", "-sf", "--max-time", "30", url },
+        .max_output_bytes = 10 * 1024 * 1024,
     }) catch |err| {
         log.err("curl failed: {}", .{err});
         return error.CurlFailed;
@@ -310,19 +311,21 @@ fn downloadAndInstall(
     var tmp_file = try std.fs.createFileAbsolute(tmp_path, .{ .read = true });
     var tmp_closed = false;
     defer if (!tmp_closed) tmp_file.close();
+    errdefer {
+        if (!tmp_closed) {
+            tmp_file.close();
+            tmp_closed = true;
+        }
+        std.fs.deleteFileAbsolute(tmp_path) catch {};
+    }
 
     // Download directly to file (streaming, no memory buffer limit)
-    const bytes_downloaded = downloadToFile(url, &tmp_file) catch |err| {
+    const bytes_downloaded = downloadToFile(allocator, url, &tmp_file) catch |err| {
         log.err("Download failed: {}", .{err});
-        // Clean up partial file on error
-        tmp_file.close();
-        std.fs.deleteFileAbsolute(tmp_path) catch {};
         return error.DownloadFailed;
     };
 
     if (bytes_downloaded == 0) {
-        tmp_file.close();
-        std.fs.deleteFileAbsolute(tmp_path) catch {};
         return error.EmptyDownload;
     }
 
@@ -348,46 +351,42 @@ fn downloadAndInstall(
 /// Download a URL directly to a file using curl.
 /// Streams the data to avoid memory buffer limits.
 /// Returns the number of bytes downloaded.
-fn downloadToFile(url: []const u8, file: *std.fs.File) !usize {
-    const allocator = std.heap.page_allocator;
-
-    // Prepare argv
+fn downloadToFile(allocator: std.mem.Allocator, url: []const u8, file: *std.fs.File) !usize {
     const argv = &[_][]const u8{ "curl", "-sfL", "--max-time", "60", url };
-
-    // Initialize child process with stdout piped
     var child = std.process.Child.init(argv, allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
 
-    // Spawn the child process
     child.spawn() catch |err| {
         log.err("curl spawn failed: {}", .{err});
         return error.CurlFailed;
     };
 
-    // Set up to read from child's stdout
     const stdout = child.stdout.?;
 
-    // Copy data from curl stdout directly to file (streaming, no memory limit)
-    const buf_size = 64 * 1024; // 64KB buffer for streaming
-    var buffer: [buf_size]u8 = undefined;
+    const BUF_SIZE = 64 * 1024;
+    var buffer: [BUF_SIZE]u8 = undefined;
     var total_bytes: usize = 0;
 
     while (true) {
         const bytes_read = stdout.read(&buffer) catch |err| {
             log.err("curl read failed: {}", .{err});
-            // Kill the child process since we're aborting
             _ = child.kill() catch {};
+            _ = child.wait() catch {};
             return error.CurlFailed;
         };
 
-        if (bytes_read == 0) break; // EOF
+        if (bytes_read == 0) break;
 
-        try file.writeAll(buffer[0..bytes_read]);
+        file.writeAll(buffer[0..bytes_read]) catch |err| {
+            log.err("download write failed: {}", .{err});
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return err;
+        };
         total_bytes += bytes_read;
     }
 
-    // Wait for curl to exit and check exit code
     const term = child.wait() catch |err| {
         log.err("curl wait failed: {}", .{err});
         return error.CurlFailed;
@@ -398,10 +397,7 @@ fn downloadToFile(url: []const u8, file: *std.fs.File) !usize {
             log.err("curl exited with code: {}", .{code});
             return error.CurlFailed;
         },
-        .Signal, .Stopped, .Unknown => {
-            log.err("curl terminated abnormally: {}", .{term});
-            return error.CurlFailed;
-        },
+        else => return error.CurlFailed,
     }
 
     return total_bytes;
@@ -483,37 +479,45 @@ test "platformFromParts maps supported and unsupported targets" {
     try std.testing.expect(platformFromParts(.freebsd, .x86_64) == null);
 }
 
-test "downloadToFile streams data without memory buffer limit" {
+test "downloadToFile streams from local file URL" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
     const allocator = std.testing.allocator;
 
-    // Create a temporary file for download
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const tmp_path = "test_download.bin";
-    var tmp_file = try tmp_dir.dir.createFile(tmp_path, .{ .read = true });
-    defer tmp_file.close();
+    const src_name = "src.bin";
+    const dst_name = "dst.bin";
+    const payload = "hello-streaming-download";
 
-    // Download a small test file (using a reliable public URL)
-    // Using a GitHub API endpoint that returns JSON
+    var src_file = try tmp_dir.dir.createFile(src_name, .{});
+    defer src_file.close();
+    try src_file.writeAll(payload);
+    try src_file.sync();
+
+    const src_abs = try tmp_dir.dir.realpathAlloc(allocator, src_name);
+    defer allocator.free(src_abs);
+
+    const file_url = try std.fmt.allocPrint(allocator, "file://{s}", .{src_abs});
+    defer allocator.free(file_url);
+
+    var dst_file = try tmp_dir.dir.createFile(dst_name, .{ .read = true });
+    defer dst_file.close();
+
     const bytes_downloaded = downloadToFile(
-        "https://api.github.com/repos/nullclaw/nullclaw/releases/latest",
-        &tmp_file,
+        allocator,
+        file_url,
+        &dst_file,
     ) catch |err| {
-        // Skip test if network is unavailable
         if (err == error.CurlFailed) return error.SkipZigTest;
         return err;
     };
 
-    // Verify we got some data
-    try std.testing.expect(bytes_downloaded > 0);
+    try std.testing.expectEqual(payload.len, bytes_downloaded);
 
-    // Verify the file contains valid JSON (basic check)
-    try tmp_file.seekTo(0);
-    const content = try tmp_file.readToEndAlloc(allocator, 1024 * 1024);
+    try dst_file.seekTo(0);
+    const content = try dst_file.readToEndAlloc(allocator, payload.len + 1);
     defer allocator.free(content);
-
-    // Should contain some JSON markers
-    try std.testing.expect(std.mem.indexOf(u8, content, "{") != null);
-    try std.testing.expect(std.mem.indexOf(u8, content, "tag_name") != null);
+    try std.testing.expectEqualStrings(payload, content);
 }
