@@ -756,8 +756,8 @@ fn parseToolCallJsonInner(allocator: std.mem.Allocator, parsed: std.json.Parsed(
     };
 
     // Robustness: strip trailing XML tags and handle JSON-in-JSON hallucinations.
-    // Keep a borrowed source slice, then duplicate exactly once at the end.
-    var resolved_name_src: []const u8 = stripTrailingXml(std.mem.trim(u8, name_str, " \t\r\n"));
+    const resolved_name_src = stripTrailingXml(std.mem.trim(u8, name_str, " \t\r\n"));
+    var resolved_name_owned: ?[]u8 = null;
 
     if (std.mem.startsWith(u8, resolved_name_src, "{")) {
         const inner_parsed = std.json.parseFromSlice(std.json.Value, allocator, resolved_name_src, .{}) catch null;
@@ -766,14 +766,14 @@ fn parseToolCallJsonInner(allocator: std.mem.Allocator, parsed: std.json.Parsed(
             if (p.value == .object) {
                 if (p.value.object.get("name")) |n| {
                     if (n == .string) {
-                        resolved_name_src = std.mem.trim(u8, n.string, " \t\r\n");
+                        resolved_name_owned = try allocator.dupe(u8, std.mem.trim(u8, n.string, " \t\r\n"));
                     }
                 }
             }
         }
     }
 
-    const resolved_name = try allocator.dupe(u8, resolved_name_src);
+    const resolved_name = resolved_name_owned orelse try allocator.dupe(u8, resolved_name_src);
     errdefer allocator.free(resolved_name);
 
     if (resolved_name.len == 0) return error.EmptyToolName;
