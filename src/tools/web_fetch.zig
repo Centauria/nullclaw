@@ -9,6 +9,7 @@ const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const net_security = @import("../root.zig").net_security;
+const http_util = @import("../http_util.zig");
 
 const log = std.log.scoped(.web_fetch);
 
@@ -66,12 +67,25 @@ pub const WebFetchTool = struct {
             "Accept: text/html,application/json,text/plain,*/*",
         };
 
-        const body = @import("../http_util.zig").curlGet(
-            allocator,
-            url,
-            &headers,
-            "30",
-        ) catch |err| {
+        const body = blk: {
+            if (shouldUseCurlResolve(host)) {
+                const resolve_entry = try buildCurlResolveEntry(allocator, host, resolved_port, connect_host);
+                defer allocator.free(resolve_entry);
+                break :blk http_util.curlGetWithResolve(
+                    allocator,
+                    url,
+                    &headers,
+                    "30",
+                    resolve_entry,
+                );
+            }
+            break :blk http_util.curlGet(
+                allocator,
+                url,
+                &headers,
+                "30",
+            );
+        } catch |err| {
             log.err("web_fetch connection failed for {s}: {}", .{ url, err });
             const msg = try std.fmt.allocPrint(allocator, "Fetch failed: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
@@ -105,6 +119,28 @@ fn parseMaxCharsWithDefault(args: JsonObjectMap, default: usize) usize {
     if (val_i64 < 100) return 100;
     if (val_i64 > 200_000) return 200_000;
     return @intCast(val_i64);
+}
+
+fn shouldUseCurlResolve(host: []const u8) bool {
+    // DNS pinning is required for hostname-based URLs. IPv6 literals do not
+    // involve DNS and don't fit curl's host:port `--resolve` syntax cleanly.
+    return std.mem.indexOfScalar(u8, stripHostBrackets(host), ':') == null;
+}
+
+fn buildCurlResolveEntry(
+    allocator: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    connect_host: []const u8,
+) ![]u8 {
+    const host_for_resolve = stripHostBrackets(host);
+    const connect_target = if (std.mem.indexOfScalar(u8, connect_host, ':') != null)
+        try std.fmt.allocPrint(allocator, "[{s}]", .{connect_host})
+    else
+        try allocator.dupe(u8, connect_host);
+    defer allocator.free(connect_target);
+
+    return std.fmt.allocPrint(allocator, "{s}:{d}:{s}", .{ host_for_resolve, port, connect_target });
 }
 
 fn stripHostBrackets(host: []const u8) []const u8 {
@@ -449,8 +485,22 @@ test "WebFetchTool loopback decimal alias blocked" {
     try testing.expectEqualStrings("Blocked local/private host", result.error_msg.?);
 }
 
+test "buildCurlResolveEntry formats ipv4 connect target" {
+    const entry = try buildCurlResolveEntry(testing.allocator, "example.com", 443, "93.184.216.34");
+    defer testing.allocator.free(entry);
+    try testing.expectEqualStrings("example.com:443:93.184.216.34", entry);
+}
 
+test "buildCurlResolveEntry wraps ipv6 connect target" {
+    const entry = try buildCurlResolveEntry(testing.allocator, "example.com", 443, "2001:db8::1");
+    defer testing.allocator.free(entry);
+    try testing.expectEqualStrings("example.com:443:[2001:db8::1]", entry);
+}
 
+test "shouldUseCurlResolve skips ipv6 literal hosts" {
+    try testing.expect(shouldUseCurlResolve("example.com"));
+    try testing.expect(!shouldUseCurlResolve("[2001:db8::1]"));
+}
 
 test "htmlToText strips script and style" {
     const html = "<html><head><style>body{color:red}</style></head><body><script>alert(1)</script>Hello</body></html>";

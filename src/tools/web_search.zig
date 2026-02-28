@@ -64,11 +64,12 @@ pub const WebSearchTool = struct {
         defer allocator.free(url_str);
 
         // Make HTTP request via curl subprocess
+        const auth_header = try std.fmt.allocPrint(allocator, "X-Subscription-Token: {s}", .{api_key});
+        defer allocator.free(auth_header);
         const headers = [_][]const u8{
-            try std.fmt.allocPrint(allocator, "X-Subscription-Token: {s}", .{api_key}),
+            auth_header,
             "Accept: application/json",
         };
-        defer for (headers) |h| allocator.free(h);
 
         const body = @import("../http_util.zig").curlGet(
             allocator,

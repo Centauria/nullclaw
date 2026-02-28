@@ -755,26 +755,25 @@ fn parseToolCallJsonInner(allocator: std.mem.Allocator, parsed: std.json.Parsed(
         else => return error.InvalidToolName,
     };
 
-    // Robustness: strip trailing XML tags and handle JSON-in-JSON hallucinations
-    var resolved_name: []const u8 = stripTrailingXml(std.mem.trim(u8, name_str, " \t\r\n"));
+    // Robustness: strip trailing XML tags and handle JSON-in-JSON hallucinations.
+    // Keep a borrowed source slice, then duplicate exactly once at the end.
+    var resolved_name_src: []const u8 = stripTrailingXml(std.mem.trim(u8, name_str, " \t\r\n"));
 
-    if (std.mem.startsWith(u8, resolved_name, "{")) {
-        const inner_parsed = std.json.parseFromSlice(std.json.Value, allocator, resolved_name, .{}) catch null;
+    if (std.mem.startsWith(u8, resolved_name_src, "{")) {
+        const inner_parsed = std.json.parseFromSlice(std.json.Value, allocator, resolved_name_src, .{}) catch null;
         if (inner_parsed) |p| {
             defer p.deinit();
             if (p.value == .object) {
                 if (p.value.object.get("name")) |n| {
                     if (n == .string) {
-                        // Found nested name! Dupe it before p.deinit()
-                        resolved_name = try allocator.dupe(u8, n.string);
+                        resolved_name_src = std.mem.trim(u8, n.string, " \t\r\n");
                     }
                 }
             }
         }
-    } else {
-        // Just dupe the original name to ensure stable ownership
-        resolved_name = try allocator.dupe(u8, resolved_name);
     }
+
+    const resolved_name = try allocator.dupe(u8, resolved_name_src);
     errdefer allocator.free(resolved_name);
 
     if (resolved_name.len == 0) return error.EmptyToolName;
@@ -892,9 +891,8 @@ fn parseInvokeTagCall(allocator: std.mem.Allocator, inner: []const u8) !ParsedTo
     const tool_name = std.mem.trim(u8, after_prefix[1 .. name_end + 1], " \t\r\n");
     if (tool_name.len == 0) return error.EmptyToolName;
 
-
     const invoke_close_tag = "</invoke>";
-    // Look for the '>' that closes the <invoke ...> tag. 
+    // Look for the '>' that closes the <invoke ...> tag.
     // It might not be immediately after the name (e.g. models sometimes insert a comma or space).
     // Robustness: if we find "<parameter" before ">", then the ">" was missing entirely.
     const invoke_tag_end_pos = blk: {
@@ -914,7 +912,6 @@ fn parseInvokeTagCall(allocator: std.mem.Allocator, inner: []const u8) !ParsedTo
         full_invoke_content[0..ic]
     else
         full_invoke_content;
-
 
     var args_buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer args_buf.deinit(allocator);
@@ -992,7 +989,7 @@ fn parseHybridTagCall(allocator: std.mem.Allocator, inner: []const u8) !ParsedTo
             if (after.len > 0) {
                 const quote = after[0];
                 if (quote == '"' or quote == '\'') {
-                    if (std.mem.indexOfScalar(u8, after[1 ..], quote)) |q_end| {
+                    if (std.mem.indexOfScalar(u8, after[1..], quote)) |q_end| {
                         break :blk std.mem.trim(u8, after[1 .. q_end + 1], " \t\r\n");
                     }
                 }
@@ -1011,7 +1008,7 @@ fn parseHybridTagCall(allocator: std.mem.Allocator, inner: []const u8) !ParsedTo
             if (after.len > 0) {
                 const quote = after[0];
                 if (quote == '"' or quote == '\'') {
-                    if (std.mem.indexOfScalar(u8, after[1 ..], quote)) |q_end| {
+                    if (std.mem.indexOfScalar(u8, after[1..], quote)) |q_end| {
                         break :blk std.mem.trim(u8, after[1 .. q_end + 1], " \t\r\n");
                     }
                 }
@@ -2222,6 +2219,15 @@ test "parseToolCallJson robustness" {
         allocator.free(res2.arguments_json);
     }
     try std.testing.expectEqualStrings("shell", res2.name);
+
+    // Case 3: JSON-like name without nested "name" keeps the outer name text.
+    const json3 = "{\"name\": \"{\\\"tool\\\":\\\"shell\\\"}\", \"arguments\": {}}";
+    const res3 = try parseToolCallJson(allocator, json3);
+    defer {
+        allocator.free(res3.name);
+        allocator.free(res3.arguments_json);
+    }
+    try std.testing.expectEqualStrings("{\"tool\":\"shell\"}", res3.name);
 }
 
 test "parseXmlToolCalls minimax format" {

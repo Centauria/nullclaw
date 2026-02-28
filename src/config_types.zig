@@ -74,9 +74,9 @@ pub const DiagnosticsConfig = struct {
 };
 
 pub const AutonomyConfig = struct {
-    level: AutonomyLevel = .full,
+    level: AutonomyLevel = .supervised,
     workspace_only: bool = true,
-    max_actions_per_hour: u32 = 1000,
+    max_actions_per_hour: u32 = 20,
     require_approval_for_medium_risk: bool = true,
     block_high_risk_commands: bool = true,
     allowed_commands: []const []const u8 = &.{},
@@ -776,7 +776,7 @@ pub const BrowserConfig = struct {
 // ── HTTP request config ─────────────────────────────────────────
 
 pub const HttpRequestConfig = struct {
-    enabled: bool = true,
+    enabled: bool = false,
     max_response_size: u32 = 1_000_000,
     timeout_secs: u64 = 30,
     allowed_domains: []const []const u8 = &.{},
