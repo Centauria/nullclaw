@@ -139,10 +139,6 @@ fn parseChoicesDirective(allocator: std.mem.Allocator, json_payload: []const u8)
         for (opts.items) |opt| opt.deinit(allocator);
         opts.deinit(allocator);
     };
-    errdefer {
-        for (opts.items) |opt| opt.deinit(allocator);
-        opts.deinit(allocator);
-    }
 
     for (items) |item| {
         if (item != .object) return null;

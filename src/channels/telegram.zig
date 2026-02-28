@@ -561,6 +561,34 @@ pub const TelegramChannel = struct {
         return false;
     }
 
+    fn isAuthorizedIdentity(
+        self: *const TelegramChannel,
+        is_group: bool,
+        username: []const u8,
+        user_id: ?[]const u8,
+    ) bool {
+        var ids_buf: [2][]const u8 = undefined;
+        var ids_len: usize = 0;
+        ids_buf[ids_len] = username;
+        ids_len += 1;
+        if (user_id) |uid| {
+            ids_buf[ids_len] = uid;
+            ids_len += 1;
+        }
+
+        if (is_group) {
+            if (std.mem.eql(u8, self.group_policy, "open")) return true;
+            if (std.mem.eql(u8, self.group_policy, "disabled")) return false;
+
+            if (self.group_allow_from.len > 0) {
+                return self.isAnyGroupIdentityAllowed(ids_buf[0..ids_len]);
+            }
+            return self.isAnyIdentityAllowed(ids_buf[0..ids_len]);
+        }
+
+        return self.isAnyIdentityAllowed(ids_buf[0..ids_len]);
+    }
+
     pub fn healthCheck(self: *TelegramChannel) bool {
         var url_buf: [512]u8 = undefined;
         const url = self.apiUrl(&url_buf, "getMe") catch return false;
@@ -1024,7 +1052,7 @@ pub const TelegramChannel = struct {
         }
         body.appendSlice(self.allocator, "}") catch return;
 
-        const resp = root.http_util.curlPostWithProxy(self.allocator, url, body.items, &.{}, self.proxy, null) catch return;
+        const resp = root.http_util.curlPostWithProxy(self.allocator, url, body.items, &.{}, self.proxy, "10") catch return;
         self.allocator.free(resp);
     }
 
@@ -1043,7 +1071,7 @@ pub const TelegramChannel = struct {
         body.appendSlice(self.allocator, msg_id_str) catch return;
         body.appendSlice(self.allocator, ",\"reply_markup\":{\"inline_keyboard\":[]}}") catch return;
 
-        const resp = root.http_util.curlPostWithProxy(self.allocator, url, body.items, &.{}, self.proxy, null) catch return;
+        const resp = root.http_util.curlPostWithProxy(self.allocator, url, body.items, &.{}, self.proxy, "10") catch return;
         self.allocator.free(resp);
     }
 
@@ -1772,6 +1800,15 @@ pub const TelegramChannel = struct {
         else
             false;
 
+        if (!self.isAuthorizedIdentity(is_group, username, user_id)) {
+            log.warn("ignoring callback from unauthorized user: username={s}, user_id={s}", .{
+                username,
+                user_id orelse "unknown",
+            });
+            self.answerCallbackQuery(cb_id, "You are not allowed to use this button");
+            return;
+        }
+
         const first_name_val = from_obj.object.get("first_name");
         const first_name: ?[]const u8 = if (first_name_val) |fnv| (if (fnv == .string) fnv.string else null) else null;
 
@@ -1908,28 +1945,7 @@ pub const TelegramChannel = struct {
         else
             false;
 
-        // Check allowlist against all known identities
-        var ids_buf: [2][]const u8 = undefined;
-        var ids_len: usize = 0;
-        ids_buf[ids_len] = username;
-        ids_len += 1;
-        if (user_id) |uid| {
-            ids_buf[ids_len] = uid;
-            ids_len += 1;
-        }
-
-        const is_authorized = if (is_group) blk: {
-            if (std.mem.eql(u8, self.group_policy, "open")) break :blk true;
-            if (std.mem.eql(u8, self.group_policy, "disabled")) break :blk false;
-
-            if (self.group_allow_from.len > 0) {
-                break :blk self.isAnyGroupIdentityAllowed(ids_buf[0..ids_len]);
-            } else {
-                break :blk self.isAnyIdentityAllowed(ids_buf[0..ids_len]);
-            }
-        } else self.isAnyIdentityAllowed(ids_buf[0..ids_len]);
-
-        if (!is_authorized) {
+        if (!self.isAuthorizedIdentity(is_group, username, user_id)) {
             log.warn("ignoring message from unauthorized user: username={s}, user_id={s}", .{
                 username,
                 user_id orelse "unknown",
@@ -4045,6 +4061,22 @@ test "telegram parseCallbackData rejects malformed format" {
     try std.testing.expect(TelegramChannel.parseCallbackData("nc1:abc123") == null);
     try std.testing.expect(TelegramChannel.parseCallbackData("bad:abc123:yes") == null);
     try std.testing.expect(TelegramChannel.parseCallbackData("nc1:abc123:Yes") == null);
+}
+
+test "telegram isAuthorizedIdentity enforces group allowlist and ids" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "tok", &.{ "alice", "42" }, &.{"group_user"}, "allowlist");
+    defer ch.deinitPendingInteractions();
+
+    try std.testing.expect(ch.isAuthorizedIdentity(false, "alice", null));
+    try std.testing.expect(ch.isAuthorizedIdentity(false, "unknown", "42"));
+    try std.testing.expect(!ch.isAuthorizedIdentity(false, "bob", "999"));
+
+    try std.testing.expect(ch.isAuthorizedIdentity(true, "group_user", null));
+    try std.testing.expect(!ch.isAuthorizedIdentity(true, "alice", null));
+
+    ch.group_allow_from = &.{};
+    try std.testing.expect(ch.isAuthorizedIdentity(true, "alice", null));
 }
 
 test "telegram buildInlineKeyboardJson builds callback_data" {
