@@ -798,6 +798,7 @@ pub const Config = struct {
         InvalidPort,
         InvalidRetryCount,
         InvalidBackoffMs,
+        InvalidHttpSearchBaseUrl,
         InvalidWebTransport,
         InvalidWebPath,
         InvalidWebAuthToken,
@@ -834,6 +835,11 @@ pub const Config = struct {
         }
         if (self.reliability.provider_backoff_ms > 600_000) {
             return ValidationError.InvalidBackoffMs;
+        }
+        if (self.http_request.search_base_url) |search_base_url| {
+            if (!config_types.HttpRequestConfig.isValidSearchBaseUrl(search_base_url)) {
+                return ValidationError.InvalidHttpSearchBaseUrl;
+            }
         }
         for (self.channels.web) |web_cfg| {
             if (!config_types.WebConfig.isValidTransport(web_cfg.transport)) {
@@ -903,6 +909,7 @@ pub const Config = struct {
             ValidationError.InvalidPort => std.debug.print("Config error: gateway port must be non-zero.\n", .{}),
             ValidationError.InvalidRetryCount => std.debug.print("Config error: provider_retries must be <= 100.\n", .{}),
             ValidationError.InvalidBackoffMs => std.debug.print("Config error: provider_backoff_ms must be <= 600000.\n", .{}),
+            ValidationError.InvalidHttpSearchBaseUrl => std.debug.print("Config error: http_request.search_base_url must be https://host or https://host/search (no query/fragment).\n", .{}),
             ValidationError.InvalidWebTransport => std.debug.print("Config error: channels.web.accounts.<id>.transport must be 'local' or 'relay'.\n", .{}),
             ValidationError.InvalidWebPath => std.debug.print("Config error: channels.web.accounts.<id>.path must start with '/'.\n", .{}),
             ValidationError.InvalidWebAuthToken => std.debug.print("Config error: channels.web.accounts.<id>.auth_token/relay_token must be 16-128 printable chars without whitespace.\n", .{}),
@@ -1792,6 +1799,28 @@ test "validation accepts max boundary backoff" {
         .allocator = std.testing.allocator,
     };
     cfg.reliability.provider_backoff_ms = 600_000;
+    try cfg.validate();
+}
+
+test "validation rejects invalid http_request search base URL" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+    };
+    cfg.http_request.search_base_url = "https://searx.example.com?bad=1";
+    try std.testing.expectError(Config.ValidationError.InvalidHttpSearchBaseUrl, cfg.validate());
+}
+
+test "validation accepts valid http_request search base URL" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+    };
+    cfg.http_request.search_base_url = "https://searx.example.com/search";
     try cfg.validate();
 }
 

@@ -987,6 +987,36 @@ pub const HttpRequestConfig = struct {
     ///   - "https://searx.example.com"
     ///   - "https://searx.example.com/search"
     search_base_url: ?[]const u8 = null,
+
+    /// Validate optional SearXNG base URL accepted by web_search.
+    /// Allowed forms:
+    ///   - https://host
+    ///   - https://host/
+    ///   - https://host/search
+    ///   - https://host/search/
+    pub fn isValidSearchBaseUrl(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (!std.mem.startsWith(u8, trimmed, "https://")) return false;
+        if (std.mem.indexOfAny(u8, trimmed, "?#") != null) return false;
+
+        const no_scheme = trimmed["https://".len..];
+        if (no_scheme.len == 0 or no_scheme[0] == '/') return false;
+
+        const slash_pos = std.mem.indexOfScalar(u8, no_scheme, '/');
+        const authority = if (slash_pos) |idx| no_scheme[0..idx] else no_scheme;
+        if (authority.len == 0) return false;
+        if (std.mem.indexOfAny(u8, authority, " \t\r\n")) |_| return false;
+
+        if (slash_pos) |idx| {
+            var path = no_scheme[idx..];
+            if (std.mem.eql(u8, path, "/")) return true;
+            while (path.len > 1 and path[path.len - 1] == '/') {
+                path = path[0 .. path.len - 1];
+            }
+            if (!std.mem.eql(u8, path, "/search")) return false;
+        }
+        return true;
+    }
 };
 
 // ── Identity config ─────────────────────────────────────────────
@@ -1231,4 +1261,17 @@ test "WebConfig relay ttl validation enforces documented ranges" {
     try std.testing.expect(WebConfig.isValidRelayTokenTtl(3_600));
     try std.testing.expect(WebConfig.isValidRelayTokenTtl(2_592_000));
     try std.testing.expect(!WebConfig.isValidRelayTokenTtl(3_599));
+}
+
+test "HttpRequestConfig search base URL validation" {
+    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com/"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com/search"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com/search/"));
+
+    try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("http://searx.example.com"));
+    try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("https://"));
+    try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com?x=1"));
+    try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com#frag"));
+    try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com/custom"));
 }

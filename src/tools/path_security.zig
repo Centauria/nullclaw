@@ -4,6 +4,7 @@
 //! Extracted from file_edit.zig to eliminate cross-imports between tool files.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 /// System-critical prefixes (Unix) — always blocked even if they match allowed_paths.
 const SYSTEM_BLOCKED_PREFIXES_UNIX = [_][]const u8{
@@ -42,7 +43,12 @@ else
 
 /// Check whether a directory-style prefix matches (exact or followed by a path separator).
 pub fn pathStartsWith(path: []const u8, prefix: []const u8) bool {
-    if (!std.mem.startsWith(u8, path, prefix)) return false;
+    if (builtin.os.tag == .windows) {
+        if (path.len < prefix.len) return false;
+        if (!std.ascii.eqlIgnoreCase(path[0..prefix.len], prefix)) return false;
+    } else {
+        if (!std.mem.startsWith(u8, path, prefix)) return false;
+    }
     if (path.len == prefix.len) return true;
     const c = path[prefix.len];
     return c == '/' or c == '\\';
@@ -257,6 +263,11 @@ test "pathStartsWith exact match" {
 
 test "pathStartsWith with trailing component" {
     try std.testing.expect(pathStartsWith("/foo/bar/baz", "/foo/bar"));
+}
+
+test "pathStartsWith windows is case-insensitive" {
+    if (comptime @import("builtin").os.tag != .windows) return;
+    try std.testing.expect(pathStartsWith("c:\\windows\\system32\\cmd.exe", "C:\\Windows"));
 }
 
 test "pathStartsWith rejects partial" {

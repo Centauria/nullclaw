@@ -61,18 +61,27 @@ pub const WebSearchTool = struct {
         if (self.searxng_base_url) |base_url| {
             const trimmed = std.mem.trim(u8, base_url, " \t\n\r");
             if (trimmed.len > 0) {
-                return executeSearxngSearch(allocator, query, count, trimmed, self.timeout_secs) catch |err| {
-                    if (tryBraveApiKeyOrNull(allocator)) |api_key| {
-                        defer allocator.free(api_key);
-                        log.warn("web_search searxng backend failed ({}), falling back to Brave API", .{err});
-                        return executeBraveSearch(allocator, query, count, api_key, self.timeout_secs);
-                    }
-                    return switch (err) {
-                        error.InvalidSearchBaseUrl => ToolResult.fail("Invalid http_request.search_base_url; expected https://host[/search]"),
-                        error.RequestFailed => ToolResult.fail("SearXNG request failed and BRAVE_API_KEY is not set."),
-                        error.InvalidResponse => ToolResult.fail("SearXNG returned invalid response and BRAVE_API_KEY is not set."),
-                        else => return err,
-                    };
+                return executeSearxngSearch(allocator, query, count, trimmed, self.timeout_secs) catch |err| switch (err) {
+                    // Invalid base URL is a configuration error: fail hard.
+                    error.InvalidSearchBaseUrl => ToolResult.fail("Invalid http_request.search_base_url; expected https://host[/search]"),
+                    // Runtime SearXNG failures may fallback to Brave if available.
+                    error.RequestFailed => {
+                        if (tryBraveApiKeyOrNull(allocator)) |api_key| {
+                            defer allocator.free(api_key);
+                            log.warn("web_search searxng request failed, falling back to Brave API", .{});
+                            return executeBraveSearch(allocator, query, count, api_key, self.timeout_secs);
+                        }
+                        return ToolResult.fail("SearXNG request failed and BRAVE_API_KEY is not set.");
+                    },
+                    error.InvalidResponse => {
+                        if (tryBraveApiKeyOrNull(allocator)) |api_key| {
+                            defer allocator.free(api_key);
+                            log.warn("web_search searxng returned invalid response, falling back to Brave API", .{});
+                            return executeBraveSearch(allocator, query, count, api_key, self.timeout_secs);
+                        }
+                        return ToolResult.fail("SearXNG returned invalid response and BRAVE_API_KEY is not set.");
+                    },
+                    else => return err,
                 };
             }
         }
@@ -151,8 +160,10 @@ fn executeSearxngSearch(
     const encoded_query = try urlEncode(allocator, query);
     defer allocator.free(encoded_query);
 
-    const url_str = buildSearxngSearchUrl(allocator, base_url, encoded_query, count) catch
-        return error.InvalidSearchBaseUrl;
+    const url_str = buildSearxngSearchUrl(allocator, base_url, encoded_query, count) catch |err| switch (err) {
+        error.InvalidSearchBaseUrl => return error.InvalidSearchBaseUrl,
+        else => return err,
+    };
     defer allocator.free(url_str);
 
     const timeout_str = try timeoutToString(allocator, timeout_secs);
@@ -168,13 +179,16 @@ fn executeSearxngSearch(
         url_str,
         &headers,
         timeout_str,
-    ) catch |err| {
-        log.err("web_search (searxng) request failed for '{s}': {}", .{ query, err });
-        return error.RequestFailed;
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            log.err("web_search (searxng) request failed for '{s}': {}", .{ query, err });
+            return error.RequestFailed;
+        },
     };
     defer allocator.free(body);
 
-    const result = formatSearxngResults(allocator, body, query) catch return error.InvalidResponse;
+    const result = try formatSearxngResults(allocator, body, query);
     if (!result.success) return error.InvalidResponse;
     return result;
 }
@@ -196,8 +210,23 @@ fn buildSearxngSearchUrl(
         trimmed = trimmed[0 .. trimmed.len - 1];
     }
     if (!std.mem.startsWith(u8, trimmed, "https://")) return error.InvalidSearchBaseUrl;
-    if (std.mem.indexOfScalar(u8, trimmed, '?') != null) {
+    if (std.mem.indexOfAny(u8, trimmed, "?#") != null) {
         return error.InvalidSearchBaseUrl;
+    }
+    const after_scheme = trimmed["https://".len..];
+    if (after_scheme.len == 0 or after_scheme[0] == '/') {
+        return error.InvalidSearchBaseUrl;
+    }
+    const authority_end = std.mem.indexOfScalar(u8, after_scheme, '/') orelse after_scheme.len;
+    const authority = after_scheme[0..authority_end];
+    if (authority.len == 0 or std.mem.indexOfAny(u8, authority, " \t\r\n") != null) {
+        return error.InvalidSearchBaseUrl;
+    }
+    if (authority_end < after_scheme.len) {
+        const path = after_scheme[authority_end..];
+        if (!std.mem.eql(u8, path, "/search")) {
+            return error.InvalidSearchBaseUrl;
+        }
     }
 
     const endpoint = if (std.mem.endsWith(u8, trimmed, "/search"))
@@ -452,6 +481,21 @@ test "buildSearxngSearchUrl normalizes base URLs" {
     const from_search = try buildSearxngSearchUrl(testing.allocator, "https://searx.example.com/search", encoded_query, 3);
     defer testing.allocator.free(from_search);
     try testing.expect(std.mem.indexOf(u8, from_search, "https://searx.example.com/search?") != null);
+}
+
+test "buildSearxngSearchUrl rejects query and fragment" {
+    try testing.expectError(
+        error.InvalidSearchBaseUrl,
+        buildSearxngSearchUrl(testing.allocator, "https://searx.example.com?x=1", "zig", 3),
+    );
+    try testing.expectError(
+        error.InvalidSearchBaseUrl,
+        buildSearxngSearchUrl(testing.allocator, "https://searx.example.com#frag", "zig", 3),
+    );
+    try testing.expectError(
+        error.InvalidSearchBaseUrl,
+        buildSearxngSearchUrl(testing.allocator, "https://searx.example.com/custom", "zig", 3),
+    );
 }
 
 test "formatBraveResults parses valid JSON" {

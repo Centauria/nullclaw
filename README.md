@@ -375,6 +375,7 @@ Use this when you want web search without Brave (via SearXNG) and unrestricted s
 ```
 
 - `http_request.search_base_url` accepts either instance root (`https://host`) or explicit endpoint (`https://host/search`).
+- Invalid `http_request.search_base_url` now fails config validation at startup (no automatic fallback for malformed URL).
 - `allowed_commands: ["*"]` enables wildcard command allowlist matching.
 - `allowed_paths: ["*"]` allows access outside workspace, except system-protected paths.
 
