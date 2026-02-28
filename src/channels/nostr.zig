@@ -32,9 +32,10 @@ pub const NostrChannel = struct {
     /// Atomic flag to signal the reader thread to stop.
     running: std.atomic.Value(bool),
     /// Per-sender protocol mirroring: remembers which DM protocol each sender used.
-    /// Written only from the reader thread; reads from send path are safe since
-    /// vtableSend runs in the outbound dispatcher which is sequenced after bus delivery.
+    /// Accessed from both reader thread (writes) and outbound dispatcher (reads),
+    /// so guard all map access with sender_protocols_mu.
     sender_protocols: std.StringHashMapUnmanaged(DmProtocol),
+    sender_protocols_mu: std.Thread.Mutex,
     /// Recently-seen inner rumor IDs (kind:14 event id → arrival unix timestamp).
     /// Suppresses duplicate deliveries when the same rumor arrives via multiple relays.
     seen_rumor_ids: std.StringHashMapUnmanaged(i64),
@@ -53,6 +54,7 @@ pub const NostrChannel = struct {
             .reader_thread = null,
             .running = std.atomic.Value(bool).init(false),
             .sender_protocols = .empty,
+            .sender_protocols_mu = .{},
             .seen_rumor_ids = .empty,
             .listen_start_at = 0,
             .started = false,
@@ -66,9 +68,16 @@ pub const NostrChannel = struct {
     }
 
     pub fn deinit(self: *NostrChannel) void {
+        self.running.store(false, .release);
         self.stopListener();
+        if (self.reader_thread) |t| {
+            t.join();
+            self.reader_thread = null;
+        }
 
         // Free heap-allocated keys in sender_protocols map.
+        self.sender_protocols_mu.lock();
+        defer self.sender_protocols_mu.unlock();
         var it = self.sender_protocols.keyIterator();
         while (it.next()) |key_ptr| {
             self.allocator.free(key_ptr.*);
@@ -552,6 +561,8 @@ pub const NostrChannel = struct {
     /// Record which DM protocol a sender used, for protocol mirroring.
     /// If the sender already has an entry, update in-place (no allocation).
     pub fn recordSenderProtocol(self: *NostrChannel, sender_hex: []const u8, protocol: DmProtocol) !void {
+        self.sender_protocols_mu.lock();
+        defer self.sender_protocols_mu.unlock();
         if (self.sender_protocols.getPtr(sender_hex)) |ptr| {
             ptr.* = protocol;
         } else {
@@ -562,7 +573,9 @@ pub const NostrChannel = struct {
     }
 
     /// Get the DM protocol a sender last used. Defaults to NIP-17 if unknown.
-    pub fn getSenderProtocol(self: *const NostrChannel, sender_hex: []const u8) DmProtocol {
+    pub fn getSenderProtocol(self: *NostrChannel, sender_hex: []const u8) DmProtocol {
+        self.sender_protocols_mu.lock();
+        defer self.sender_protocols_mu.unlock();
         return self.sender_protocols.get(sender_hex) orelse .nip17;
     }
 

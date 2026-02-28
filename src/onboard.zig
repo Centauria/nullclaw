@@ -1216,6 +1216,12 @@ fn configureNostrChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, pre
         }
     }
 
+    const nostr_mod = @import("channels/nostr.zig");
+    if (bot_pubkey_hex == null or !nostr_mod.NostrChannel.isValidHexKey(bot_pubkey_hex.?)) {
+        try out.print("{s}  -> Failed to derive a valid bot pubkey from the provided key\n\n", .{prefix});
+        return false;
+    }
+
     // ── Owner pubkey ─────────────────────────────────────────────
     try out.print("{s}  Your owner pubkey (npub or 64-char hex): ", .{prefix});
     const owner_input = prompt(out, input_buf, "", "") orelse return false;
@@ -1238,7 +1244,6 @@ fn configureNostrChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, pre
         owner_hex = try cfg.allocator.dupe(u8, owner_input);
     }
 
-    const nostr_mod = @import("channels/nostr.zig");
     if (!nostr_mod.NostrChannel.isValidHexKey(owner_hex.?)) {
         try out.print("{s}  -> owner pubkey must be 64-char hex or a valid npub\n\n", .{prefix});
         return false;
@@ -1253,7 +1258,7 @@ fn configureNostrChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, pre
     ns.* = .{
         .private_key = encrypted_key,
         .owner_pubkey = try cfg.allocator.dupe(u8, owner_hex.?),
-        .bot_pubkey = if (bot_pubkey_hex) |bph| try cfg.allocator.dupe(u8, bph) else "",
+        .bot_pubkey = try cfg.allocator.dupe(u8, bot_pubkey_hex.?),
         .config_dir = config_dir,
     };
     cfg.channels.nostr = ns;
