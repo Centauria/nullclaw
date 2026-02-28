@@ -724,6 +724,10 @@ pub const Config = struct {
             .enabled = self.http_request.enabled,
             .max_response_size = self.http_request.max_response_size,
             .timeout_secs = self.http_request.timeout_secs,
+            .allowed_domains = self.http_request.allowed_domains,
+            .search_base_url = self.http_request.search_base_url,
+            .search_provider = self.http_request.search_provider,
+            .search_fallback_providers = self.http_request.search_fallback_providers,
         }, .{})});
         try w.print("  \"identity\": {f},\n", .{std.json.fmt(self.identity, .{})});
         try w.print("  \"cost\": {f},\n", .{std.json.fmt(self.cost, .{})});
@@ -796,6 +800,9 @@ pub const Config = struct {
         InvalidPort,
         InvalidRetryCount,
         InvalidBackoffMs,
+        InvalidHttpSearchBaseUrl,
+        InvalidHttpSearchProvider,
+        InvalidHttpSearchFallbackProvider,
         InvalidWebTransport,
         InvalidWebPath,
         InvalidWebAuthToken,
@@ -832,6 +839,19 @@ pub const Config = struct {
         }
         if (self.reliability.provider_backoff_ms > 600_000) {
             return ValidationError.InvalidBackoffMs;
+        }
+        if (self.http_request.search_base_url) |search_base_url| {
+            if (!config_types.HttpRequestConfig.isValidSearchBaseUrl(search_base_url)) {
+                return ValidationError.InvalidHttpSearchBaseUrl;
+            }
+        }
+        if (!config_types.HttpRequestConfig.isValidSearchProviderName(self.http_request.search_provider)) {
+            return ValidationError.InvalidHttpSearchProvider;
+        }
+        for (self.http_request.search_fallback_providers) |provider| {
+            if (!config_types.HttpRequestConfig.isValidSearchFallbackProviderName(provider)) {
+                return ValidationError.InvalidHttpSearchFallbackProvider;
+            }
         }
         for (self.channels.web) |web_cfg| {
             if (!config_types.WebConfig.isValidTransport(web_cfg.transport)) {
@@ -901,6 +921,9 @@ pub const Config = struct {
             ValidationError.InvalidPort => std.debug.print("Config error: gateway port must be non-zero.\n", .{}),
             ValidationError.InvalidRetryCount => std.debug.print("Config error: provider_retries must be <= 100.\n", .{}),
             ValidationError.InvalidBackoffMs => std.debug.print("Config error: provider_backoff_ms must be <= 600000.\n", .{}),
+            ValidationError.InvalidHttpSearchBaseUrl => std.debug.print("Config error: http_request.search_base_url must be https://host or https://host/search (no query/fragment).\n", .{}),
+            ValidationError.InvalidHttpSearchProvider => std.debug.print("Config error: http_request.search_provider must be one of: auto, searxng, duckduckgo(ddg), brave, firecrawl, tavily, perplexity, exa, jina.\n", .{}),
+            ValidationError.InvalidHttpSearchFallbackProvider => std.debug.print("Config error: http_request.search_fallback_providers entries must be valid providers and cannot be 'auto'.\n", .{}),
             ValidationError.InvalidWebTransport => std.debug.print("Config error: channels.web.accounts.<id>.transport must be 'local' or 'relay'.\n", .{}),
             ValidationError.InvalidWebPath => std.debug.print("Config error: channels.web.accounts.<id>.path must start with '/'.\n", .{}),
             ValidationError.InvalidWebAuthToken => std.debug.print("Config error: channels.web.accounts.<id>.auth_token/relay_token must be 16-128 printable chars without whitespace.\n", .{}),
@@ -1504,6 +1527,9 @@ test "save roundtrip preserves extended config sections" {
     cfg.http_request.enabled = true;
     cfg.http_request.max_response_size = 12345;
     cfg.http_request.timeout_secs = 8;
+    cfg.http_request.search_base_url = "https://searx.example.com";
+    cfg.http_request.search_provider = "brave";
+    cfg.http_request.search_fallback_providers = &.{ "jina", "duckduckgo" };
 
     cfg.identity.format = "aieos";
     cfg.identity.aieos_path = "id.json";
@@ -1585,6 +1611,10 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expect(loaded.browser.enabled);
     try std.testing.expectEqual(@as(usize, 2), loaded.browser.allowed_domains.len);
     try std.testing.expect(loaded.http_request.enabled);
+    try std.testing.expectEqualStrings("https://searx.example.com", loaded.http_request.search_base_url.?);
+    try std.testing.expectEqualStrings("brave", loaded.http_request.search_provider);
+    try std.testing.expectEqual(@as(usize, 2), loaded.http_request.search_fallback_providers.len);
+    try std.testing.expectEqualStrings("jina", loaded.http_request.search_fallback_providers[0]);
     try std.testing.expectEqualStrings("aieos", loaded.identity.format);
     try std.testing.expectEqual(@as(u8, 70), loaded.cost.warn_at_percent);
     try std.testing.expectEqual(config_types.SandboxBackend.firejail, loaded.security.sandbox.backend);
@@ -1789,6 +1819,50 @@ test "validation accepts max boundary backoff" {
     };
     cfg.reliability.provider_backoff_ms = 600_000;
     try cfg.validate();
+}
+
+test "validation rejects invalid http_request search base URL" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+    };
+    cfg.http_request.search_base_url = "https://searx.example.com?bad=1";
+    try std.testing.expectError(Config.ValidationError.InvalidHttpSearchBaseUrl, cfg.validate());
+}
+
+test "validation accepts valid http_request search base URL" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+    };
+    cfg.http_request.search_base_url = "https://searx.example.com/search";
+    try cfg.validate();
+}
+
+test "validation rejects invalid http_request search provider" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+    };
+    cfg.http_request.search_provider = "google";
+    try std.testing.expectError(Config.ValidationError.InvalidHttpSearchProvider, cfg.validate());
+}
+
+test "validation rejects invalid http_request search fallback provider" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+    };
+    cfg.http_request.search_fallback_providers = &.{"auto"};
+    try std.testing.expectError(Config.ValidationError.InvalidHttpSearchFallbackProvider, cfg.validate());
 }
 
 test "validation rejects malformed web path" {
@@ -2264,6 +2338,34 @@ test "json parse browser allowed domains" {
     try std.testing.expectEqualStrings("docs.rs", cfg.browser.allowed_domains[1]);
     for (cfg.browser.allowed_domains) |d| allocator.free(d);
     allocator.free(cfg.browser.allowed_domains);
+}
+
+test "json parse http_request search_base_url" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"http_request": {"enabled": true, "search_base_url": "https://searx.example.com"}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.http_request.enabled);
+    try std.testing.expectEqualStrings("https://searx.example.com", cfg.http_request.search_base_url.?);
+    allocator.free(cfg.http_request.search_base_url.?);
+}
+
+test "json parse http_request search provider settings" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"http_request": {"search_provider": "tavily", "search_fallback_providers": ["exa", "jina"]}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqualStrings("tavily", cfg.http_request.search_provider);
+    try std.testing.expectEqual(@as(usize, 2), cfg.http_request.search_fallback_providers.len);
+    try std.testing.expectEqualStrings("exa", cfg.http_request.search_fallback_providers[0]);
+    try std.testing.expectEqualStrings("jina", cfg.http_request.search_fallback_providers[1]);
+    allocator.free(cfg.http_request.search_provider);
+    for (cfg.http_request.search_fallback_providers) |provider| allocator.free(provider);
+    allocator.free(cfg.http_request.search_fallback_providers);
 }
 
 test "json parse model routes" {
