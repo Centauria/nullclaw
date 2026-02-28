@@ -16,15 +16,13 @@
 //! 3) Optional fallback chain (`http_request.search_fallback_providers`).
 
 const std = @import("std");
-const builtin = @import("builtin");
 const root = @import("root.zig");
 const platform = @import("../platform.zig");
-const http_util = @import("../http_util.zig");
+const search_providers = @import("web_search_providers/root.zig");
+const search_common = search_providers.common;
 const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
-
-const log = std.log.scoped(.web_search);
 
 /// Maximum number of search results.
 const MAX_RESULTS: usize = 10;
@@ -47,20 +45,7 @@ const SearchProvider = enum {
     jina,
 };
 
-const ProviderSearchError = error{
-    InvalidProvider,
-    InvalidSearchBaseUrl,
-    MissingApiKey,
-    ProviderUnavailable,
-    RequestFailed,
-    InvalidResponse,
-};
-
-const ResultEntry = struct {
-    title: []const u8,
-    url: []const u8,
-    description: []const u8,
-};
+const ProviderSearchError = search_common.ProviderSearchError;
 
 /// Web search tool supporting multiple providers.
 pub const WebSearchTool = struct {
@@ -108,7 +93,6 @@ pub const WebSearchTool = struct {
 
         for (chain) |provider| {
             const result = executeWithProvider(self, allocator, provider, query, count) catch |err| {
-                // Invalid base URL is a configuration error: fail hard.
                 if (err == error.InvalidSearchBaseUrl) {
                     return ToolResult.fail("Invalid http_request.search_base_url; expected https://host[/search]");
                 }
@@ -157,11 +141,6 @@ fn providerName(provider: SearchProvider) []const u8 {
         .exa => "exa",
         .jina => "jina",
     };
-}
-
-fn logRequestError(provider: []const u8, query: []const u8, err: anytype) void {
-    if (builtin.is_test) return;
-    log.err("web_search ({s}) request failed for '{s}': {}", .{ provider, query, err });
 }
 
 fn appendProviderUnique(chain: []SearchProvider, len: *usize, provider: SearchProvider) void {
@@ -221,38 +200,38 @@ fn executeWithProvider(
             const base_url = self.searxng_base_url orelse return error.ProviderUnavailable;
             const trimmed = std.mem.trim(u8, base_url, " \t\n\r");
             if (trimmed.len == 0) return error.ProviderUnavailable;
-            return executeSearxngSearch(allocator, query, count, trimmed, self.timeout_secs);
+            return search_providers.searxng.execute(allocator, query, count, trimmed, self.timeout_secs);
         },
-        .duckduckgo => return executeDuckDuckGoSearch(allocator, query, count, self.timeout_secs),
+        .duckduckgo => return search_providers.duckduckgo.execute(allocator, query, count, self.timeout_secs),
         .brave => {
             const api_key = tryApiKeyFromEnvOrNull(allocator, &.{"BRAVE_API_KEY"}) orelse return error.MissingApiKey;
             defer allocator.free(api_key);
-            return executeBraveSearch(allocator, query, count, api_key, self.timeout_secs);
+            return search_providers.brave.execute(allocator, query, count, api_key, self.timeout_secs);
         },
         .firecrawl => {
             const api_key = tryApiKeyFromEnvOrNull(allocator, &.{ "FIRECRAWL_API_KEY", "WEB_SEARCH_API_KEY" }) orelse return error.MissingApiKey;
             defer allocator.free(api_key);
-            return executeFirecrawlSearch(allocator, query, count, api_key, self.timeout_secs);
+            return search_providers.firecrawl.execute(allocator, query, count, api_key, self.timeout_secs);
         },
         .tavily => {
             const api_key = tryApiKeyFromEnvOrNull(allocator, &.{ "TAVILY_API_KEY", "WEB_SEARCH_API_KEY" }) orelse return error.MissingApiKey;
             defer allocator.free(api_key);
-            return executeTavilySearch(allocator, query, count, api_key, self.timeout_secs);
+            return search_providers.tavily.execute(allocator, query, count, api_key, self.timeout_secs);
         },
         .perplexity => {
             const api_key = tryApiKeyFromEnvOrNull(allocator, &.{ "PERPLEXITY_API_KEY", "WEB_SEARCH_API_KEY" }) orelse return error.MissingApiKey;
             defer allocator.free(api_key);
-            return executePerplexitySearch(allocator, query, count, api_key, self.timeout_secs);
+            return search_providers.perplexity.execute(allocator, query, count, api_key, self.timeout_secs);
         },
         .exa => {
             const api_key = tryApiKeyFromEnvOrNull(allocator, &.{ "EXA_API_KEY", "WEB_SEARCH_API_KEY" }) orelse return error.MissingApiKey;
             defer allocator.free(api_key);
-            return executeExaSearch(allocator, query, count, api_key, self.timeout_secs);
+            return search_providers.exa.execute(allocator, query, count, api_key, self.timeout_secs);
         },
         .jina => {
             const api_key = tryApiKeyFromEnvOrNull(allocator, &.{ "JINA_API_KEY", "WEB_SEARCH_API_KEY" });
             defer if (api_key) |key| allocator.free(key);
-            return executeJinaSearch(allocator, query, api_key, self.timeout_secs);
+            return search_providers.jina.execute(allocator, query, api_key, self.timeout_secs);
         },
     }
 }
@@ -269,411 +248,19 @@ fn tryApiKeyFromEnvOrNull(allocator: std.mem.Allocator, names: []const []const u
     return null;
 }
 
-fn executeBraveSearch(
-    allocator: std.mem.Allocator,
-    query: []const u8,
-    count: usize,
-    api_key: []const u8,
-    timeout_secs: u64,
-) (ProviderSearchError || error{OutOfMemory})!ToolResult {
-    const encoded_query = try urlEncode(allocator, query);
-    defer allocator.free(encoded_query);
-
-    const url_str = try std.fmt.allocPrint(
-        allocator,
-        "https://api.search.brave.com/res/v1/web/search?q={s}&count={d}",
-        .{ encoded_query, count },
-    );
-    defer allocator.free(url_str);
-
-    const timeout_str = try timeoutToString(allocator, timeout_secs);
-    defer allocator.free(timeout_str);
-
-    const auth_header = try std.fmt.allocPrint(allocator, "X-Subscription-Token: {s}", .{api_key});
-    defer allocator.free(auth_header);
-    const headers = [_][]const u8{
-        auth_header,
-        "Accept: application/json",
-    };
-
-    const body = curlGet(allocator, url_str, &headers, timeout_str) catch |err| {
-        logRequestError("brave", query, err);
-        return err;
-    };
-    defer allocator.free(body);
-
-    const result = try formatBraveResults(allocator, body, query);
-    if (!result.success) return error.InvalidResponse;
-    return result;
+fn parseCount(args: JsonObjectMap) usize {
+    const val_i64 = root.getInt(args, "count") orelse return DEFAULT_COUNT;
+    if (val_i64 < 1) return 1;
+    const val: usize = if (val_i64 > @as(i64, @intCast(MAX_RESULTS))) MAX_RESULTS else @intCast(val_i64);
+    return val;
 }
 
-fn executeFirecrawlSearch(
-    allocator: std.mem.Allocator,
-    query: []const u8,
-    count: usize,
-    api_key: []const u8,
-    timeout_secs: u64,
-) (ProviderSearchError || error{OutOfMemory})!ToolResult {
-    const timeout_str = try timeoutToString(allocator, timeout_secs);
-    defer allocator.free(timeout_str);
-
-    const endpoint = "https://api.firecrawl.dev/v1/search";
-    const auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
-    defer allocator.free(auth_header);
-
-    const payload = .{
-        .query = query,
-        .limit = count,
-        .timeout = timeout_secs * 1000,
-    };
-    const body_json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
-    defer allocator.free(body_json);
-
-    const headers = [_][]const u8{
-        auth_header,
-        "Content-Type: application/json",
-        "Accept: application/json",
-    };
-
-    const body = curlPostJson(allocator, endpoint, body_json, &headers, timeout_str) catch |err| {
-        logRequestError("firecrawl", query, err);
-        return err;
-    };
-    defer allocator.free(body);
-
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.InvalidResponse;
-    defer parsed.deinit();
-
-    const root_val = switch (parsed.value) {
-        .object => |o| o,
-        else => return error.InvalidResponse,
-    };
-
-    if (root_val.get("success")) |success_val| {
-        if (success_val != .bool or !success_val.bool) return error.RequestFailed;
-    }
-
-    const results = root_val.get("data") orelse return error.InvalidResponse;
-    const results_arr = switch (results) {
-        .array => |a| a,
-        else => return error.InvalidResponse,
-    };
-
-    if (results_arr.items.len == 0) return ToolResult.ok("No web results found.");
-    return formatResultsArray(allocator, results_arr.items, query, "description", null);
+pub fn urlEncode(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    return search_common.urlEncode(allocator, input);
 }
 
-fn executeTavilySearch(
-    allocator: std.mem.Allocator,
-    query: []const u8,
-    count: usize,
-    api_key: []const u8,
-    timeout_secs: u64,
-) (ProviderSearchError || error{OutOfMemory})!ToolResult {
-    const timeout_str = try timeoutToString(allocator, timeout_secs);
-    defer allocator.free(timeout_str);
-
-    const endpoint = "https://api.tavily.com/search";
-    const payload = .{
-        .api_key = api_key,
-        .query = query,
-        .max_results = count,
-        .search_depth = "basic",
-        .include_answer = false,
-        .include_raw_content = false,
-        .include_images = false,
-    };
-    const body_json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
-    defer allocator.free(body_json);
-
-    const headers = [_][]const u8{
-        "Content-Type: application/json",
-        "Accept: application/json",
-    };
-
-    const body = curlPostJson(allocator, endpoint, body_json, &headers, timeout_str) catch |err| {
-        logRequestError("tavily", query, err);
-        return err;
-    };
-    defer allocator.free(body);
-
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.InvalidResponse;
-    defer parsed.deinit();
-
-    const root_val = switch (parsed.value) {
-        .object => |o| o,
-        else => return error.InvalidResponse,
-    };
-
-    if (root_val.get("error")) |_| return error.RequestFailed;
-
-    const results = root_val.get("results") orelse return error.InvalidResponse;
-    const results_arr = switch (results) {
-        .array => |a| a,
-        else => return error.InvalidResponse,
-    };
-
-    if (results_arr.items.len == 0) return ToolResult.ok("No web results found.");
-    return formatResultsArray(allocator, results_arr.items, query, "content", null);
-}
-
-fn executePerplexitySearch(
-    allocator: std.mem.Allocator,
-    query: []const u8,
-    count: usize,
-    api_key: []const u8,
-    timeout_secs: u64,
-) (ProviderSearchError || error{OutOfMemory})!ToolResult {
-    const timeout_str = try timeoutToString(allocator, timeout_secs);
-    defer allocator.free(timeout_str);
-
-    const endpoint = "https://api.perplexity.ai/search";
-    const auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{api_key});
-    defer allocator.free(auth_header);
-
-    const payload = .{
-        .query = query,
-        .max_results = count,
-    };
-    const body_json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
-    defer allocator.free(body_json);
-
-    const headers = [_][]const u8{
-        auth_header,
-        "Content-Type: application/json",
-        "Accept: application/json",
-    };
-
-    const body = curlPostJson(allocator, endpoint, body_json, &headers, timeout_str) catch |err| {
-        logRequestError("perplexity", query, err);
-        return err;
-    };
-    defer allocator.free(body);
-
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.InvalidResponse;
-    defer parsed.deinit();
-
-    const root_val = switch (parsed.value) {
-        .object => |o| o,
-        else => return error.InvalidResponse,
-    };
-
-    const results = root_val.get("results") orelse return error.InvalidResponse;
-    const results_arr = switch (results) {
-        .array => |a| a,
-        else => return error.InvalidResponse,
-    };
-
-    if (results_arr.items.len == 0) return ToolResult.ok("No web results found.");
-    return formatResultsArray(allocator, results_arr.items, query, "snippet", null);
-}
-
-fn executeExaSearch(
-    allocator: std.mem.Allocator,
-    query: []const u8,
-    count: usize,
-    api_key: []const u8,
-    timeout_secs: u64,
-) (ProviderSearchError || error{OutOfMemory})!ToolResult {
-    const timeout_str = try timeoutToString(allocator, timeout_secs);
-    defer allocator.free(timeout_str);
-
-    const endpoint = "https://api.exa.ai/search";
-    const key_header = try std.fmt.allocPrint(allocator, "x-api-key: {s}", .{api_key});
-    defer allocator.free(key_header);
-
-    const payload = .{
-        .query = query,
-        .numResults = count,
-    };
-    const body_json = try std.json.Stringify.valueAlloc(allocator, payload, .{});
-    defer allocator.free(body_json);
-
-    const headers = [_][]const u8{
-        key_header,
-        "Content-Type: application/json",
-        "Accept: application/json",
-    };
-
-    const body = curlPostJson(allocator, endpoint, body_json, &headers, timeout_str) catch |err| {
-        logRequestError("exa", query, err);
-        return err;
-    };
-    defer allocator.free(body);
-
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return error.InvalidResponse;
-    defer parsed.deinit();
-
-    const root_val = switch (parsed.value) {
-        .object => |o| o,
-        else => return error.InvalidResponse,
-    };
-
-    const results = root_val.get("results") orelse return error.InvalidResponse;
-    const results_arr = switch (results) {
-        .array => |a| a,
-        else => return error.InvalidResponse,
-    };
-
-    if (results_arr.items.len == 0) return ToolResult.ok("No web results found.");
-    return formatResultsArray(allocator, results_arr.items, query, "summary", "text");
-}
-
-fn executeJinaSearch(
-    allocator: std.mem.Allocator,
-    query: []const u8,
-    api_key: ?[]const u8,
-    timeout_secs: u64,
-) (ProviderSearchError || error{OutOfMemory})!ToolResult {
-    const encoded_query = try urlEncodePath(allocator, query);
-    defer allocator.free(encoded_query);
-
-    const url_str = try std.fmt.allocPrint(allocator, "https://s.jina.ai/{s}", .{encoded_query});
-    defer allocator.free(url_str);
-
-    const timeout_str = try timeoutToString(allocator, timeout_secs);
-    defer allocator.free(timeout_str);
-
-    if (api_key) |key| {
-        const auth_header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{key});
-        defer allocator.free(auth_header);
-        const x_key_header = try std.fmt.allocPrint(allocator, "x-api-key: {s}", .{key});
-        defer allocator.free(x_key_header);
-
-        const headers = [_][]const u8{
-            "Accept: text/plain",
-            auth_header,
-            x_key_header,
-        };
-
-        const body = curlGet(allocator, url_str, &headers, timeout_str) catch |err| {
-            logRequestError("jina", query, err);
-            return err;
-        };
-        defer allocator.free(body);
-
-        return formatJinaPlainText(allocator, body, query);
-    }
-
-    const headers = [_][]const u8{"Accept: text/plain"};
-    const body = curlGet(allocator, url_str, &headers, timeout_str) catch |err| {
-        logRequestError("jina", query, err);
-        return err;
-    };
-    defer allocator.free(body);
-
-    return formatJinaPlainText(allocator, body, query);
-}
-
-fn formatJinaPlainText(allocator: std.mem.Allocator, text: []const u8, query: []const u8) !ToolResult {
-    const trimmed = std.mem.trim(u8, text, " \t\n\r");
-    if (trimmed.len == 0) return ToolResult.ok("No web results found.");
-
-    const output = try std.fmt.allocPrint(allocator, "Results for: {s}\n\n{s}", .{ query, trimmed });
-    return ToolResult{ .success = true, .output = output };
-}
-
-fn executeDuckDuckGoSearch(
-    allocator: std.mem.Allocator,
-    query: []const u8,
-    count: usize,
-    timeout_secs: u64,
-) (ProviderSearchError || error{OutOfMemory})!ToolResult {
-    const encoded_query = try urlEncode(allocator, query);
-    defer allocator.free(encoded_query);
-
-    const url_str = try std.fmt.allocPrint(
-        allocator,
-        "https://api.duckduckgo.com/?q={s}&format=json&no_html=1&skip_disambig=1",
-        .{encoded_query},
-    );
-    defer allocator.free(url_str);
-
-    const timeout_str = try timeoutToString(allocator, timeout_secs);
-    defer allocator.free(timeout_str);
-
-    const headers = [_][]const u8{
-        "Accept: application/json",
-    };
-
-    const body = curlGet(allocator, url_str, &headers, timeout_str) catch |err| {
-        logRequestError("duckduckgo", query, err);
-        return err;
-    };
-    defer allocator.free(body);
-
-    const result = try formatDuckDuckGoResults(allocator, body, query, count);
-    if (!result.success) return error.InvalidResponse;
-    return result;
-}
-
-fn executeSearxngSearch(
-    allocator: std.mem.Allocator,
-    query: []const u8,
-    count: usize,
-    base_url: []const u8,
-    timeout_secs: u64,
-) (ProviderSearchError || error{OutOfMemory})!ToolResult {
-    const encoded_query = try urlEncode(allocator, query);
-    defer allocator.free(encoded_query);
-
-    const url_str = buildSearxngSearchUrl(allocator, base_url, encoded_query, count) catch |err| switch (err) {
-        error.InvalidSearchBaseUrl => return error.InvalidSearchBaseUrl,
-        else => return err,
-    };
-    defer allocator.free(url_str);
-
-    const timeout_str = try timeoutToString(allocator, timeout_secs);
-    defer allocator.free(timeout_str);
-
-    const headers = [_][]const u8{
-        "Accept: application/json",
-        "User-Agent: nullclaw/0.1 (web_search)",
-    };
-
-    const body = curlGet(allocator, url_str, &headers, timeout_str) catch |err| {
-        logRequestError("searxng", query, err);
-        return err;
-    };
-    defer allocator.free(body);
-
-    const result = try formatSearxngResults(allocator, body, query);
-    if (!result.success) return error.InvalidResponse;
-    return result;
-}
-
-fn curlGet(
-    allocator: std.mem.Allocator,
-    url: []const u8,
-    headers: []const []const u8,
-    timeout_secs: []const u8,
-) (ProviderSearchError || error{OutOfMemory})![]u8 {
-    if (builtin.is_test) return error.RequestFailed;
-
-    return http_util.curlGet(allocator, url, headers, timeout_secs) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.RequestFailed,
-    };
-}
-
-fn curlPostJson(
-    allocator: std.mem.Allocator,
-    url: []const u8,
-    body: []const u8,
-    headers: []const []const u8,
-    timeout_secs: []const u8,
-) (ProviderSearchError || error{OutOfMemory})![]u8 {
-    if (builtin.is_test) return error.RequestFailed;
-
-    return http_util.curlPostWithProxy(allocator, url, body, headers, null, timeout_secs) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.RequestFailed,
-    };
-}
-
-fn timeoutToString(allocator: std.mem.Allocator, timeout_secs: u64) ![]u8 {
-    const effective_timeout = if (timeout_secs == 0) DEFAULT_TIMEOUT_SECS else timeout_secs;
-    return std.fmt.allocPrint(allocator, "{d}", .{effective_timeout});
+fn urlEncodePath(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    return search_common.urlEncodePath(allocator, input);
 }
 
 fn buildSearxngSearchUrl(
@@ -682,297 +269,19 @@ fn buildSearxngSearchUrl(
     encoded_query: []const u8,
     count: usize,
 ) ![]u8 {
-    var trimmed = std.mem.trim(u8, base_url, " \t\n\r");
-    if (trimmed.len == 0) return error.InvalidSearchBaseUrl;
-    while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') {
-        trimmed = trimmed[0 .. trimmed.len - 1];
-    }
-    if (!std.mem.startsWith(u8, trimmed, "https://")) return error.InvalidSearchBaseUrl;
-    if (std.mem.indexOfAny(u8, trimmed, "?#") != null) {
-        return error.InvalidSearchBaseUrl;
-    }
-    const after_scheme = trimmed["https://".len..];
-    if (after_scheme.len == 0 or after_scheme[0] == '/') {
-        return error.InvalidSearchBaseUrl;
-    }
-    const authority_end = std.mem.indexOfScalar(u8, after_scheme, '/') orelse after_scheme.len;
-    const authority = after_scheme[0..authority_end];
-    if (authority.len == 0 or std.mem.indexOfAny(u8, authority, " \t\r\n") != null) {
-        return error.InvalidSearchBaseUrl;
-    }
-    if (authority_end < after_scheme.len) {
-        const path = after_scheme[authority_end..];
-        if (!std.mem.eql(u8, path, "/search")) {
-            return error.InvalidSearchBaseUrl;
-        }
-    }
-
-    const endpoint = if (std.mem.endsWith(u8, trimmed, "/search"))
-        try allocator.dupe(u8, trimmed)
-    else
-        try std.fmt.allocPrint(allocator, "{s}/search", .{trimmed});
-    defer allocator.free(endpoint);
-
-    return std.fmt.allocPrint(
-        allocator,
-        "{s}?q={s}&format=json&language=all&safesearch=0&categories=general&count={d}",
-        .{ endpoint, encoded_query, count },
-    );
+    return search_common.buildSearxngSearchUrl(allocator, base_url, encoded_query, count);
 }
 
-/// Parse count from args ObjectMap. Returns DEFAULT_COUNT if not found or invalid.
-fn parseCount(args: JsonObjectMap) usize {
-    const val_i64 = root.getInt(args, "count") orelse return DEFAULT_COUNT;
-    if (val_i64 < 1) return 1;
-    const val: usize = if (val_i64 > @as(i64, @intCast(MAX_RESULTS))) MAX_RESULTS else @intCast(val_i64);
-    return val;
-}
-
-/// URL-encode a string for query components.
-pub fn urlEncode(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~') {
-            try buf.append(allocator, c);
-        } else if (c == ' ') {
-            try buf.append(allocator, '+');
-        } else {
-            try buf.appendSlice(allocator, &.{ '%', hexDigit(c >> 4), hexDigit(c & 0x0f) });
-        }
-    }
-    return buf.toOwnedSlice(allocator);
-}
-
-/// URL-encode a string for path components.
-fn urlEncodePath(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
-    for (input) |c| {
-        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.' or c == '~') {
-            try buf.append(allocator, c);
-        } else {
-            try buf.appendSlice(allocator, &.{ '%', hexDigit(c >> 4), hexDigit(c & 0x0f) });
-        }
-    }
-    return buf.toOwnedSlice(allocator);
-}
-
-fn hexDigit(v: u8) u8 {
-    return "0123456789ABCDEF"[v & 0x0f];
-}
-
-/// Parse Brave Search JSON and format as text results.
 pub fn formatBraveResults(allocator: std.mem.Allocator, json_body: []const u8, query: []const u8) !ToolResult {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_body, .{}) catch
-        return ToolResult.fail("Failed to parse search response JSON");
-    defer parsed.deinit();
-
-    const root_val = switch (parsed.value) {
-        .object => |o| o,
-        else => return ToolResult.fail("Unexpected search response format"),
-    };
-
-    const web = root_val.get("web") orelse
-        return ToolResult.ok("No web results found.");
-
-    const web_obj = switch (web) {
-        .object => |o| o,
-        else => return ToolResult.ok("No web results found."),
-    };
-
-    const results = web_obj.get("results") orelse
-        return ToolResult.ok("No web results found.");
-
-    const results_arr = switch (results) {
-        .array => |a| a,
-        else => return ToolResult.ok("No web results found."),
-    };
-
-    if (results_arr.items.len == 0)
-        return ToolResult.ok("No web results found.");
-
-    return formatResultsArray(allocator, results_arr.items, query, "description", null);
+    return search_providers.brave.formatResults(allocator, json_body, query);
 }
 
-/// Parse SearXNG JSON and format as text results.
 pub fn formatSearxngResults(allocator: std.mem.Allocator, json_body: []const u8, query: []const u8) !ToolResult {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_body, .{}) catch
-        return ToolResult.fail("Failed to parse search response JSON");
-    defer parsed.deinit();
-
-    const root_val = switch (parsed.value) {
-        .object => |o| o,
-        else => return ToolResult.fail("Unexpected search response format"),
-    };
-
-    const results = root_val.get("results") orelse
-        return ToolResult.ok("No web results found.");
-
-    const results_arr = switch (results) {
-        .array => |a| a,
-        else => return ToolResult.ok("No web results found."),
-    };
-
-    if (results_arr.items.len == 0)
-        return ToolResult.ok("No web results found.");
-
-    return formatResultsArray(allocator, results_arr.items, query, "content", null);
+    return search_providers.searxng.formatResults(allocator, json_body, query);
 }
 
 fn formatDuckDuckGoResults(allocator: std.mem.Allocator, json_body: []const u8, query: []const u8, count: usize) !ToolResult {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_body, .{}) catch
-        return ToolResult.fail("Failed to parse search response JSON");
-    defer parsed.deinit();
-
-    const root_val = switch (parsed.value) {
-        .object => |o| o,
-        else => return ToolResult.fail("Unexpected search response format"),
-    };
-
-    var entries: [MAX_RESULTS]ResultEntry = undefined;
-    var entry_len: usize = 0;
-
-    const heading = extractString(root_val, "Heading") orelse "";
-    const abstract_text = extractString(root_val, "AbstractText") orelse "";
-    const abstract_url = extractString(root_val, "AbstractURL") orelse "";
-
-    if (abstract_url.len > 0 and abstract_text.len > 0 and entry_len < count) {
-        const title = if (heading.len > 0) heading else duckduckgoTitleFromText(abstract_text);
-        entries[entry_len] = .{
-            .title = title,
-            .url = abstract_url,
-            .description = abstract_text,
-        };
-        entry_len += 1;
-    }
-
-    if (root_val.get("RelatedTopics")) |related_topics| {
-        if (related_topics == .array) {
-            collectDuckDuckGoTopics(related_topics.array.items, &entries, &entry_len, count);
-        }
-    }
-
-    if (entry_len == 0) return ToolResult.ok("No web results found.");
-    return formatResultEntries(allocator, query, entries[0..entry_len]);
-}
-
-fn collectDuckDuckGoTopics(
-    topics: []const std.json.Value,
-    entries: *[MAX_RESULTS]ResultEntry,
-    entry_len: *usize,
-    max_results: usize,
-) void {
-    for (topics) |topic| {
-        if (entry_len.* >= max_results) return;
-
-        const topic_obj = switch (topic) {
-            .object => |o| o,
-            else => continue,
-        };
-
-        const text = extractString(topic_obj, "Text");
-        const first_url = extractString(topic_obj, "FirstURL");
-
-        if (text != null and first_url != null and text.?.len > 0 and first_url.?.len > 0) {
-            entries[entry_len.*] = .{
-                .title = duckduckgoTitleFromText(text.?),
-                .url = first_url.?,
-                .description = text.?,
-            };
-            entry_len.* += 1;
-            continue;
-        }
-
-        if (topic_obj.get("Topics")) |nested_topics| {
-            if (nested_topics == .array) {
-                collectDuckDuckGoTopics(nested_topics.array.items, entries, entry_len, max_results);
-            }
-        }
-    }
-}
-
-fn duckduckgoTitleFromText(text: []const u8) []const u8 {
-    if (std.mem.indexOf(u8, text, " - ")) |idx| {
-        if (idx > 0) return text[0..idx];
-    }
-    if (std.mem.indexOf(u8, text, " — ")) |idx| {
-        if (idx > 0) return text[0..idx];
-    }
-    return text;
-}
-
-fn formatResultEntries(allocator: std.mem.Allocator, query: []const u8, entries: []const ResultEntry) !ToolResult {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
-
-    try std.fmt.format(buf.writer(allocator), "Results for: {s}\n\n", .{query});
-
-    for (entries, 0..) |entry, i| {
-        const title = if (entry.title.len > 0) entry.title else "(no title)";
-        const url = if (entry.url.len > 0) entry.url else "(no url)";
-
-        try std.fmt.format(buf.writer(allocator), "{d}. {s}\n   {s}\n", .{ i + 1, title, url });
-        if (entry.description.len > 0) {
-            try std.fmt.format(buf.writer(allocator), "   {s}\n", .{entry.description});
-        }
-        try buf.append(allocator, '\n');
-    }
-
-    return ToolResult.ok(try buf.toOwnedSlice(allocator));
-}
-
-fn formatResultsArray(
-    allocator: std.mem.Allocator,
-    items: []const std.json.Value,
-    query: []const u8,
-    preferred_desc_key: []const u8,
-    secondary_desc_key: ?[]const u8,
-) !ToolResult {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(allocator);
-
-    try std.fmt.format(buf.writer(allocator), "Results for: {s}\n\n", .{query});
-
-    var out_idx: usize = 0;
-    for (items) |item| {
-        const obj = switch (item) {
-            .object => |o| o,
-            else => continue,
-        };
-
-        const title = extractString(obj, "title") orelse "(no title)";
-        const url = extractString(obj, "url") orelse "(no url)";
-        const desc = blk: {
-            if (extractString(obj, preferred_desc_key)) |d| break :blk d;
-            if (secondary_desc_key) |key| {
-                if (extractString(obj, key)) |d| break :blk d;
-            }
-            if (extractString(obj, "description")) |d| break :blk d;
-            break :blk "";
-        };
-
-        out_idx += 1;
-        try std.fmt.format(buf.writer(allocator), "{d}. {s}\n   {s}\n", .{ out_idx, title, url });
-        if (desc.len > 0) {
-            try std.fmt.format(buf.writer(allocator), "   {s}\n", .{desc});
-        }
-        try buf.append(allocator, '\n');
-    }
-
-    if (out_idx == 0) {
-        return ToolResult.ok("No web results found.");
-    }
-
-    return ToolResult.ok(try buf.toOwnedSlice(allocator));
-}
-
-fn extractString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    const val = obj.get(key) orelse return null;
-    return switch (val) {
-        .string => |s| s,
-        else => null,
-    };
+    return search_providers.duckduckgo.formatResults(allocator, json_body, query, count);
 }
 
 // ══════════════════════════════════════════════════════════════════
