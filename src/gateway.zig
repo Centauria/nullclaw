@@ -110,7 +110,13 @@ const GatewayThreadObserver = struct {
         }
 
         const out = try allocator.alloc(GatewayTurnToolEvent, count);
+        errdefer allocator.free(out);
         var out_idx: usize = 0;
+        errdefer {
+            for (out[0..out_idx]) |event| {
+                allocator.free(event.tool);
+            }
+        }
         for (self.events.items) |event| {
             if (event.seq <= seq) continue;
 
@@ -4291,6 +4297,21 @@ test "GatewayThreadObserver collectSince filters by sequence" {
     try std.testing.expectEqual(@as(usize, 1), events.len);
     try std.testing.expectEqualStrings("web_fetch", events[0].tool);
     try std.testing.expect(!events[0].success);
+}
+
+test "GatewayThreadObserver collectSince OOM frees partial output" {
+    var obs = GatewayThreadObserver.init(std.testing.allocator);
+    defer obs.deinit();
+
+    const event1 = observability.ObserverEvent{ .tool_call = .{ .tool = "shell", .duration_ms = 10, .success = true } };
+    obs.observer().recordEvent(&event1);
+    const event2 = observability.ObserverEvent{ .tool_call = .{ .tool = "web_fetch", .duration_ms = 20, .success = false } };
+    obs.observer().recordEvent(&event2);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    // collectSince allocations: out array + first tool dupe + second tool dupe
+    failing.fail_index = failing.alloc_index + 2;
+    try std.testing.expectError(error.OutOfMemory, obs.collectSince(failing.allocator(), 0));
 }
 
 // ── buildThreadEventsJson / buildWebhookSuccessResponse tests ───
