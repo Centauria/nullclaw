@@ -52,9 +52,7 @@ pub const ShellTool = struct {
                     error.CommandNotAllowed => ToolResult.fail("Command not allowed by security policy"),
                     error.HighRiskBlocked => ToolResult.fail("High-risk command blocked by security policy"),
                     error.ApprovalRequired => blk: {
-                        const msg = std.fmt.allocPrint(allocator,
-                            "Command requires approval (medium/high risk): {s}",
-                            .{command}) catch "Command requires approval (medium/high risk)";
+                        const msg = try std.fmt.allocPrint(allocator, "Command requires approval (medium/high risk): {s}", .{command});
                         break :blk ToolResult{ .success = false, .output = "", .error_msg = msg };
                     },
                 };
@@ -371,4 +369,30 @@ test "shell ApprovalRequired error includes command name" {
     defer std.testing.allocator.free(result.error_msg.?);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "touch test.txt") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "approval") != null);
+}
+
+test "shell ApprovalRequired propagates oom for error message allocation" {
+    const policy_mod = @import("../security/policy.zig");
+    var tracker = policy_mod.RateTracker.init(std.testing.allocator, 100);
+    defer tracker.deinit();
+    const allowed = [_][]const u8{ "git", "ls", "cat", "grep", "echo", "touch" };
+    var policy = policy_mod.SecurityPolicy{
+        .autonomy = .supervised,
+        .workspace_dir = "/tmp",
+        .require_approval_for_medium_risk = true,
+        .block_high_risk_commands = false,
+        .tracker = &tracker,
+        .allowed_commands = &allowed,
+    };
+
+    var st = ShellTool{ .workspace_dir = "/tmp", .policy = &policy };
+    const parsed = try root.parseTestArgs("{\"command\": \"touch test.txt\"}");
+    defer parsed.deinit();
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        st.execute(failing.allocator(), parsed.value.object),
+    );
 }
