@@ -13,7 +13,6 @@ const log = std.log.scoped(.http_request);
 pub const HttpRequestTool = struct {
     allowed_domains: []const []const u8 = &.{}, // empty = allow all
     max_response_size: u32 = 1_000_000,
-    timeout_secs: u64 = 30,
 
     pub const tool_name = "http_request";
     pub const tool_description = "Make HTTP requests to external APIs. Supports GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS methods. " ++

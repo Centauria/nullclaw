@@ -21,6 +21,12 @@ const DEFAULT_COUNT: usize = 5;
 /// Default request timeout for backend HTTP calls.
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
+const SearxngSearchError = error{
+    InvalidSearchBaseUrl,
+    RequestFailed,
+    InvalidResponse,
+};
+
 /// Web search tool supporting Brave Search API and SearXNG.
 pub const WebSearchTool = struct {
     /// Optional SearXNG base URL (e.g. https://searx.example.com or .../search).
@@ -55,21 +61,40 @@ pub const WebSearchTool = struct {
         if (self.searxng_base_url) |base_url| {
             const trimmed = std.mem.trim(u8, base_url, " \t\n\r");
             if (trimmed.len > 0) {
-                return executeSearxngSearch(allocator, query, count, trimmed, self.timeout_secs);
+                return executeSearxngSearch(allocator, query, count, trimmed, self.timeout_secs) catch |err| {
+                    if (tryBraveApiKeyOrNull(allocator)) |api_key| {
+                        defer allocator.free(api_key);
+                        log.warn("web_search searxng backend failed ({}), falling back to Brave API", .{err});
+                        return executeBraveSearch(allocator, query, count, api_key, self.timeout_secs);
+                    }
+                    return switch (err) {
+                        error.InvalidSearchBaseUrl => ToolResult.fail("Invalid http_request.search_base_url; expected https://host[/search]"),
+                        error.RequestFailed => ToolResult.fail("SearXNG request failed and BRAVE_API_KEY is not set."),
+                        error.InvalidResponse => ToolResult.fail("SearXNG returned invalid response and BRAVE_API_KEY is not set."),
+                        else => return err,
+                    };
+                };
             }
         }
 
         // Fallback to Brave when API key is available.
-        if (platform.getEnvOrNull(allocator, "BRAVE_API_KEY")) |api_key| {
+        if (tryBraveApiKeyOrNull(allocator)) |api_key| {
             defer allocator.free(api_key);
-            if (std.mem.trim(u8, api_key, " \t\n\r").len > 0) {
-                return executeBraveSearch(allocator, query, count, api_key, self.timeout_secs);
-            }
+            return executeBraveSearch(allocator, query, count, api_key, self.timeout_secs);
         }
 
         return ToolResult.fail("web_search is not configured. Set BRAVE_API_KEY or http_request.search_base_url (SearXNG).");
     }
 };
+
+fn tryBraveApiKeyOrNull(allocator: std.mem.Allocator) ?[]const u8 {
+    const key = platform.getEnvOrNull(allocator, "BRAVE_API_KEY") orelse return null;
+    if (std.mem.trim(u8, key, " \t\n\r").len == 0) {
+        allocator.free(key);
+        return null;
+    }
+    return key;
+}
 
 fn executeBraveSearch(
     allocator: std.mem.Allocator,
@@ -122,13 +147,12 @@ fn executeSearxngSearch(
     count: usize,
     base_url: []const u8,
     timeout_secs: u64,
-) !ToolResult {
+) (SearxngSearchError || error{OutOfMemory})!ToolResult {
     const encoded_query = try urlEncode(allocator, query);
     defer allocator.free(encoded_query);
 
-    const url_str = buildSearxngSearchUrl(allocator, base_url, encoded_query, count) catch {
-        return ToolResult.fail("Invalid http_request.search_base_url; expected https://host[/search]");
-    };
+    const url_str = buildSearxngSearchUrl(allocator, base_url, encoded_query, count) catch
+        return error.InvalidSearchBaseUrl;
     defer allocator.free(url_str);
 
     const timeout_str = try timeoutToString(allocator, timeout_secs);
@@ -146,12 +170,13 @@ fn executeSearxngSearch(
         timeout_str,
     ) catch |err| {
         log.err("web_search (searxng) request failed for '{s}': {}", .{ query, err });
-        const msg = try std.fmt.allocPrint(allocator, "Search request failed: {}", .{err});
-        return ToolResult{ .success = false, .output = "", .error_msg = msg };
+        return error.RequestFailed;
     };
     defer allocator.free(body);
 
-    return formatSearxngResults(allocator, body, query);
+    const result = formatSearxngResults(allocator, body, query) catch return error.InvalidResponse;
+    if (!result.success) return error.InvalidResponse;
+    return result;
 }
 
 fn timeoutToString(allocator: std.mem.Allocator, timeout_secs: u64) ![]u8 {
@@ -166,15 +191,13 @@ fn buildSearxngSearchUrl(
     count: usize,
 ) ![]u8 {
     var trimmed = std.mem.trim(u8, base_url, " \t\n\r");
-    if (trimmed.len == 0) return error.InvalidSearchUrl;
+    if (trimmed.len == 0) return error.InvalidSearchBaseUrl;
     while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') {
         trimmed = trimmed[0 .. trimmed.len - 1];
     }
-    if (!std.mem.startsWith(u8, trimmed, "https://")) {
-        return error.InvalidSearchUrl;
-    }
+    if (!std.mem.startsWith(u8, trimmed, "https://")) return error.InvalidSearchBaseUrl;
     if (std.mem.indexOfScalar(u8, trimmed, '?') != null) {
-        return error.InvalidSearchUrl;
+        return error.InvalidSearchBaseUrl;
     }
 
     const endpoint = if (std.mem.endsWith(u8, trimmed, "/search"))
@@ -365,6 +388,19 @@ test "WebSearchTool without backend config fails with helpful message" {
     const result = try wst.execute(testing.allocator, parsed.value.object);
     try testing.expect(!result.success);
     try testing.expect(std.mem.indexOf(u8, result.error_msg.?, "search_base_url") != null);
+}
+
+test "WebSearchTool invalid searxng URL reports config error when Brave is unavailable" {
+    if (platform.getEnvOrNull(testing.allocator, "BRAVE_API_KEY")) |k| {
+        testing.allocator.free(k);
+        return;
+    }
+    var wst = WebSearchTool{ .searxng_base_url = "https://searx.example.com?bad=1" };
+    const parsed = try root.parseTestArgs("{\"query\":\"zig\"}");
+    defer parsed.deinit();
+    const result = try wst.execute(testing.allocator, parsed.value.object);
+    try testing.expect(!result.success);
+    try testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Invalid http_request.search_base_url") != null);
 }
 
 test "parseCount defaults to 5" {
