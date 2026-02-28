@@ -1026,21 +1026,21 @@ pub const HttpRequestConfig = struct {
 
     pub fn isValidSearchProviderName(raw: []const u8) bool {
         const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-        return std.mem.eql(u8, trimmed, "auto") or
-            std.mem.eql(u8, trimmed, "searxng") or
-            std.mem.eql(u8, trimmed, "duckduckgo") or
-            std.mem.eql(u8, trimmed, "ddg") or
-            std.mem.eql(u8, trimmed, "brave") or
-            std.mem.eql(u8, trimmed, "firecrawl") or
-            std.mem.eql(u8, trimmed, "tavily") or
-            std.mem.eql(u8, trimmed, "perplexity") or
-            std.mem.eql(u8, trimmed, "exa") or
-            std.mem.eql(u8, trimmed, "jina");
+        return std.ascii.eqlIgnoreCase(trimmed, "auto") or
+            std.ascii.eqlIgnoreCase(trimmed, "searxng") or
+            std.ascii.eqlIgnoreCase(trimmed, "duckduckgo") or
+            std.ascii.eqlIgnoreCase(trimmed, "ddg") or
+            std.ascii.eqlIgnoreCase(trimmed, "brave") or
+            std.ascii.eqlIgnoreCase(trimmed, "firecrawl") or
+            std.ascii.eqlIgnoreCase(trimmed, "tavily") or
+            std.ascii.eqlIgnoreCase(trimmed, "perplexity") or
+            std.ascii.eqlIgnoreCase(trimmed, "exa") or
+            std.ascii.eqlIgnoreCase(trimmed, "jina");
     }
 
     pub fn isValidSearchFallbackProviderName(raw: []const u8) bool {
         const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-        if (std.mem.eql(u8, trimmed, "auto")) return false;
+        if (std.ascii.eqlIgnoreCase(trimmed, "auto")) return false;
         return isValidSearchProviderName(trimmed);
     }
 };
@@ -1314,11 +1314,15 @@ test "HttpRequestConfig search provider validation" {
     try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("perplexity"));
     try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("exa"));
     try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("jina"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("BRAVE"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("DDG"));
     try std.testing.expect(!HttpRequestConfig.isValidSearchProviderName("google"));
 }
 
 test "HttpRequestConfig fallback provider validation disallows auto" {
     try std.testing.expect(HttpRequestConfig.isValidSearchFallbackProviderName("brave"));
     try std.testing.expect(HttpRequestConfig.isValidSearchFallbackProviderName("ddg"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchFallbackProviderName("JINA"));
     try std.testing.expect(!HttpRequestConfig.isValidSearchFallbackProviderName("auto"));
+    try std.testing.expect(!HttpRequestConfig.isValidSearchFallbackProviderName("AUTO"));
 }
