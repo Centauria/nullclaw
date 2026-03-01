@@ -345,12 +345,18 @@ pub const QQGroupPolicy = enum {
     allowlist,
 };
 
+pub const QQReceiveMode = enum {
+    websocket,
+    webhook,
+};
+
 pub const QQConfig = struct {
     account_id: []const u8 = "default",
     app_id: []const u8 = "",
     app_secret: []const u8 = "",
     bot_token: []const u8 = "",
     sandbox: bool = false,
+    receive_mode: QQReceiveMode = .webhook,
     group_policy: QQGroupPolicy = .allow,
     allowed_groups: []const []const u8 = &.{},
     allow_from: []const []const u8 = &.{},
