@@ -369,15 +369,15 @@ pub const QQChannel = struct {
     }
 
     /// Ensure a valid access_token is available, fetching or refreshing as needed.
-    /// Returns the current access_token slice (owned by self).
-    fn ensureAccessToken(self: *QQChannel) ![]const u8 {
+    /// Returns a caller-owned copy of the token to avoid lifetime races with stop().
+    fn ensureAccessToken(self: *QQChannel) ![]u8 {
         self.token_mu.lock();
         defer self.token_mu.unlock();
 
         const now = std.time.timestamp();
         if (self.access_token) |tok| {
             if (now < self.token_expires_at - TOKEN_REFRESH_MARGIN_SECS) {
-                return tok;
+                return self.allocator.dupe(u8, tok);
             }
         }
 
@@ -386,7 +386,7 @@ pub const QQChannel = struct {
         self.access_token = result.token;
         self.token_expires_at = now + result.expires_in;
         log.info("Access token obtained (expires_in={d}s)", .{result.expires_in});
-        return result.token;
+        return self.allocator.dupe(u8, result.token);
     }
 
     // ── Incoming event handling ──────────────────────────────────────
@@ -686,6 +686,7 @@ pub const QQChannel = struct {
             log.err("Access token fetch failed for sendChunk: {}", .{err});
             return error.QQApiError;
         };
+        defer self.allocator.free(token);
         var auth_buf: [512]u8 = undefined;
         const auth_header = buildAuthHeader(&auth_buf, token) catch {
             return error.QQApiError;
@@ -847,6 +848,7 @@ pub const QQChannel = struct {
             log.err("QQ access token fetch failed: {}", .{err});
             return error.TokenFetchFailed;
         };
+        defer self.allocator.free(token);
         var identify_buf: [2048]u8 = undefined;
         const identify_payload = try buildIdentifyPayload(&identify_buf, token, DEFAULT_INTENTS);
         log.info("Sending IDENTIFY (app_id={s}, auth=QQBot)...", .{self.config.app_id});
@@ -1461,11 +1463,16 @@ test "qq QQChannel ensureAccessToken caches token" {
     }
 
     const token1 = try ch.ensureAccessToken();
+    defer alloc.free(token1);
     try std.testing.expectEqualStrings("test-access-token", token1);
 
-    // Second call should return cached token (same pointer)
+    // Second call should still use cached channel token, but caller gets its own copy.
+    const cached_ptr = ch.access_token.?.ptr;
     const token2 = try ch.ensureAccessToken();
-    try std.testing.expect(token1.ptr == token2.ptr);
+    defer alloc.free(token2);
+    try std.testing.expectEqualStrings("test-access-token", token2);
+    try std.testing.expect(cached_ptr == ch.access_token.?.ptr);
+    try std.testing.expect(token1.ptr != token2.ptr);
 }
 
 test "qq buildGroupSendUrl" {
