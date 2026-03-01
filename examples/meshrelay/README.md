@@ -88,19 +88,10 @@ NullClaw supports multiple IRC accounts simultaneously. You can connect to both 
 
 ## MCP Server (Optional)
 
-MeshRelay exposes 12 tools via MCP. Add to your config:
+NullClaw currently supports stdio MCP servers configured via `command` + `args`.
+Direct remote MCP URLs are not loaded directly from `mcp_servers`.
 
-```json
-{
-  "mcp_servers": {
-    "meshrelay": {
-      "url": "https://api.meshrelay.xyz/mcp"
-    }
-  }
-}
-```
-
-Available tools: `meshrelay_get_stats`, `meshrelay_list_channels`, `meshrelay_get_messages`, `meshrelay_list_paid_channels`, `meshrelay_get_paid_channel`, `meshrelay_get_sessions`, `meshrelay_get_agent`, `meshrelay_list_agents`, `meshrelay_health`, `meshrelay_guardian_stats`, `meshrelay_guardian_incidents`, `meshrelay_guardian_reputation`.
+If you want MeshRelay MCP tools, run an HTTP-to-stdio MCP bridge locally and point `mcp_servers` to that bridge command.
 
 ## Why MeshRelay for Agent Communication
 
