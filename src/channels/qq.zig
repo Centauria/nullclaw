@@ -1289,16 +1289,20 @@ pub const QQChannel = struct {
 
         log.info("sendChunk: POSTing to {s} ...", .{url});
 
-        const resp = root.http_util.curlPost(self.allocator, url, body, &.{auth_header}) catch |err| {
+        const resp = root.http_util.curlPostWithStatus(self.allocator, url, body, &.{auth_header}) catch |err| {
             log.err("QQ API POST failed: {}", .{err});
             return error.QQApiError;
         };
-        defer self.allocator.free(resp);
-        ensureQqApiSuccess(self.allocator, resp) catch {
+        defer self.allocator.free(resp.body);
+        if (resp.status_code < 200 or resp.status_code >= 300) {
+            log.err("QQ API send returned HTTP status {d}", .{resp.status_code});
+            return error.QQApiError;
+        }
+        ensureQqApiSuccess(self.allocator, resp.body) catch {
             log.err("QQ API send returned non-zero code payload", .{});
             return error.QQApiError;
         };
-        log.debug("sendChunk: API response_len={d}", .{resp.len});
+        log.debug("sendChunk: API response_len={d}", .{resp.body.len});
     }
 
     fn sendMedia(self: *QQChannel, target: []const u8, image_url_raw: []const u8, msg_seq: ?u32) !void {
@@ -1350,17 +1354,21 @@ pub const QQChannel = struct {
 
         const upload_body = try buildMediaUploadBody(self.allocator, image_url);
         defer self.allocator.free(upload_body);
-        const upload_resp = root.http_util.curlPost(self.allocator, files_url, upload_body, &.{auth_header}) catch |err| {
+        const upload_resp = root.http_util.curlPostWithStatus(self.allocator, files_url, upload_body, &.{auth_header}) catch |err| {
             log.err("QQ media upload failed: {}", .{err});
             return error.QQApiError;
         };
-        defer self.allocator.free(upload_resp);
-        ensureQqApiSuccess(self.allocator, upload_resp) catch {
+        defer self.allocator.free(upload_resp.body);
+        if (upload_resp.status_code < 200 or upload_resp.status_code >= 300) {
+            log.err("QQ media upload returned HTTP status {d}", .{upload_resp.status_code});
+            return error.QQApiError;
+        }
+        ensureQqApiSuccess(self.allocator, upload_resp.body) catch {
             log.err("QQ media upload returned non-zero code payload", .{});
             return error.QQApiError;
         };
 
-        const file_info = parseUploadedFileInfo(self.allocator, upload_resp) catch {
+        const file_info = parseUploadedFileInfo(self.allocator, upload_resp.body) catch {
             log.err("QQ media upload response missing file_info", .{});
             return error.QQApiError;
         };
@@ -1373,12 +1381,16 @@ pub const QQChannel = struct {
             if (msg_id != null) msg_seq else null,
         );
         defer self.allocator.free(media_body);
-        const send_resp = root.http_util.curlPost(self.allocator, message_url, media_body, &.{auth_header}) catch |err| {
+        const send_resp = root.http_util.curlPostWithStatus(self.allocator, message_url, media_body, &.{auth_header}) catch |err| {
             log.err("QQ media send failed: {}", .{err});
             return error.QQApiError;
         };
-        defer self.allocator.free(send_resp);
-        ensureQqApiSuccess(self.allocator, send_resp) catch {
+        defer self.allocator.free(send_resp.body);
+        if (send_resp.status_code < 200 or send_resp.status_code >= 300) {
+            log.err("QQ media send returned HTTP status {d}", .{send_resp.status_code});
+            return error.QQApiError;
+        }
+        ensureQqApiSuccess(self.allocator, send_resp.body) catch {
             log.err("QQ media send returned non-zero code payload", .{});
             return error.QQApiError;
         };
