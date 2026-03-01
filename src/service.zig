@@ -15,6 +15,7 @@ pub const ServiceCommand = enum {
     install,
     start,
     stop,
+    restart,
     status,
     uninstall,
 };
@@ -38,6 +39,7 @@ pub fn handleCommand(
         .install => install(allocator, config_path),
         .start => startService(allocator),
         .stop => stopService(allocator),
+        .restart => restartService(allocator),
         .status => serviceStatus(allocator),
         .uninstall => uninstall(allocator),
     };
@@ -86,6 +88,11 @@ fn stopService(allocator: std.mem.Allocator) !void {
     } else {
         return error.UnsupportedPlatform;
     }
+}
+
+fn restartService(allocator: std.mem.Allocator) !void {
+    try stopService(allocator);
+    try startService(allocator);
 }
 
 fn serviceStatus(allocator: std.mem.Allocator) !void {
