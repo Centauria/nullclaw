@@ -325,6 +325,7 @@ fn mergeSchedulerTickChangesAndSave(
 fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState, event_bus: *bus_mod.Bus) void {
     var scheduler = CronScheduler.init(allocator, config.scheduler.max_tasks, config.scheduler.enabled);
     scheduler.setShellCwd(config.workspace_dir);
+    scheduler.setAgentTimeoutSecs(config.scheduler.agent_timeout_secs);
     defer scheduler.deinit();
     var before_tick: std.StringHashMapUnmanaged(SchedulerJobSnapshot) = .empty;
     defer {

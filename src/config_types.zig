@@ -120,6 +120,8 @@ pub const SchedulerConfig = struct {
     enabled: bool = true,
     max_tasks: u32 = 64,
     max_concurrent: u32 = 4,
+    /// Hard timeout for cron agent subprocess execution. 0 = no timeout.
+    agent_timeout_secs: u64 = 0,
 };
 
 pub const AgentConfig = struct {

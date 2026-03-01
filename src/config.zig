@@ -1476,6 +1476,7 @@ test "save roundtrip preserves extended config sections" {
     cfg.scheduler.enabled = false;
     cfg.scheduler.max_tasks = 32;
     cfg.scheduler.max_concurrent = 2;
+    cfg.scheduler.agent_timeout_secs = 123;
 
     cfg.agent.compact_context = true;
     cfg.agent.max_tool_iterations = 7;
@@ -1599,6 +1600,7 @@ test "save roundtrip preserves extended config sections" {
 
     try std.testing.expectEqualStrings("docker", loaded.runtime.kind);
     try std.testing.expectEqual(@as(u32, 32), loaded.scheduler.max_tasks);
+    try std.testing.expectEqual(@as(u64, 123), loaded.scheduler.agent_timeout_secs);
     try std.testing.expect(loaded.agent.parallel_tools);
 
     try std.testing.expectEqualStrings("openai", loaded.memory.search.provider);
@@ -2144,13 +2146,14 @@ test "json parse diagnostics section" {
 test "json parse scheduler section" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"scheduler": {"enabled": false, "max_tasks": 128, "max_concurrent": 8}}
+        \\{"scheduler": {"enabled": false, "max_tasks": 128, "max_concurrent": 8, "agent_timeout_secs": 600}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
     try std.testing.expect(!cfg.scheduler.enabled);
     try std.testing.expectEqual(@as(u32, 128), cfg.scheduler.max_tasks);
     try std.testing.expectEqual(@as(u32, 8), cfg.scheduler.max_concurrent);
+    try std.testing.expectEqual(@as(u64, 600), cfg.scheduler.agent_timeout_secs);
 }
 
 test "json parse agent section" {

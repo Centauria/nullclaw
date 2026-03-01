@@ -392,6 +392,7 @@ pub const CronScheduler = struct {
     enabled: bool,
     allocator: std.mem.Allocator,
     shell_cwd: ?[]const u8 = null,
+    agent_timeout_secs: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, max_tasks: usize, enabled: bool) CronScheduler {
         return .{
@@ -400,11 +401,16 @@ pub const CronScheduler = struct {
             .enabled = enabled,
             .allocator = allocator,
             .shell_cwd = null,
+            .agent_timeout_secs = 0,
         };
     }
 
     pub fn setShellCwd(self: *CronScheduler, cwd: []const u8) void {
         self.shell_cwd = cwd;
+    }
+
+    pub fn setAgentTimeoutSecs(self: *CronScheduler, timeout_secs: u64) void {
+        self.agent_timeout_secs = timeout_secs;
     }
 
     fn freeJobOwned(self: *CronScheduler, job: CronJob) void {
@@ -781,7 +787,7 @@ pub const CronScheduler = struct {
                             _ = deliverResult(self.allocator, job.delivery, agent_output, true, b) catch {};
                         }
                     } else {
-                        const exec_result = runAgentJob(self.allocator, self.shell_cwd, agent_output, job.model) catch |err| {
+                        const exec_result = runAgentJob(self.allocator, self.shell_cwd, agent_output, job.model, self.agent_timeout_secs) catch |err| {
                             log.err("cron agent job '{s}' failed to start: {}", .{ job.id, err });
                             job.last_run_secs = now;
                             job.last_status = "error";
@@ -845,7 +851,107 @@ const AgentRunResult = struct {
     output: []const u8,
 };
 
-fn runAgentJob(allocator: std.mem.Allocator, cwd: ?[]const u8, prompt: []const u8, model: ?[]const u8) !AgentRunResult {
+const AGENT_MAX_OUTPUT_BYTES: usize = 1_048_576;
+const AGENT_POLL_STEP_NS: u64 = 200 * std.time.ns_per_ms;
+
+fn hasTimeoutExpired(start_ns: i128, timeout_secs: u64) bool {
+    if (timeout_secs == 0) return false;
+    const timeout_ns = @as(i128, @intCast(timeout_secs)) * std.time.ns_per_s;
+    const now_ns = std.time.nanoTimestamp();
+    return now_ns - start_ns >= timeout_ns;
+}
+
+fn collectChildOutputWithTimeout(
+    child: *std.process.Child,
+    allocator: std.mem.Allocator,
+    stdout: *std.ArrayList(u8),
+    stderr: *std.ArrayList(u8),
+    timeout_secs: u64,
+    start_ns: i128,
+) !bool {
+    var poller = std.Io.poll(allocator, enum { stdout, stderr }, .{
+        .stdout = child.stdout.?,
+        .stderr = child.stderr.?,
+    });
+    defer poller.deinit();
+
+    const stdout_r = poller.reader(.stdout);
+    stdout_r.buffer = stdout.allocatedSlice();
+    stdout_r.seek = 0;
+    stdout_r.end = stdout.items.len;
+
+    const stderr_r = poller.reader(.stderr);
+    stderr_r.buffer = stderr.allocatedSlice();
+    stderr_r.seek = 0;
+    stderr_r.end = stderr.items.len;
+
+    defer {
+        stdout.* = .{
+            .items = stdout_r.buffer[0..stdout_r.end],
+            .capacity = stdout_r.buffer.len,
+        };
+        stderr.* = .{
+            .items = stderr_r.buffer[0..stderr_r.end],
+            .capacity = stderr_r.buffer.len,
+        };
+        stdout_r.buffer = &.{};
+        stderr_r.buffer = &.{};
+    }
+
+    var timed_out = false;
+    while (true) {
+        const keep_polling = if (timeout_secs == 0 or timed_out)
+            try poller.poll()
+        else
+            try poller.pollTimeout(AGENT_POLL_STEP_NS);
+
+        if (stdout_r.bufferedLen() > AGENT_MAX_OUTPUT_BYTES) return error.StdoutStreamTooLong;
+        if (stderr_r.bufferedLen() > AGENT_MAX_OUTPUT_BYTES) return error.StderrStreamTooLong;
+
+        if (!keep_polling) break;
+
+        if (!timed_out and hasTimeoutExpired(start_ns, timeout_secs)) {
+            if (child.kill()) |_| {
+                // Process terminated and reaped by kill().
+            } else |err| {
+                switch (err) {
+                    error.AlreadyTerminated => {},
+                    else => return err,
+                }
+            }
+            timed_out = true;
+        }
+    }
+
+    return timed_out;
+}
+
+fn buildAgentOutput(
+    allocator: std.mem.Allocator,
+    stdout: []const u8,
+    stderr: []const u8,
+    timeout_secs: u64,
+    timed_out: bool,
+) ![]const u8 {
+    if (timed_out) {
+        const source = if (stdout.len > 0) stdout else stderr;
+        if (source.len > 0) {
+            return std.fmt.allocPrint(allocator, "{s}\n\n[agent timed out after {d}s]", .{ source, timeout_secs });
+        }
+        return std.fmt.allocPrint(allocator, "agent timed out after {d}s", .{timeout_secs});
+    }
+
+    const output_source = if (stdout.len > 0) stdout else if (stderr.len > 0) stderr else "";
+    return allocator.dupe(u8, output_source);
+}
+
+fn runAgentJob(
+    allocator: std.mem.Allocator,
+    cwd: ?[]const u8,
+    prompt: []const u8,
+    model: ?[]const u8,
+    timeout_secs: u64,
+) !AgentRunResult {
     const exe_path = try std.fs.selfExePathAlloc(allocator);
     defer allocator.free(exe_path);
 
@@ -861,20 +967,40 @@ fn runAgentJob(allocator: std.mem.Allocator, cwd: ?[]const u8, prompt: []const u
     try argv.append(allocator, "-m");
     try argv.append(allocator, prompt);
 
-    const result = try std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = argv.items,
-        .cwd = cwd,
-    });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
+    var child = std.process.Child.init(argv.items, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    child.cwd = cwd;
 
-    const success = switch (result.term) {
+    try child.spawn();
+    errdefer {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+    }
+
+    const start_ns = std.time.nanoTimestamp();
+
+    var stdout: std.ArrayList(u8) = .empty;
+    defer stdout.deinit(allocator);
+    var stderr: std.ArrayList(u8) = .empty;
+    defer stderr.deinit(allocator);
+
+    const timed_out = try collectChildOutputWithTimeout(
+        &child,
+        allocator,
+        &stdout,
+        &stderr,
+        timeout_secs,
+        start_ns,
+    );
+
+    const term = try child.wait();
+    const success = !timed_out and switch (term) {
         .Exited => |code| code == 0,
         else => false,
     };
-    const output_source = if (result.stdout.len > 0) result.stdout else if (result.stderr.len > 0) result.stderr else "";
-    const output = try allocator.dupe(u8, output_source);
+    const output = try buildAgentOutput(allocator, stdout.items, stderr.items, timeout_secs, timed_out);
     return .{ .success = success, .output = output };
 }
 
@@ -1357,7 +1483,10 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
 
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
-    if (cfg_opt) |cfg| scheduler.setShellCwd(cfg.workspace_dir);
+    if (cfg_opt) |cfg| {
+        scheduler.setShellCwd(cfg.workspace_dir);
+        scheduler.setAgentTimeoutSecs(cfg.scheduler.agent_timeout_secs);
+    }
     try loadJobs(&scheduler);
 
     if (scheduler.getJob(id)) |job| {
@@ -1383,7 +1512,7 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
             },
             .agent => {
                 const prompt = job.prompt orelse job.command;
-                const result = runAgentJob(allocator, scheduler.shell_cwd, prompt, job.model) catch |err| {
+                const result = runAgentJob(allocator, scheduler.shell_cwd, prompt, job.model, scheduler.agent_timeout_secs) catch |err| {
                     log.err("Agent job '{s}' failed: {s}", .{ id, @errorName(err) });
                     return;
                 };
@@ -2058,6 +2187,80 @@ test "agent job delivers result via bus" {
     try std.testing.expectEqualStrings("discord", msg.channel);
     try std.testing.expectEqualStrings("general", msg.chat_id);
     try std.testing.expectEqualStrings("Summarize today's news", msg.content);
+}
+
+test "collectChildOutputWithTimeout disables timeout when set to zero" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var child = std.process.Child.init(&.{ platform.getShell(), platform.getShellFlag(), "echo ready" }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    try child.spawn();
+    errdefer {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+    }
+
+    var stdout: std.ArrayList(u8) = .empty;
+    defer stdout.deinit(allocator);
+    var stderr: std.ArrayList(u8) = .empty;
+    defer stderr.deinit(allocator);
+
+    const timed_out = try collectChildOutputWithTimeout(
+        &child,
+        allocator,
+        &stdout,
+        &stderr,
+        0,
+        std.time.nanoTimestamp(),
+    );
+    const term = try child.wait();
+
+    try std.testing.expect(!timed_out);
+    switch (term) {
+        .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        else => try std.testing.expect(false),
+    }
+    try std.testing.expect(std.mem.indexOf(u8, stdout.items, "ready") != null);
+}
+
+test "collectChildOutputWithTimeout kills process after deadline" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var child = std.process.Child.init(&.{ platform.getShell(), platform.getShellFlag(), "sleep 2; echo never" }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    try child.spawn();
+    errdefer {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+    }
+
+    var stdout: std.ArrayList(u8) = .empty;
+    defer stdout.deinit(allocator);
+    var stderr: std.ArrayList(u8) = .empty;
+    defer stderr.deinit(allocator);
+
+    const timed_out = try collectChildOutputWithTimeout(
+        &child,
+        allocator,
+        &stdout,
+        &stderr,
+        1,
+        std.time.nanoTimestamp(),
+    );
+    const term = try child.wait();
+
+    try std.testing.expect(timed_out);
+    const completed_ok = switch (term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+    try std.testing.expect(!completed_ok);
 }
 
 test "DeliveryMode parse and asStr" {
