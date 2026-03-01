@@ -598,19 +598,23 @@ pub const QQChannel = struct {
         var meta_buf: [512]u8 = undefined;
         var meta_fbs = std.io.fixedBufferStream(&meta_buf);
         const mw = meta_fbs.writer();
-        mw.print("{{\"msg_id\":\"{s}\",\"is_dm\":{s},\"is_group\":{s}", .{
-            msg_id_str,
+        mw.writeAll("{\"msg_id\":") catch return;
+        root.appendJsonStringW(mw, msg_id_str) catch return;
+        mw.print(",\"is_dm\":{s},\"is_group\":{s}", .{
             if (is_dm) "true" else "false",
             if (is_group) "true" else "false",
         }) catch return;
         if (channel_id.len > 0) {
-            mw.print(",\"channel_id\":\"{s}\"", .{channel_id}) catch return;
+            mw.writeAll(",\"channel_id\":") catch return;
+            root.appendJsonStringW(mw, channel_id) catch return;
         }
         if (group_openid.len > 0) {
-            mw.print(",\"group_openid\":\"{s}\"", .{group_openid}) catch return;
+            mw.writeAll(",\"group_openid\":") catch return;
+            root.appendJsonStringW(mw, group_openid) catch return;
         }
         if (user_openid.len > 0) {
-            mw.print(",\"user_openid\":\"{s}\"", .{user_openid}) catch return;
+            mw.writeAll(",\"user_openid\":") catch return;
+            root.appendJsonStringW(mw, user_openid) catch return;
         }
         mw.writeAll(",\"account_id\":") catch return;
         root.appendJsonStringW(mw, self.config.account_id) catch return;
@@ -1273,6 +1277,31 @@ test "qq handleGatewayEvent MESSAGE_CREATE" {
     try std.testing.expect(meta_parsed.value.object.get("account_id") != null);
     try std.testing.expect(meta_parsed.value.object.get("account_id").? == .string);
     try std.testing.expectEqualStrings("qq-main", meta_parsed.value.object.get("account_id").?.string);
+}
+
+test "qq handleGatewayEvent metadata escapes dynamic strings" {
+    const alloc = std.testing.allocator;
+    var event_bus_inst = bus.Bus.init();
+    defer event_bus_inst.close();
+
+    var ch = QQChannel.init(alloc, .{ .account_id = "qq-main" });
+    ch.setBus(&event_bus_inst);
+    ch.running.store(true, .release);
+
+    const msg_json =
+        \\{"op":0,"s":2,"t":"MESSAGE_CREATE","d":{"id":"msg\"001","channel_id":"ch\\1","guild_id":"g1","content":"hello","author":{"id":"user1"}}}
+    ;
+    try ch.handleGatewayEvent(msg_json);
+
+    var msg = event_bus_inst.consumeInbound() orelse return try std.testing.expect(false);
+    defer msg.deinit(alloc);
+    try std.testing.expect(msg.metadata_json != null);
+
+    const meta = try std.json.parseFromSlice(std.json.Value, alloc, msg.metadata_json.?, .{});
+    defer meta.deinit();
+    try std.testing.expect(meta.value == .object);
+    try std.testing.expectEqualStrings("msg\"001", meta.value.object.get("msg_id").?.string);
+    try std.testing.expectEqualStrings("ch\\1", meta.value.object.get("channel_id").?.string);
 }
 
 test "qq handleGatewayEvent DIRECT_MESSAGE_CREATE" {
