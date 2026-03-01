@@ -523,6 +523,18 @@ pub const QQChannel = struct {
         const group_openid = getJsonStringFromObj(d, "group_openid") orelse "";
         const user_openid = getJsonStringFromObj(author, "user_openid") orelse "";
         log.info("handleMessageCreate: channel_id='{s}' group_openid='{s}' user_openid='{s}'", .{ channel_id, group_openid, user_openid });
+        if (is_c2c and user_openid.len == 0) {
+            log.info("handleMessageCreate: DROPPED — C2C event missing user_openid", .{});
+            return;
+        }
+        if (is_group and group_openid.len == 0) {
+            log.info("handleMessageCreate: DROPPED — group event missing group_openid", .{});
+            return;
+        }
+        if (!is_dm and !is_group and channel_id.len == 0) {
+            log.info("handleMessageCreate: DROPPED — guild event missing channel_id", .{});
+            return;
+        }
 
         // Check group policy (for guild and group events)
         if (!is_dm and self.config.group_policy == .allowlist) {
@@ -1535,4 +1547,38 @@ test "qq handleGatewayEvent GROUP_AT_MESSAGE_CREATE" {
     try std.testing.expectEqualStrings("mem_oid_1", msg.sender_id);
     try std.testing.expectEqualStrings("group:grp_oid_1:grp001", msg.chat_id);
     try std.testing.expect(std.mem.startsWith(u8, msg.session_key, "qq:group:"));
+}
+
+test "qq handleGatewayEvent C2C_MESSAGE_CREATE drops missing user_openid" {
+    const alloc = std.testing.allocator;
+    var event_bus_inst = bus.Bus.init();
+    defer event_bus_inst.close();
+
+    var ch = QQChannel.init(alloc, .{ .account_id = "qq-test" });
+    ch.setBus(&event_bus_inst);
+    ch.running = true;
+
+    const msg_json =
+        \\{"op":0,"s":12,"t":"C2C_MESSAGE_CREATE","d":{"id":"c2c-missing-openid","author":{"id":"legacy-id"},"content":"hi","timestamp":"2025-01-01T00:00:00Z"}}
+    ;
+    try ch.handleGatewayEvent(msg_json);
+
+    try std.testing.expectEqual(@as(usize, 0), event_bus_inst.inboundDepth());
+}
+
+test "qq handleGatewayEvent GROUP_AT_MESSAGE_CREATE drops missing group_openid" {
+    const alloc = std.testing.allocator;
+    var event_bus_inst = bus.Bus.init();
+    defer event_bus_inst.close();
+
+    var ch = QQChannel.init(alloc, .{ .account_id = "qq-test" });
+    ch.setBus(&event_bus_inst);
+    ch.running = true;
+
+    const msg_json =
+        \\{"op":0,"s":13,"t":"GROUP_AT_MESSAGE_CREATE","d":{"id":"grp-missing-openid","author":{"member_openid":"mem_oid_1"},"content":"@bot hello","timestamp":"2025-01-01T00:00:00Z"}}
+    ;
+    try ch.handleGatewayEvent(msg_json);
+
+    try std.testing.expectEqual(@as(usize, 0), event_bus_inst.inboundDepth());
 }
