@@ -12,13 +12,9 @@ Signal app  <-->  signal-cli container (:8080)  <-->  nullclaw gateway (:3000)
 
 ### 1. Register or link a Signal account
 
-Option A (recommended): follow `SIGNAL-REREGISTER.md`.
-
-Option B (link existing account):
-
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.signal.yml up signal-cli
-docker exec nullclaw-signal-cli-1 signal-cli link -n nullclaw
+docker compose -f docker-compose.yml -f docker-compose.signal.yml up -d signal-cli
+docker compose -f docker-compose.yml -f docker-compose.signal.yml exec signal-cli signal-cli link -n nullclaw
 ```
 
 Scan the QR code in Signal (Settings -> Linked Devices -> Link New Device), then stop the `signal-cli` container.
@@ -33,10 +29,45 @@ SIGNAL_ACCOUNT=+1...
 SIGNAL_RECIPIENT=+1...   # or uuid:...
 ```
 
-Create `config.signal.json` from `config.signal.example.json` and set real values for:
-- `SIGNAL_ACCOUNT`
-- `SIGNAL_RECIPIENT`
-- `OPENROUTER_API_KEY` (or keep env-based resolution)
+Create `config.signal.json` (example):
+
+```json
+{
+  "models": {
+    "providers": {
+      "openrouter": {
+        "api_key": "YOUR_OPENROUTER_API_KEY"
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "openrouter/anthropic/claude-sonnet-4"
+      }
+    }
+  },
+  "channels": {
+    "signal": {
+      "accounts": {
+        "main": {
+          "http_url": "http://signal-cli:8080",
+          "account": "+10000000000",
+          "allow_from": ["+10000000001"],
+          "group_policy": "allowlist",
+          "ignore_attachments": true,
+          "ignore_stories": true
+        }
+      }
+    }
+  },
+  "gateway": {
+    "port": 3000,
+    "host": "0.0.0.0",
+    "require_pairing": false
+  }
+}
+```
 
 Keep `http_url` as `http://signal-cli:8080` for Docker networking.
 
