@@ -11,7 +11,8 @@
       "agent_id",
       "request_id",
       "payload",
-      "access_token"
+      "access_token",
+      "auth_token"
     ],
     "fields": {
       "v": "integer (must be 1)",
@@ -20,7 +21,8 @@
       "agent_id": "string logical agent id",
       "request_id": "string request correlation id",
       "payload": "object event-specific payload",
-      "access_token": "string UI JWT (relay mode)"
+      "access_token": "string UI JWT (pairing mode, relay mode)",
+      "auth_token": "string channel token (local message_auth_mode=token)"
     }
   },
   "events": {
@@ -53,7 +55,8 @@
       "payload": {
         "content": "string required unless payload.e2e is used",
         "sender_id": "string optional",
-        "access_token": "string required (can be top-level access_token)",
+        "access_token": "string required in pairing mode (can be top-level access_token)",
+        "auth_token": "string required in local token mode (can be top-level auth_token)",
         "e2e": {
           "alg": "string optional (x25519-chacha20poly1305-v1)",
           "nonce": "string required when e2e is used (base64url)",
@@ -133,6 +136,10 @@
       "description": "Dedicated relay credential for nullclaw <-> relay transport auth",
       "lifecycle": "config relay_token -> env NULLCLAW_RELAY_TOKEN -> persisted auth credential -> generated token",
       "ttl_seconds": "configurable via relay_token_ttl_secs (3600..31536000)"
+    },
+    "local_message_token": {
+      "description": "Local user_message token auth for orchestration mode",
+      "config": "channels.web.accounts.<id>.message_auth_mode=token + channels.web.accounts.<id>.auth_token (or NULLCLAW_WEB_TOKEN / NULLCLAW_GATEWAY_TOKEN / OPENCLAW_GATEWAY_TOKEN)"
     }
   }
 }
