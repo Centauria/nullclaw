@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const platform = @import("platform.zig");
 const bus = @import("bus.zig");
 const json_util = @import("json_util.zig");
@@ -391,6 +392,7 @@ pub const CronScheduler = struct {
     enabled: bool,
     allocator: std.mem.Allocator,
     shell_cwd: ?[]const u8 = null,
+    agent_timeout_secs: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, max_tasks: usize, enabled: bool) CronScheduler {
         return .{
@@ -399,11 +401,26 @@ pub const CronScheduler = struct {
             .enabled = enabled,
             .allocator = allocator,
             .shell_cwd = null,
+            .agent_timeout_secs = 0,
         };
     }
 
     pub fn setShellCwd(self: *CronScheduler, cwd: []const u8) void {
         self.shell_cwd = cwd;
+    }
+
+    pub fn setAgentTimeoutSecs(self: *CronScheduler, timeout_secs: u64) void {
+        self.agent_timeout_secs = timeout_secs;
+    }
+
+    fn freeJobOwned(self: *CronScheduler, job: CronJob) void {
+        self.allocator.free(job.id);
+        self.allocator.free(job.expression);
+        self.allocator.free(job.command);
+        if (job.prompt) |prompt| self.allocator.free(prompt);
+        if (job.name) |name| self.allocator.free(name);
+        if (job.model) |model| self.allocator.free(model);
+        if (job.last_output) |output| self.allocator.free(output);
     }
 
     pub fn deinit(self: *CronScheduler) void {
@@ -419,10 +436,7 @@ pub const CronScheduler = struct {
 
     fn clearJobs(self: *CronScheduler) void {
         for (self.jobs.items) |job| {
-            self.allocator.free(job.id);
-            self.allocator.free(job.expression);
-            self.allocator.free(job.command);
-            if (job.last_output) |o| self.allocator.free(o);
+            self.freeJobOwned(job);
         }
         self.jobs.clearRetainingCapacity();
     }
@@ -474,6 +488,57 @@ pub const CronScheduler = struct {
         return &self.jobs.items[self.jobs.items.len - 1];
     }
 
+    /// Add a recurring agent job.
+    pub fn addAgentJob(self: *CronScheduler, expression: []const u8, prompt: []const u8, model: ?[]const u8) !*CronJob {
+        if (self.jobs.items.len >= self.max_tasks) return error.MaxTasksReached;
+
+        _ = try normalizeExpression(expression);
+        const now = std.time.timestamp();
+        const next_run_secs = try nextRunForCronExpression(expression, now);
+
+        var id_buf: [32]u8 = undefined;
+        const id = std.fmt.bufPrint(&id_buf, "agent-{d}", .{self.jobs.items.len + 1}) catch "agent-?";
+
+        try self.jobs.append(self.allocator, .{
+            .id = try self.allocator.dupe(u8, id),
+            .expression = try self.allocator.dupe(u8, expression),
+            .command = try self.allocator.dupe(u8, prompt),
+            .next_run_secs = next_run_secs,
+            .job_type = .agent,
+            .prompt = try self.allocator.dupe(u8, prompt),
+            .model = if (model) |m| try self.allocator.dupe(u8, m) else null,
+        });
+
+        return &self.jobs.items[self.jobs.items.len - 1];
+    }
+
+    /// Add a one-shot delayed agent task.
+    pub fn addAgentOnce(self: *CronScheduler, delay: []const u8, prompt: []const u8, model: ?[]const u8) !*CronJob {
+        if (self.jobs.items.len >= self.max_tasks) return error.MaxTasksReached;
+
+        const delay_secs = try parseDuration(delay);
+        const now = std.time.timestamp();
+
+        var id_buf: [32]u8 = undefined;
+        const id = std.fmt.bufPrint(&id_buf, "agent-once-{d}", .{self.jobs.items.len + 1}) catch "agent-once-?";
+
+        var expr_buf: [64]u8 = undefined;
+        const expr = std.fmt.bufPrint(&expr_buf, "@once:{s}", .{delay}) catch "@once";
+
+        try self.jobs.append(self.allocator, .{
+            .id = try self.allocator.dupe(u8, id),
+            .expression = try self.allocator.dupe(u8, expr),
+            .command = try self.allocator.dupe(u8, prompt),
+            .next_run_secs = now + delay_secs,
+            .one_shot = true,
+            .job_type = .agent,
+            .prompt = try self.allocator.dupe(u8, prompt),
+            .model = if (model) |m| try self.allocator.dupe(u8, m) else null,
+        });
+
+        return &self.jobs.items[self.jobs.items.len - 1];
+    }
+
     /// List all jobs.
     pub fn listJobs(self: *const CronScheduler) []const CronJob {
         return self.jobs.items;
@@ -509,6 +574,32 @@ pub const CronScheduler = struct {
             const new_cmd = allocator.dupe(u8, cmd) catch return false;
             allocator.free(job.command);
             job.command = new_cmd;
+
+            // Back-compat behavior: for agent jobs, --command should still update
+            // the effective prompt if --prompt was not provided explicitly.
+            if (job.job_type == .agent and patch.prompt == null) {
+                const new_prompt = allocator.dupe(u8, cmd) catch return false;
+                if (job.prompt) |old_prompt| allocator.free(old_prompt);
+                job.prompt = new_prompt;
+            }
+        }
+        if (patch.prompt) |prompt| {
+            const new_prompt = allocator.dupe(u8, prompt) catch return false;
+            if (job.prompt) |old_prompt| allocator.free(old_prompt);
+            job.prompt = new_prompt;
+
+            // Keep command text aligned with prompt for agent jobs so display/list
+            // and fallback behavior stay coherent.
+            if (job.job_type == .agent) {
+                const new_cmd = allocator.dupe(u8, prompt) catch return false;
+                allocator.free(job.command);
+                job.command = new_cmd;
+            }
+        }
+        if (patch.model) |model| {
+            const new_model = allocator.dupe(u8, model) catch return false;
+            if (job.model) |old_model| allocator.free(old_model);
+            job.model = new_model;
         }
         if (patch.enabled) |ena| {
             job.enabled = ena;
@@ -575,9 +666,7 @@ pub const CronScheduler = struct {
     pub fn removeJob(self: *CronScheduler, id: []const u8) bool {
         for (self.jobs.items, 0..) |job, i| {
             if (std.mem.eql(u8, job.id, id)) {
-                self.allocator.free(job.id);
-                self.allocator.free(job.expression);
-                self.allocator.free(job.command);
+                self.freeJobOwned(job);
                 _ = self.jobs.orderedRemove(i);
                 return true;
             }
@@ -685,18 +774,42 @@ pub const CronScheduler = struct {
                     }
                 },
                 .agent => {
-                    // Agent jobs: use prompt or command as the agent input.
-                    // In the real runtime the agent turn produces a result;
-                    // here we record the prompt and treat it as the output placeholder.
                     const agent_output = job.prompt orelse job.command;
-                    job.last_run_secs = now;
-                    job.last_status = "ok";
+                    if (builtin.is_test) {
+                        // Keep unit tests deterministic: no subprocess or network side effects.
+                        job.last_run_secs = now;
+                        job.last_status = "ok";
 
-                    if (job.last_output) |old| self.allocator.free(old);
-                    job.last_output = self.allocator.dupe(u8, agent_output) catch null;
+                        if (job.last_output) |old| self.allocator.free(old);
+                        job.last_output = self.allocator.dupe(u8, agent_output) catch null;
 
-                    if (out_bus) |b| {
-                        _ = deliverResult(self.allocator, job.delivery, agent_output, true, b) catch {};
+                        if (out_bus) |b| {
+                            _ = deliverResult(self.allocator, job.delivery, agent_output, true, b) catch {};
+                        }
+                    } else {
+                        const exec_result = runAgentJob(self.allocator, self.shell_cwd, agent_output, job.model, self.agent_timeout_secs) catch |err| {
+                            log.err("cron agent job '{s}' execution failed: {s}", .{ job.id, @errorName(err) });
+                            job.last_run_secs = now;
+                            job.last_status = "error";
+                            if (job.last_output) |old| self.allocator.free(old);
+                            job.last_output = null;
+                            if (out_bus) |b| {
+                                _ = deliverResult(self.allocator, job.delivery, "agent job execution failed", false, b) catch {};
+                            }
+                            continue;
+                        };
+
+                        job.last_run_secs = now;
+                        job.last_status = if (exec_result.success) "ok" else "error";
+                        if (job.last_output) |old| self.allocator.free(old);
+                        if (out_bus) |b| {
+                            _ = deliverResult(self.allocator, job.delivery, exec_result.output, exec_result.success, b) catch {};
+                        }
+
+                        job.last_output = if (exec_result.output.len > 0) exec_result.output else blk: {
+                            self.allocator.free(exec_result.output);
+                            break :blk null;
+                        };
                     }
                 },
             }
@@ -724,10 +837,7 @@ pub const CronScheduler = struct {
                 i -= 1;
                 const rm_idx = remove_indices[i];
                 const job = self.jobs.items[rm_idx];
-                self.allocator.free(job.id);
-                self.allocator.free(job.expression);
-                self.allocator.free(job.command);
-                if (job.last_output) |o| self.allocator.free(o);
+                self.freeJobOwned(job);
                 _ = self.jobs.orderedRemove(rm_idx);
             }
         }
@@ -735,6 +845,173 @@ pub const CronScheduler = struct {
         return changed;
     }
 };
+
+const AgentRunResult = struct {
+    success: bool,
+    output: []const u8,
+};
+
+const AGENT_MAX_OUTPUT_BYTES: usize = 1_048_576;
+const AGENT_POLL_STEP_NS: u64 = 200 * std.time.ns_per_ms;
+
+fn hasTimeoutExpired(start_ns: i128, timeout_secs: u64) bool {
+    if (timeout_secs == 0) return false;
+    const timeout_ns = @as(i128, @intCast(timeout_secs)) * std.time.ns_per_s;
+    const now_ns = std.time.nanoTimestamp();
+    return now_ns - start_ns >= timeout_ns;
+}
+
+fn collectChildOutputWithTimeout(
+    child: *std.process.Child,
+    allocator: std.mem.Allocator,
+    stdout: *std.ArrayList(u8),
+    stderr: *std.ArrayList(u8),
+    timeout_secs: u64,
+    start_ns: i128,
+) !bool {
+    var poller = std.Io.poll(allocator, enum { stdout, stderr }, .{
+        .stdout = child.stdout.?,
+        .stderr = child.stderr.?,
+    });
+    defer poller.deinit();
+
+    const stdout_r = poller.reader(.stdout);
+    stdout_r.buffer = stdout.allocatedSlice();
+    stdout_r.seek = 0;
+    stdout_r.end = stdout.items.len;
+
+    const stderr_r = poller.reader(.stderr);
+    stderr_r.buffer = stderr.allocatedSlice();
+    stderr_r.seek = 0;
+    stderr_r.end = stderr.items.len;
+
+    defer {
+        stdout.* = .{
+            .items = stdout_r.buffer[0..stdout_r.end],
+            .capacity = stdout_r.buffer.len,
+        };
+        stderr.* = .{
+            .items = stderr_r.buffer[0..stderr_r.end],
+            .capacity = stderr_r.buffer.len,
+        };
+        stdout_r.buffer = &.{};
+        stderr_r.buffer = &.{};
+    }
+
+    var timed_out = false;
+    while (true) {
+        const keep_polling = if (timeout_secs == 0 or timed_out)
+            try poller.poll()
+        else
+            try poller.pollTimeout(AGENT_POLL_STEP_NS);
+
+        if (stdout_r.bufferedLen() > AGENT_MAX_OUTPUT_BYTES) return error.StdoutStreamTooLong;
+        if (stderr_r.bufferedLen() > AGENT_MAX_OUTPUT_BYTES) return error.StderrStreamTooLong;
+
+        if (!keep_polling) break;
+
+        if (!timed_out and hasTimeoutExpired(start_ns, timeout_secs)) {
+            try terminateAgentChildHard(child);
+            timed_out = true;
+        }
+    }
+
+    return timed_out;
+}
+
+fn terminateAgentChildHard(child: *std.process.Child) !void {
+    if (comptime builtin.os.tag == .windows) {
+        _ = child.killWindows(1) catch |err| switch (err) {
+            error.AlreadyTerminated => return,
+            else => return err,
+        };
+        return;
+    }
+    if (comptime builtin.os.tag == .wasi) return error.UnsupportedOperation;
+
+    std.posix.kill(child.id, std.posix.SIG.KILL) catch |err| switch (err) {
+        error.ProcessNotFound => return,
+        else => return err,
+    };
+}
+
+fn buildAgentOutput(
+    allocator: std.mem.Allocator,
+    stdout: []const u8,
+    stderr: []const u8,
+    timeout_secs: u64,
+    timed_out: bool,
+) ![]const u8 {
+    if (timed_out) {
+        const source = if (stdout.len > 0) stdout else stderr;
+        if (source.len > 0) {
+            return std.fmt.allocPrint(allocator, "{s}\n\n[agent timed out after {d}s]", .{ source, timeout_secs });
+        }
+        return std.fmt.allocPrint(allocator, "agent timed out after {d}s", .{timeout_secs});
+    }
+
+    const output_source = if (stdout.len > 0) stdout else if (stderr.len > 0) stderr else "";
+    return allocator.dupe(u8, output_source);
+}
+
+fn runAgentJob(
+    allocator: std.mem.Allocator,
+    cwd: ?[]const u8,
+    prompt: []const u8,
+    model: ?[]const u8,
+    timeout_secs: u64,
+) !AgentRunResult {
+    const exe_path = try std.fs.selfExePathAlloc(allocator);
+    defer allocator.free(exe_path);
+
+    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer argv.deinit(allocator);
+
+    try argv.append(allocator, exe_path);
+    try argv.append(allocator, "agent");
+    if (model) |m| {
+        try argv.append(allocator, "--model");
+        try argv.append(allocator, m);
+    }
+    try argv.append(allocator, "-m");
+    try argv.append(allocator, prompt);
+
+    var child = std.process.Child.init(argv.items, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    child.cwd = cwd;
+
+    try child.spawn();
+    errdefer {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+    }
+
+    const start_ns = std.time.nanoTimestamp();
+
+    var stdout: std.ArrayList(u8) = .empty;
+    defer stdout.deinit(allocator);
+    var stderr: std.ArrayList(u8) = .empty;
+    defer stderr.deinit(allocator);
+
+    const timed_out = try collectChildOutputWithTimeout(
+        &child,
+        allocator,
+        &stdout,
+        &stderr,
+        timeout_secs,
+        start_ns,
+    );
+
+    const term = try child.wait();
+    const success = !timed_out and switch (term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+    const output = try buildAgentOutput(allocator, stdout.items, stderr.items, timeout_secs, timed_out);
+    return .{ .success = success, .output = output };
+}
 
 const LoadPolicy = enum {
     best_effort,
@@ -821,6 +1098,37 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             break :blk false;
         };
 
+        const job_type = blk: {
+            if (obj.get("job_type")) |v| {
+                if (v == .string) break :blk JobType.parse(v.string);
+            }
+            break :blk JobType.shell;
+        };
+        const prompt = blk: {
+            if (obj.get("prompt")) |v| {
+                if (v == .string and v.string.len > 0) break :blk v.string;
+            }
+            break :blk null;
+        };
+        const model = blk: {
+            if (obj.get("model")) |v| {
+                if (v == .string and v.string.len > 0) break :blk v.string;
+            }
+            break :blk null;
+        };
+        const enabled = blk: {
+            if (obj.get("enabled")) |v| {
+                if (v == .bool) break :blk v.bool;
+            }
+            break :blk true;
+        };
+        const delete_after_run = blk: {
+            if (obj.get("delete_after_run")) |v| {
+                if (v == .bool) break :blk v.bool;
+            }
+            break :blk false;
+        };
+
         try scheduler.jobs.append(scheduler.allocator, .{
             .id = try scheduler.allocator.dupe(u8, id),
             .expression = try scheduler.allocator.dupe(u8, expression),
@@ -828,6 +1136,11 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             .next_run_secs = next_run_secs,
             .paused = paused,
             .one_shot = one_shot,
+            .job_type = job_type,
+            .prompt = if (prompt) |p| try scheduler.allocator.dupe(u8, p) else null,
+            .model = if (model) |m| try scheduler.allocator.dupe(u8, m) else null,
+            .enabled = enabled,
+            .delete_after_run = delete_after_run,
         });
     }
 }
@@ -950,6 +1263,28 @@ pub fn saveJobs(scheduler: *const CronScheduler) !void {
         try buf.appendSlice(scheduler.allocator, ",");
         try json_util.appendJsonKey(&buf, scheduler.allocator, "one_shot");
         try buf.appendSlice(scheduler.allocator, if (job.one_shot) "true" else "false");
+        try buf.appendSlice(scheduler.allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, scheduler.allocator, "job_type", job.job_type.asStr());
+        try buf.appendSlice(scheduler.allocator, ",");
+        try json_util.appendJsonKey(&buf, scheduler.allocator, "prompt");
+        if (job.prompt) |prompt| {
+            try json_util.appendJsonString(&buf, scheduler.allocator, prompt);
+        } else {
+            try buf.appendSlice(scheduler.allocator, "null");
+        }
+        try buf.appendSlice(scheduler.allocator, ",");
+        try json_util.appendJsonKey(&buf, scheduler.allocator, "model");
+        if (job.model) |model| {
+            try json_util.appendJsonString(&buf, scheduler.allocator, model);
+        } else {
+            try buf.appendSlice(scheduler.allocator, "null");
+        }
+        try buf.appendSlice(scheduler.allocator, ",");
+        try json_util.appendJsonKey(&buf, scheduler.allocator, "enabled");
+        try buf.appendSlice(scheduler.allocator, if (job.enabled) "true" else "false");
+        try buf.appendSlice(scheduler.allocator, ",");
+        try json_util.appendJsonKey(&buf, scheduler.allocator, "delete_after_run");
+        try buf.appendSlice(scheduler.allocator, if (job.delete_after_run) "true" else "false");
 
         try buf.appendSlice(scheduler.allocator, "}");
     }
@@ -1038,9 +1373,10 @@ pub fn cliListJobs(allocator: std.mem.Allocator) !void {
             break :blk "";
         };
         const status = job.last_status orelse "n/a";
-        log.info("- {s} | {s} | next={d} | status={s}{s} cmd: {s}", .{
+        log.info("- {s} | {s} | type={s} | next={d} | status={s}{s} cmd: {s}", .{
             job.id,
             job.expression,
+            job.job_type.asStr(),
             job.next_run_secs,
             status,
             flags,
@@ -1064,6 +1400,21 @@ pub fn cliAddJob(allocator: std.mem.Allocator, expression: []const u8, command: 
     log.info("  Cmd : {s}", .{job.command});
 }
 
+/// CLI: add a recurring agent job.
+pub fn cliAddAgentJob(allocator: std.mem.Allocator, expression: []const u8, prompt: []const u8, model: ?[]const u8) !void {
+    var scheduler = CronScheduler.init(allocator, 1024, true);
+    defer scheduler.deinit();
+    try loadJobs(&scheduler);
+
+    const job = try scheduler.addAgentJob(expression, prompt, model);
+    try saveJobs(&scheduler);
+
+    log.info("Added agent cron job {s}", .{job.id});
+    log.info("  Expr : {s}", .{job.expression});
+    log.info("  Type : {s}", .{job.job_type.asStr()});
+    if (job.model) |m| log.info("  Model: {s}", .{m});
+}
+
 /// CLI: add a one-shot delayed task.
 pub fn cliAddOnce(allocator: std.mem.Allocator, delay: []const u8, command: []const u8) !void {
     var scheduler = CronScheduler.init(allocator, 1024, true);
@@ -1076,6 +1427,21 @@ pub fn cliAddOnce(allocator: std.mem.Allocator, delay: []const u8, command: []co
     log.info("Added one-shot task {s}", .{job.id});
     log.info("  Runs at: {d}", .{job.next_run_secs});
     log.info("  Cmd    : {s}", .{job.command});
+}
+
+/// CLI: add a one-shot delayed agent task.
+pub fn cliAddAgentOnce(allocator: std.mem.Allocator, delay: []const u8, prompt: []const u8, model: ?[]const u8) !void {
+    var scheduler = CronScheduler.init(allocator, 1024, true);
+    defer scheduler.deinit();
+    try loadJobs(&scheduler);
+
+    const job = try scheduler.addAgentOnce(delay, prompt, model);
+    try saveJobs(&scheduler);
+
+    log.info("Added one-shot agent task {s}", .{job.id});
+    log.info("  Runs at: {d}", .{job.next_run_secs});
+    log.info("  Type   : {s}", .{job.job_type.asStr()});
+    if (job.model) |m| log.info("  Model  : {s}", .{m});
 }
 
 /// CLI: remove a cron job by ID.
@@ -1126,27 +1492,44 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
 
     var scheduler = CronScheduler.init(allocator, 1024, true);
     defer scheduler.deinit();
-    if (cfg_opt) |cfg| scheduler.setShellCwd(cfg.workspace_dir);
+    if (cfg_opt) |cfg| {
+        scheduler.setShellCwd(cfg.workspace_dir);
+        scheduler.setAgentTimeoutSecs(cfg.scheduler.agent_timeout_secs);
+    }
     try loadJobs(&scheduler);
 
     if (scheduler.getJob(id)) |job| {
         log.info("Running job '{s}': {s}", .{ id, job.command });
-        const result = std.process.Child.run(.{
-            .allocator = allocator,
-            .argv = &.{ platform.getShell(), platform.getShellFlag(), job.command },
-            .cwd = scheduler.shell_cwd,
-        }) catch |err| {
-            log.err("Job '{s}' failed: {s}", .{ id, @errorName(err) });
-            return;
-        };
-        defer allocator.free(result.stdout);
-        defer allocator.free(result.stderr);
-        if (result.stdout.len > 0) log.info("{s}", .{result.stdout});
-        const exit_code: u8 = switch (result.term) {
-            .Exited => |code| code,
-            else => 1,
-        };
-        log.info("Job '{s}' completed (exit {d}).", .{ id, exit_code });
+        switch (job.job_type) {
+            .shell => {
+                const result = std.process.Child.run(.{
+                    .allocator = allocator,
+                    .argv = &.{ platform.getShell(), platform.getShellFlag(), job.command },
+                    .cwd = scheduler.shell_cwd,
+                }) catch |err| {
+                    log.err("Job '{s}' failed: {s}", .{ id, @errorName(err) });
+                    return;
+                };
+                defer allocator.free(result.stdout);
+                defer allocator.free(result.stderr);
+                if (result.stdout.len > 0) log.info("{s}", .{result.stdout});
+                const exit_code: u8 = switch (result.term) {
+                    .Exited => |code| code,
+                    else => 1,
+                };
+                log.info("Job '{s}' completed (exit {d}).", .{ id, exit_code });
+            },
+            .agent => {
+                const prompt = job.prompt orelse job.command;
+                const result = runAgentJob(allocator, scheduler.shell_cwd, prompt, job.model, scheduler.agent_timeout_secs) catch |err| {
+                    log.err("Agent job '{s}' failed: {s}", .{ id, @errorName(err) });
+                    return;
+                };
+                defer allocator.free(result.output);
+                if (result.output.len > 0) log.info("{s}", .{result.output});
+                log.info("Agent job '{s}' completed ({s}).", .{ id, if (result.success) "ok" else "error" });
+            },
+        }
     } else {
         log.warn("Cron job '{s}' not found", .{id});
     }
@@ -1158,6 +1541,8 @@ pub fn cliUpdateJob(
     id: []const u8,
     expression: ?[]const u8,
     command: ?[]const u8,
+    prompt: ?[]const u8,
+    model: ?[]const u8,
     enabled: ?bool,
 ) !void {
     var scheduler = CronScheduler.init(allocator, 1024, true);
@@ -1167,6 +1552,8 @@ pub fn cliUpdateJob(
     const patch = CronJobPatch{
         .expression = expression,
         .command = command,
+        .prompt = prompt,
+        .model = model,
         .enabled = enabled,
     };
     if (scheduler.updateJob(allocator, id, patch)) {
@@ -1392,6 +1779,26 @@ test "save and load roundtrip with JSON-sensitive command characters" {
     try std.testing.expectEqualStrings(cmd, loaded.listJobs()[0].command);
 }
 
+test "save and load roundtrip keeps agent fields" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    _ = try scheduler.addAgentJob("*/15 * * * *", "Summarize release status", "openrouter/anthropic/claude-sonnet-4");
+    try saveJobs(&scheduler);
+
+    var loaded = CronScheduler.init(std.testing.allocator, 10, true);
+    defer loaded.deinit();
+    try loadJobsStrict(&loaded);
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.listJobs().len);
+    const job = loaded.listJobs()[0];
+    try std.testing.expectEqual(JobType.agent, job.job_type);
+    try std.testing.expect(job.prompt != null);
+    try std.testing.expectEqualStrings("Summarize release status", job.prompt.?);
+    try std.testing.expect(job.model != null);
+    try std.testing.expectEqualStrings("openrouter/anthropic/claude-sonnet-4", job.model.?);
+}
+
 test "JobType parse and asStr" {
     try std.testing.expectEqual(JobType.shell, JobType.parse("shell"));
     try std.testing.expectEqual(JobType.agent, JobType.parse("agent"));
@@ -1450,6 +1857,43 @@ test "updateJob modifies job fields" {
     try std.testing.expectEqualStrings("echo updated", updated.command);
     try std.testing.expect(!updated.enabled);
     try std.testing.expect(updated.paused);
+}
+
+test "updateJob keeps agent command and prompt in sync" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    _ = try scheduler.addAgentJob("* * * * *", "old prompt", "model-a");
+    const id = scheduler.listJobs()[0].id;
+
+    // Back-compat: updating command should update agent prompt.
+    try std.testing.expect(scheduler.updateJob(allocator, id, .{ .command = "new command prompt" }));
+    var updated = scheduler.getJob(id).?;
+    try std.testing.expect(updated.prompt != null);
+    try std.testing.expectEqualStrings("new command prompt", updated.command);
+    try std.testing.expectEqualStrings("new command prompt", updated.prompt.?);
+
+    // Explicit prompt/model update should persist both.
+    try std.testing.expect(scheduler.updateJob(allocator, id, .{
+        .prompt = "explicit prompt",
+        .model = "model-b",
+    }));
+    updated = scheduler.getJob(id).?;
+    try std.testing.expect(updated.prompt != null);
+    try std.testing.expectEqualStrings("explicit prompt", updated.command);
+    try std.testing.expectEqualStrings("explicit prompt", updated.prompt.?);
+    try std.testing.expect(updated.model != null);
+    try std.testing.expectEqualStrings("model-b", updated.model.?);
+}
+
+test "CronScheduler remove frees agent job fields" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    const job = try scheduler.addAgentJob("* * * * *", "prompt to free", "model-to-free");
+    try std.testing.expect(scheduler.removeJob(job.id));
+    try std.testing.expectEqual(@as(usize, 0), scheduler.listJobs().len);
 }
 
 test "getMutableJob returns null for unknown id" {
@@ -1734,7 +2178,7 @@ test "agent job delivers result via bus" {
         .expression = try allocator.dupe(u8, "* * * * *"),
         .command = try allocator.dupe(u8, "summarize"),
         .job_type = .agent,
-        .prompt = "Summarize today's news",
+        .prompt = try allocator.dupe(u8, "Summarize today's news"),
         .next_run_secs = 0,
         .delivery = .{
             .mode = .always,
@@ -1752,6 +2196,80 @@ test "agent job delivers result via bus" {
     try std.testing.expectEqualStrings("discord", msg.channel);
     try std.testing.expectEqualStrings("general", msg.chat_id);
     try std.testing.expectEqualStrings("Summarize today's news", msg.content);
+}
+
+test "collectChildOutputWithTimeout disables timeout when set to zero" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var child = std.process.Child.init(&.{ platform.getShell(), platform.getShellFlag(), "echo ready" }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    try child.spawn();
+    errdefer {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+    }
+
+    var stdout: std.ArrayList(u8) = .empty;
+    defer stdout.deinit(allocator);
+    var stderr: std.ArrayList(u8) = .empty;
+    defer stderr.deinit(allocator);
+
+    const timed_out = try collectChildOutputWithTimeout(
+        &child,
+        allocator,
+        &stdout,
+        &stderr,
+        0,
+        std.time.nanoTimestamp(),
+    );
+    const term = try child.wait();
+
+    try std.testing.expect(!timed_out);
+    switch (term) {
+        .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        else => try std.testing.expect(false),
+    }
+    try std.testing.expect(std.mem.indexOf(u8, stdout.items, "ready") != null);
+}
+
+test "collectChildOutputWithTimeout kills process after deadline" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var child = std.process.Child.init(&.{ platform.getShell(), platform.getShellFlag(), "sleep 2; echo never" }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    try child.spawn();
+    errdefer {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+    }
+
+    var stdout: std.ArrayList(u8) = .empty;
+    defer stdout.deinit(allocator);
+    var stderr: std.ArrayList(u8) = .empty;
+    defer stderr.deinit(allocator);
+
+    const timed_out = try collectChildOutputWithTimeout(
+        &child,
+        allocator,
+        &stdout,
+        &stderr,
+        1,
+        std.time.nanoTimestamp(),
+    );
+    const term = try child.wait();
+
+    try std.testing.expect(timed_out);
+    const completed_ok = switch (term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
+    try std.testing.expect(!completed_ok);
 }
 
 test "DeliveryMode parse and asStr" {
