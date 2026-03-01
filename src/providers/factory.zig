@@ -604,6 +604,11 @@ test "ProviderHolder.fromConfig routes to correct variant" {
     var h6 = ProviderHolder.fromConfig(alloc, "groq", "gsk_test", null, true);
     defer h6.deinit();
     try std.testing.expect(h6 == .compatible);
+    // compatible (telnyx from built-in table URL)
+    var h6b = ProviderHolder.fromConfig(alloc, "telnyx", "test-key", null, true);
+    defer h6b.deinit();
+    try std.testing.expect(h6b == .compatible);
+    try std.testing.expectEqualStrings("https://api.telnyx.com/v2/ai", h6b.compatible.base_url);
     // openai-codex
     var h7 = ProviderHolder.fromConfig(alloc, "openai-codex", null, null, true);
     defer h7.deinit();

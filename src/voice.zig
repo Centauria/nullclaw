@@ -1,7 +1,7 @@
-//! Voice transcription via Groq Whisper API (OpenAI-compatible).
+//! Voice transcription via OpenAI-compatible STT APIs (Groq/OpenAI/Telnyx).
 //!
 //! Reads an audio file, builds a multipart/form-data POST request,
-//! and sends it to the Groq transcription endpoint. Returns the
+//! and sends it to the configured transcription endpoint. Returns the
 //! transcribed text as an owned slice.
 
 const std = @import("std");
@@ -593,48 +593,6 @@ test "voice resolveTranscriptionEndpoint unknown falls back to groq" {
         "https://api.groq.com/openai/v1/audio/transcriptions",
         resolveTranscriptionEndpoint("some-unknown-provider", null),
     );
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-// Telnyx Transcriber (OpenAI-compatible Whisper STT)
-// ════════════════════════════════════════════════════════════════════════════
-
-pub const TelnyxTranscriber = struct {
-    endpoint: []const u8,
-    api_key: []const u8,
-    model: []const u8,
-    language: ?[]const u8,
-
-    fn vtableTranscribe(ptr: *anyopaque, alloc: std.mem.Allocator, path: []const u8) TranscribeError!?[]const u8 {
-        const self: *TelnyxTranscriber = @ptrCast(@alignCast(ptr));
-        const result = try transcribeFile(alloc, self.api_key, self.endpoint, path, .{
-            .model = self.model,
-            .language = self.language,
-        });
-        return result;
-    }
-
-    pub const vtable = Transcriber.VTable{
-        .transcribe = &vtableTranscribe,
-    };
-
-    pub fn transcriber(self: *TelnyxTranscriber) Transcriber {
-        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
-    }
-};
-
-test "voice TelnyxTranscriber stores fields" {
-    var tt = TelnyxTranscriber{
-        .endpoint = "https://api.telnyx.com/v2/ai/audio/transcriptions",
-        .api_key = "test-telnyx-key",
-        .model = "whisper-1",
-        .language = "en",
-    };
-    try std.testing.expectEqualStrings("test-telnyx-key", tt.api_key);
-    try std.testing.expectEqualStrings("en", tt.language.?);
-    // Vtable dispatches
-    const t = tt.transcriber();
-    try std.testing.expect(t.vtable == &TelnyxTranscriber.vtable);
 }
 
 test "voice resolveTranscriptionEndpoint telnyx" {
