@@ -60,6 +60,7 @@ pub const SignalConfig = config_types.SignalConfig;
 pub const EmailConfig = config_types.EmailConfig;
 pub const LineConfig = config_types.LineConfig;
 pub const QQGroupPolicy = config_types.QQGroupPolicy;
+pub const QQReceiveMode = config_types.QQReceiveMode;
 pub const QQConfig = config_types.QQConfig;
 pub const OneBotConfig = config_types.OneBotConfig;
 pub const MaixCamConfig = config_types.MaixCamConfig;
@@ -3335,13 +3336,15 @@ test "parse qq accounts include allowlist and allowed_groups" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const json =
-        \\{"channels": {"qq": {"accounts": {"qq-backup": {"app_id": "app2", "bot_token": "tok2"}, "qq-main": {"app_id": "app1", "app_secret": "sec1", "bot_token": "tok1", "group_policy": "allowlist", "allowed_groups": ["group-a", "group-b"], "allow_from": ["user-a"]}}}}}
+        \\{"channels": {"qq": {"accounts": {"qq-backup": {"app_id": "app2", "bot_token": "tok2"}, "qq-main": {"app_id": "app1", "app_secret": "sec1", "bot_token": "tok1", "receive_mode": "websocket", "group_policy": "allowlist", "allowed_groups": ["group-a", "group-b"], "allow_from": ["user-a"]}}}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
     try std.testing.expectEqual(@as(usize, 2), cfg.channels.qq.len);
     try std.testing.expectEqualStrings("qq-backup", cfg.channels.qq[0].account_id);
     try std.testing.expectEqualStrings("qq-main", cfg.channels.qq[1].account_id);
+    try std.testing.expectEqual(config_types.QQReceiveMode.webhook, cfg.channels.qq[0].receive_mode);
+    try std.testing.expectEqual(config_types.QQReceiveMode.websocket, cfg.channels.qq[1].receive_mode);
     try std.testing.expectEqual(config_types.QQGroupPolicy.allowlist, cfg.channels.qq[1].group_policy);
     try std.testing.expectEqual(@as(usize, 2), cfg.channels.qq[1].allowed_groups.len);
     try std.testing.expectEqualStrings("group-a", cfg.channels.qq[1].allowed_groups[0]);

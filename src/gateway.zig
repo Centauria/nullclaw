@@ -6,7 +6,7 @@
 //!   - Body size limits (64KB max)
 //!   - Request timeouts (30s)
 //!   - Bearer token authentication (PairingGuard)
-//!   - Endpoints: /health, /ready, /pair, /webhook, /whatsapp, /telegram, /line, /lark, /slack/events
+//!   - Endpoints: /health, /ready, /pair, /webhook, /whatsapp, /telegram, /line, /lark, /qq, /slack/events
 //!
 //! Uses std.http.Server (built-in, no external deps).
 
@@ -367,6 +367,7 @@ pub const GatewayState = struct {
     lark_app_secret: []const u8 = "",
     lark_account_id: []const u8 = "default",
     lark_allow_from: []const []const u8 = &.{},
+    qq_channels: std.ArrayListUnmanaged(channels.qq.QQChannel) = .empty,
     pairing_guard: ?PairingGuard,
     event_bus: ?*bus_mod.Bus = null,
 
@@ -388,6 +389,10 @@ pub const GatewayState = struct {
     }
 
     pub fn deinit(self: *GatewayState) void {
+        for (self.qq_channels.items) |*qq_ch| {
+            qq_ch.channel().stop();
+        }
+        self.qq_channels.deinit(self.allocator);
         self.rate_limiter.deinit(self.allocator);
         self.idempotency.deinit(self.allocator);
         if (self.pairing_guard) |*guard| {
@@ -953,6 +958,65 @@ fn selectLarkConfig(
     }
 
     return &cfg.channels.lark[0];
+}
+
+fn findQqConfigByAccountId(cfg: *const Config, account_id: []const u8) ?*const config_types.QQConfig {
+    for (cfg.channels.qq) |*qq_cfg| {
+        if (std.ascii.eqlIgnoreCase(qq_cfg.account_id, account_id)) return qq_cfg;
+    }
+    return null;
+}
+
+fn findQqConfigByAppId(cfg: *const Config, app_id: []const u8) ?*const config_types.QQConfig {
+    for (cfg.channels.qq) |*qq_cfg| {
+        if (std.mem.eql(u8, qq_cfg.app_id, app_id)) return qq_cfg;
+    }
+    return null;
+}
+
+fn selectQqConfig(
+    cfg_opt: ?*const Config,
+    target: []const u8,
+    app_id_header: ?[]const u8,
+) ?*const config_types.QQConfig {
+    if (!build_options.enable_channel_qq) return null;
+    const cfg = cfg_opt orelse return null;
+    if (cfg.channels.qq.len == 0) return null;
+
+    if (parseQueryParam(target, "account_id")) |account_id| {
+        if (findQqConfigByAccountId(cfg, account_id)) |qq_cfg| {
+            return qq_cfg;
+        }
+    }
+    if (parseQueryParam(target, "account")) |account_id| {
+        if (findQqConfigByAccountId(cfg, account_id)) |qq_cfg| {
+            return qq_cfg;
+        }
+    }
+
+    if (app_id_header) |raw_app_id| {
+        const app_id = std.mem.trim(u8, raw_app_id, " \t\r\n");
+        if (app_id.len > 0) {
+            if (findQqConfigByAppId(cfg, app_id)) |qq_cfg| {
+                return qq_cfg;
+            }
+        }
+    }
+
+    if (cfg.channels.qqPrimary()) |primary| {
+        if (findQqConfigByAccountId(cfg, primary.account_id)) |qq_cfg| {
+            return qq_cfg;
+        }
+    }
+
+    return &cfg.channels.qq[0];
+}
+
+fn findQqRuntimeChannel(state: *GatewayState, account_id: []const u8) ?*channels.qq.QQChannel {
+    for (state.qq_channels.items) |*qq_ch| {
+        if (std.ascii.eqlIgnoreCase(qq_ch.config.account_id, account_id)) return qq_ch;
+    }
+    return null;
 }
 
 fn webhookBasePath(target: []const u8) []const u8 {
@@ -1528,6 +1592,7 @@ const webhook_route_descriptors = [_]WebhookRouteDescriptor{
     .{ .path = "/slack/events", .handler = handleSlackWebhookRoute },
     .{ .path = "/line", .handler = handleLineWebhookRoute },
     .{ .path = "/lark", .handler = handleLarkWebhookRoute },
+    .{ .path = "/qq", .handler = handleQqWebhookRoute },
 };
 
 fn findWebhookRouteDescriptor(path: []const u8) ?*const WebhookRouteDescriptor {
@@ -2260,8 +2325,105 @@ fn handleLarkWebhookRoute(ctx: *WebhookHandlerContext) void {
     ctx.response_body = "{\"status\":\"ok\"}";
 }
 
+fn handleQqWebhookRoute(ctx: *WebhookHandlerContext) void {
+    if (!build_options.enable_channel_qq) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"qq channel disabled in this build\"}";
+        return;
+    }
+
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    if (!ctx.state.rate_limiter.allowWebhook(ctx.state.allocator, "qq")) {
+        ctx.response_status = "429 Too Many Requests";
+        ctx.response_body = "{\"error\":\"rate limited\"}";
+        return;
+    }
+
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_body = "{\"status\":\"received\"}";
+        return;
+    };
+
+    const app_id_header = extractHeader(ctx.raw_request, "X-Bot-Appid");
+    const qq_cfg = selectQqConfig(ctx.config_opt, ctx.target, app_id_header) orelse {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"qq not configured\"}";
+        return;
+    };
+
+    if (qq_cfg.receive_mode != .webhook) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"qq webhook mode not enabled\"}";
+        return;
+    }
+
+    if (app_id_header) |raw_app_id| {
+        const app_id = std.mem.trim(u8, raw_app_id, " \t\r\n");
+        if (app_id.len > 0 and !std.mem.eql(u8, app_id, qq_cfg.app_id)) {
+            ctx.response_status = "401 Unauthorized";
+            ctx.response_body = "{\"error\":\"invalid X-Bot-Appid\"}";
+            return;
+        }
+    }
+
+    var qq_channel = findQqRuntimeChannel(ctx.state, qq_cfg.account_id) orelse blk: {
+        ctx.state.qq_channels.append(ctx.state.allocator, channels.qq.QQChannel.initFromConfig(ctx.state.allocator, qq_cfg.*)) catch {
+            ctx.response_status = "500 Internal Server Error";
+            ctx.response_body = "{\"error\":\"qq channel init failed\"}";
+            return;
+        };
+        break :blk &ctx.state.qq_channels.items[ctx.state.qq_channels.items.len - 1];
+    };
+
+    if (qq_channel.buildWebhookValidationResponse(ctx.req_allocator, body) catch null) |challenge_resp| {
+        ctx.response_body = challenge_resp;
+        return;
+    }
+
+    const inbound_opt = qq_channel.parseWebhookPayload(ctx.req_allocator, body) catch {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    };
+
+    if (inbound_opt) |inbound| {
+        defer inbound.deinit(qq_channel.allocator);
+
+        if (ctx.state.event_bus) |eb| {
+            _ = publishToBus(
+                eb,
+                ctx.state.allocator,
+                "qq",
+                inbound.sender_id,
+                inbound.chat_id,
+                inbound.content,
+                inbound.session_key,
+                inbound.metadata_json,
+            );
+            ctx.response_body = "{\"status\":\"received\"}";
+            return;
+        }
+
+        if (ctx.session_mgr_opt) |sm| {
+            const reply: ?[]const u8 = sm.processMessage(inbound.session_key, inbound.content, null) catch |err| blk: {
+                qq_channel.sendMessage(inbound.chat_id, userFacingAgentError(err)) catch {};
+                break :blk null;
+            };
+            if (reply) |r| {
+                defer ctx.root_allocator.free(r);
+                qq_channel.sendMessage(inbound.chat_id, r) catch {};
+            }
+        }
+    }
+
+    ctx.response_body = "{\"status\":\"ok\"}";
+}
+
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
-/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark
+/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, POST /qq
 /// If config_ptr is null, loads config internally (for backward compatibility).
 pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr: ?*const Config, event_bus: ?*bus_mod.Bus) !void {
     health.markComponentOk("gateway");
@@ -2333,6 +2495,11 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             state.lark_app_secret = lark_cfg.app_secret;
             state.lark_allow_from = lark_cfg.allow_from;
             state.lark_account_id = lark_cfg.account_id;
+        }
+        if (build_options.enable_channel_qq) {
+            for (cfg.channels.qq) |qq_cfg| {
+                try state.qq_channels.append(allocator, channels.qq.QQChannel.initFromConfig(allocator, qq_cfg));
+            }
         }
 
         // In daemon mode (`event_bus` is present), inbound processing is delegated to
@@ -2701,6 +2868,7 @@ test "findWebhookRouteDescriptor resolves known webhook paths" {
     try std.testing.expect(findWebhookRouteDescriptor("/slack/events") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/line") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/lark") != null);
+    try std.testing.expect(findWebhookRouteDescriptor("/qq") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/health") == null);
 }
 
@@ -3212,6 +3380,68 @@ test "selectLarkConfig picks account by verification token" {
     }
     try std.testing.expect(selected != null);
     try std.testing.expectEqualStrings("backup", selected.?.account_id);
+}
+
+test "selectQqConfig picks account by X-Bot-Appid header" {
+    const qq_accounts = [_]config_types.QQConfig{
+        .{
+            .account_id = "main",
+            .app_id = "app-main",
+            .app_secret = "secret-main",
+        },
+        .{
+            .account_id = "backup",
+            .app_id = "app-backup",
+            .app_secret = "secret-backup",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .qq = &qq_accounts,
+        },
+    };
+
+    const selected = selectQqConfig(&cfg, "/qq", "app-backup");
+    if (!build_options.enable_channel_qq) {
+        try std.testing.expect(selected == null);
+        return;
+    }
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("backup", selected.?.account_id);
+}
+
+test "selectQqConfig falls back to primary account" {
+    const qq_accounts = [_]config_types.QQConfig{
+        .{
+            .account_id = "z-last",
+            .app_id = "app-z",
+            .app_secret = "secret-z",
+        },
+        .{
+            .account_id = "default",
+            .app_id = "app-default",
+            .app_secret = "secret-default",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .qq = &qq_accounts,
+        },
+    };
+
+    const selected = selectQqConfig(&cfg, "/qq", null);
+    if (!build_options.enable_channel_qq) {
+        try std.testing.expect(selected == null);
+        return;
+    }
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("default", selected.?.account_id);
 }
 
 test "whatsappSessionKey builds direct key by sender" {

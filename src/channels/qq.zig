@@ -206,8 +206,11 @@ fn extractImageMarkers(allocator: std.mem.Allocator, payload: std.json.Value) ![
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Message Deduplication (Ring Buffer)
+// Message Deduplication
 // ════════════════════════════════════════════════════════════════════════════
+
+/// Runtime dedup capacity, aligned with zeroclaw (10k keys, evict half).
+pub const DEDUP_CAPACITY: usize = 10_000;
 
 pub const DEDUP_RING_SIZE: usize = 1024;
 
@@ -235,6 +238,50 @@ pub const DedupRing = struct {
     pub fn reset(self: *DedupRing) void {
         self.idx = 0;
         self.count = 0;
+    }
+};
+
+pub const StringDedupSet = struct {
+    seen: std.StringHashMapUnmanaged(void) = .empty,
+    order: std.ArrayListUnmanaged([]u8) = .empty,
+    mu: std.Thread.Mutex = .{},
+
+    pub fn deinit(self: *StringDedupSet, allocator: std.mem.Allocator) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.order.items) |key| allocator.free(key);
+        self.order.deinit(allocator);
+        self.seen.deinit(allocator);
+    }
+
+    pub fn isDuplicate(self: *StringDedupSet, allocator: std.mem.Allocator, message_id: []const u8) !bool {
+        if (message_id.len == 0) return false;
+
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        if (self.seen.contains(message_id)) {
+            return true;
+        }
+
+        if (self.order.items.len >= DEDUP_CAPACITY) {
+            const remove_n = self.order.items.len / 2;
+            var i: usize = 0;
+            while (i < remove_n) : (i += 1) {
+                const key = self.order.items[i];
+                _ = self.seen.remove(key);
+                allocator.free(key);
+            }
+            const remaining = self.order.items.len - remove_n;
+            std.mem.copyForwards([]u8, self.order.items[0..remaining], self.order.items[remove_n..]);
+            self.order.items.len = remaining;
+        }
+
+        const owned_key = try allocator.dupe(u8, message_id);
+        errdefer allocator.free(owned_key);
+        try self.seen.put(allocator, owned_key, {});
+        try self.order.append(allocator, owned_key);
+        return false;
     }
 };
 
@@ -485,6 +532,34 @@ fn ensureHttpsMediaUrl(media_url: []const u8) ![]const u8 {
     return trimmed;
 }
 
+fn qqSeedFromSecret(secret: []const u8) ?[32]u8 {
+    if (secret.len == 0) return null;
+
+    var seed: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < seed.len) : (i += 1) {
+        seed[i] = secret[i % secret.len];
+    }
+    return seed;
+}
+
+fn qqWebhookValidationSignature(
+    allocator: std.mem.Allocator,
+    app_secret: []const u8,
+    event_ts: []const u8,
+    plain_token: []const u8,
+) !?[]u8 {
+    const seed = qqSeedFromSecret(app_secret) orelse return null;
+    const key_pair = std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed) catch return null;
+    const payload = try std.fmt.allocPrint(allocator, "{s}{s}", .{ event_ts, plain_token });
+    defer allocator.free(payload);
+
+    const signature = key_pair.sign(payload, null) catch return null;
+    const signature_bytes = signature.toBytes();
+    const signature_hex = std.fmt.bytesToHex(signature_bytes, .lower);
+    return @as(?[]u8, try allocator.dupe(u8, &signature_hex));
+}
+
 /// Check if a group ID is allowed by the given config.
 pub fn isGroupAllowed(config: config_types.QQConfig, group_id: []const u8) bool {
     return switch (config.group_policy) {
@@ -672,7 +747,8 @@ pub const QQChannel = struct {
     config: config_types.QQConfig,
     allocator: std.mem.Allocator,
     event_bus: ?*bus.Bus,
-    dedup: DedupRing,
+    dedup_ring: DedupRing,
+    dedup_set: StringDedupSet = .{},
     sequence: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
     has_sequence: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     heartbeat_interval_ms: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -697,7 +773,7 @@ pub const QQChannel = struct {
             .config = config,
             .allocator = allocator,
             .event_bus = null,
-            .dedup = .{},
+            .dedup_ring = .{},
             .session_id = null,
         };
     }
@@ -740,6 +816,15 @@ pub const QQChannel = struct {
         self.token_expires_at = now + result.expires_in;
         log.info("Access token obtained (expires_in={d}s)", .{result.expires_in});
         return self.allocator.dupe(u8, result.token);
+    }
+
+    fn isDuplicateMessageId(self: *QQChannel, msg_id: []const u8) bool {
+        if (msg_id.len == 0) return false;
+
+        if (comptime builtin.is_test) {
+            return self.dedup_ring.isDuplicate(std.hash.Fnv1a_64.hash(msg_id));
+        }
+        return self.dedup_set.isDuplicate(self.allocator, msg_id) catch false;
     }
 
     // ── Incoming event handling ──────────────────────────────────────
@@ -830,6 +915,65 @@ pub const QQChannel = struct {
         }
     }
 
+    pub fn buildWebhookValidationResponse(self: *QQChannel, allocator: std.mem.Allocator, raw_json: []const u8) !?[]u8 {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{}) catch return null;
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+
+        const op_val = parsed.value.object.get("op") orelse return null;
+        const op_int: i64 = switch (op_val) {
+            .integer => op_val.integer,
+            .string => |s| std.fmt.parseInt(i64, s, 10) catch return null,
+            else => return null,
+        };
+        if (op_int != 13) return null;
+
+        const payload = parsed.value.object.get("d") orelse return null;
+        if (payload != .object) return null;
+        const plain_token_raw = getJsonStringFromObj(payload, "plain_token") orelse return null;
+        const event_ts_raw = getJsonStringFromObj(payload, "event_ts") orelse return null;
+        const plain_token = std.mem.trim(u8, plain_token_raw, " \t\r\n");
+        const event_ts = std.mem.trim(u8, event_ts_raw, " \t\r\n");
+        if (plain_token.len == 0 or event_ts.len == 0) return null;
+
+        const signature = (try qqWebhookValidationSignature(allocator, self.config.app_secret, event_ts, plain_token)) orelse return null;
+        defer allocator.free(signature);
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(allocator);
+        try out.appendSlice(allocator, "{\"plain_token\":");
+        try root.json_util.appendJsonString(&out, allocator, plain_token);
+        try out.appendSlice(allocator, ",\"signature\":");
+        try root.json_util.appendJsonString(&out, allocator, signature);
+        try out.appendSlice(allocator, "}");
+        return @as(?[]u8, try out.toOwnedSlice(allocator));
+    }
+
+    pub fn parseWebhookPayload(self: *QQChannel, allocator: std.mem.Allocator, raw_json: []const u8) !?bus.InboundMessage {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw_json, .{}) catch return null;
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+
+        const op_val = parsed.value.object.get("op") orelse return null;
+        const op_int: i64 = switch (op_val) {
+            .integer => op_val.integer,
+            .string => |s| std.fmt.parseInt(i64, s, 10) catch return null,
+            else => return null,
+        };
+        if (op_int != 0) return null;
+
+        var temp_bus = bus.Bus.init();
+        defer temp_bus.close();
+
+        const prev_bus = self.event_bus;
+        self.event_bus = &temp_bus;
+        defer self.event_bus = prev_bus;
+
+        try self.handleGatewayEvent(raw_json);
+        if (temp_bus.inboundDepth() == 0) return null;
+        return temp_bus.consumeInbound();
+    }
+
     fn handleMessageCreate(self: *QQChannel, val: std.json.Value, event_type: []const u8) !void {
         log.info("handleMessageCreate: event_type='{s}'", .{event_type});
 
@@ -849,8 +993,7 @@ pub const QQChannel = struct {
             return;
         };
         log.info("handleMessageCreate: msg_id='{s}'", .{msg_id_str});
-        const msg_id_hash = std.hash.Fnv1a_64.hash(msg_id_str);
-        if (self.dedup.isDuplicate(msg_id_hash)) {
+        if (self.isDuplicateMessageId(msg_id_str)) {
             log.info("handleMessageCreate: DROPPED — duplicate msg_id", .{});
             return;
         }
@@ -923,7 +1066,7 @@ pub const QQChannel = struct {
         }
 
         // Allowlist check
-        if (!root.isAllowed(self.config.allow_from, sender_id)) {
+        if (!root.isAllowedExact(self.config.allow_from, sender_id)) {
             log.info("handleMessageCreate: DROPPED — sender '{s}' not in allow_from", .{sender_id});
             return;
         }
@@ -1245,6 +1388,11 @@ pub const QQChannel = struct {
 
     fn vtableStart(ptr: *anyopaque) anyerror!void {
         const self: *QQChannel = @ptrCast(@alignCast(ptr));
+        if (self.config.receive_mode == .webhook) {
+            log.info("QQ channel in webhook receive_mode; websocket listener not started", .{});
+            self.running.store(true, .release);
+            return;
+        }
         self.running.store(true, .release);
         self.heartbeat_stop.store(false, .release);
         log.info("QQ channel starting (sandbox={s}, app_id={s})", .{ if (self.config.sandbox) "true" else "false", self.config.app_id });
@@ -1278,6 +1426,9 @@ pub const QQChannel = struct {
             self.allocator.free(tok);
             self.access_token = null;
         }
+        self.dedup_ring.reset();
+        self.dedup_set.deinit(self.allocator);
+        self.dedup_set = .{};
         log.info("QQ channel stopped", .{});
     }
 
@@ -1532,6 +1683,7 @@ test "qq config defaults" {
     try std.testing.expectEqualStrings("", config.app_secret);
     try std.testing.expectEqualStrings("", config.bot_token);
     try std.testing.expect(!config.sandbox);
+    try std.testing.expect(config.receive_mode == .webhook);
     try std.testing.expect(config.group_policy == .allow);
     try std.testing.expectEqual(@as(usize, 0), config.allowed_groups.len);
 }
@@ -1543,12 +1695,14 @@ test "qq config custom values" {
         .app_secret = "secret",
         .bot_token = "token",
         .sandbox = true,
+        .receive_mode = .websocket,
         .group_policy = .allowlist,
         .allowed_groups = &list,
     };
     try std.testing.expectEqualStrings("12345", config.app_id);
     try std.testing.expectEqualStrings("secret", config.app_secret);
     try std.testing.expect(config.sandbox);
+    try std.testing.expect(config.receive_mode == .websocket);
     try std.testing.expect(config.group_policy == .allowlist);
     try std.testing.expectEqual(@as(usize, 2), config.allowed_groups.len);
 }
@@ -2141,6 +2295,69 @@ test "qq handleGatewayEvent invalid JSON" {
     try ch.handleGatewayEvent("not json");
     try ch.handleGatewayEvent("{broken");
     try ch.handleGatewayEvent("");
+}
+
+test "qq handleGatewayEvent allow_from uses exact match" {
+    const alloc = std.testing.allocator;
+    var event_bus_inst = bus.Bus.init();
+    defer event_bus_inst.close();
+
+    var ch = QQChannel.init(alloc, .{ .allow_from = &.{"User-Exact"} });
+    ch.setBus(&event_bus_inst);
+
+    const msg_json =
+        \\{"op":0,"s":15,"t":"C2C_MESSAGE_CREATE","d":{"id":"msg-case","author":{"user_openid":"user-exact"},"content":"hello"}}
+    ;
+    try ch.handleGatewayEvent(msg_json);
+    try std.testing.expectEqual(@as(usize, 0), event_bus_inst.inboundDepth());
+}
+
+test "qq buildWebhookValidationResponse handles op13 challenge" {
+    const alloc = std.testing.allocator;
+    var ch = QQChannel.init(alloc, .{ .app_secret = "super-secret" });
+
+    const payload =
+        \\{"op":13,"d":{"plain_token":"plain123","event_ts":"1725442341"}}
+    ;
+    const response = try ch.buildWebhookValidationResponse(alloc, payload);
+    try std.testing.expect(response != null);
+    defer alloc.free(response.?);
+
+    try std.testing.expect(std.mem.indexOf(u8, response.?, "\"plain_token\":\"plain123\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response.?, "\"signature\":\"") != null);
+}
+
+test "qq parseWebhookPayload returns inbound message for dispatch event" {
+    const alloc = std.testing.allocator;
+    var ch = QQChannel.init(alloc, .{ .account_id = "qq-main", .allow_from = &.{"*"} });
+
+    const payload =
+        \\{"op":0,"s":42,"t":"C2C_MESSAGE_CREATE","d":{"id":"msg001","author":{"user_openid":"user_oid_1"},"content":"hello webhook"}}
+    ;
+    const maybe_msg = try ch.parseWebhookPayload(alloc, payload);
+    try std.testing.expect(maybe_msg != null);
+
+    var msg = maybe_msg.?;
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("qq", msg.channel);
+    try std.testing.expectEqualStrings("user_oid_1", msg.sender_id);
+    try std.testing.expectEqualStrings("c2c:user_oid_1:msg001", msg.chat_id);
+    try std.testing.expectEqualStrings("hello webhook", msg.content);
+}
+
+test "qq parseWebhookPayload deduplicates repeated message id" {
+    const alloc = std.testing.allocator;
+    var ch = QQChannel.init(alloc, .{ .account_id = "qq-main", .allow_from = &.{"*"} });
+
+    const payload =
+        \\{"op":0,"s":42,"t":"C2C_MESSAGE_CREATE","d":{"id":"msg001","author":{"user_openid":"user_oid_1"},"content":"hello webhook"}}
+    ;
+    const first = try ch.parseWebhookPayload(alloc, payload);
+    try std.testing.expect(first != null);
+    if (first) |msg| msg.deinit(alloc);
+
+    const second = try ch.parseWebhookPayload(alloc, payload);
+    try std.testing.expect(second == null);
 }
 
 test "qq handleGatewayEvent empty message content ignored" {
