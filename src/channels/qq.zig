@@ -43,14 +43,11 @@ pub const Opcode = enum(u8) {
     }
 };
 
-/// Default intents bitmask for QQ Bot API:
-///   bit 0:  GUILDS               — guild events
-///   bit 1:  GUILD_MEMBERS         — member changes
-///   bit 12: DIRECT_MESSAGE        — guild DM events
+/// Default intents bitmask for QQ Bot API (zeroclaw parity):
 ///   bit 25: GROUP_AND_C2C_EVENT   — group @msg + C2C (private chat) events
 ///   bit 30: PUBLIC_GUILD_MESSAGES — public guild @msg events
 /// See: https://bot.q.qq.com/wiki/develop/api-v2/dev-prepare/interface-framework/event-emit.html
-pub const DEFAULT_INTENTS: u32 = (1 << 0) | (1 << 1) | (1 << 12) | (1 << 25) | (1 << 30);
+pub const DEFAULT_INTENTS: u32 = (1 << 25) | (1 << 30);
 
 // ════════════════════════════════════════════════════════════════════════════
 // CQ Code Parsing (QQ message format)
@@ -446,9 +443,9 @@ pub fn fetchGatewayUrl(allocator: std.mem.Allocator, access_token: []const u8, s
 /// Best-effort QQ API response check.
 /// If payload includes a non-zero "code", treat it as an API failure.
 fn ensureQqApiSuccess(allocator: std.mem.Allocator, resp_body: []const u8) !void {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp_body, .{}) catch return;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp_body, .{}) catch return error.QQApiError;
     defer parsed.deinit();
-    if (parsed.value != .object) return;
+    if (parsed.value != .object) return error.QQApiError;
 
     const code_val = parsed.value.object.get("code") orelse return;
     const code: i64 = switch (code_val) {
@@ -1742,6 +1739,14 @@ test "qq parseUploadedFileInfo extracts file_info" {
     try std.testing.expectEqualStrings("abc123", file_info);
 }
 
+test "qq ensureQqApiSuccess validates response payload" {
+    const alloc = std.testing.allocator;
+    try ensureQqApiSuccess(alloc, "{\"code\":0,\"message\":\"ok\"}");
+    try ensureQqApiSuccess(alloc, "{\"file_info\":\"abc123\"}");
+    try std.testing.expectError(error.QQApiError, ensureQqApiSuccess(alloc, "{\"code\":40001}"));
+    try std.testing.expectError(error.QQApiError, ensureQqApiSuccess(alloc, "not-json"));
+}
+
 test "qq buildAuthHeader" {
     var buf: [256]u8 = undefined;
     const header = try buildAuthHeader(&buf, "my-access-token");
@@ -2180,17 +2185,14 @@ test "qq RECONNECT_DELAY_NS constant" {
 }
 
 test "qq DEFAULT_INTENTS has expected bits" {
-    // GUILDS (bit 0) should be set
-    try std.testing.expect(DEFAULT_INTENTS & (1 << 0) != 0);
-    // GUILD_MEMBERS (bit 1) should be set
-    try std.testing.expect(DEFAULT_INTENTS & (1 << 1) != 0);
-    // DIRECT_MESSAGE (bit 12) should be set
-    try std.testing.expect(DEFAULT_INTENTS & (1 << 12) != 0);
     // GROUP_AND_C2C_EVENT (bit 25) should be set
     try std.testing.expect(DEFAULT_INTENTS & (1 << 25) != 0);
     // PUBLIC_GUILD_MESSAGES (bit 30) should be set
     try std.testing.expect(DEFAULT_INTENTS & (1 << 30) != 0);
-    // GUILD_MESSAGES (bit 9) should NOT be set (requires private-domain)
+    // Other bits should remain unset in the default mask.
+    try std.testing.expect(DEFAULT_INTENTS & (1 << 0) == 0);
+    try std.testing.expect(DEFAULT_INTENTS & (1 << 1) == 0);
+    try std.testing.expect(DEFAULT_INTENTS & (1 << 12) == 0);
     try std.testing.expect(DEFAULT_INTENTS & (1 << 9) == 0);
 }
 
