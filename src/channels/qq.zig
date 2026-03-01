@@ -436,7 +436,47 @@ pub fn parseGatewayHost(wss_url: []const u8) []const u8 {
             break :blk no_scheme.len;
         }
     };
-    return no_scheme[0..end];
+    const host_port = no_scheme[0..end];
+    if (std.mem.lastIndexOf(u8, host_port, ":")) |colon| {
+        if (colon > 0) {
+            _ = std.fmt.parseInt(u16, host_port[colon + 1 ..], 10) catch return host_port;
+            return host_port[0..colon];
+        }
+    }
+    return host_port;
+}
+
+/// Parse port from wss:// URL.
+/// Defaults to 443 when port is absent or invalid.
+pub fn parseGatewayPort(wss_url: []const u8) u16 {
+    const no_scheme = if (std.mem.startsWith(u8, wss_url, "wss://"))
+        wss_url[6..]
+    else if (std.mem.startsWith(u8, wss_url, "ws://"))
+        wss_url[5..]
+    else
+        wss_url;
+
+    const slash_pos = std.mem.indexOf(u8, no_scheme, "/");
+    const query_pos = std.mem.indexOf(u8, no_scheme, "?");
+
+    const end = blk: {
+        if (slash_pos != null and query_pos != null) {
+            break :blk @min(slash_pos.?, query_pos.?);
+        } else if (slash_pos != null) {
+            break :blk slash_pos.?;
+        } else if (query_pos != null) {
+            break :blk query_pos.?;
+        } else {
+            break :blk no_scheme.len;
+        }
+    };
+    const host_port = no_scheme[0..end];
+    if (std.mem.lastIndexOf(u8, host_port, ":")) |colon| {
+        if (colon > 0) {
+            return std.fmt.parseInt(u16, host_port[colon + 1 ..], 10) catch 443;
+        }
+    }
+    return 443;
 }
 
 /// Parse path (and optional query) from wss:// URL.
@@ -1034,10 +1074,11 @@ pub const QQChannel = struct {
             return error.InvalidGatewayUrl;
         }
         const host = parseGatewayHost(gw_url);
+        const port = parseGatewayPort(gw_url);
         const path = parseGatewayPath(gw_url);
-        log.info("Connecting to gateway: host={s} path={s}", .{ host, path });
+        log.info("Connecting to gateway: host={s} port={d} path={s}", .{ host, port, path });
 
-        var ws = try websocket.WsClient.connect(self.allocator, host, 443, path, &.{});
+        var ws = try websocket.WsClient.connect(self.allocator, host, port, path, &.{});
 
         // Store fd for interrupt-on-stop
         self.ws_fd.store(ws.stream.handle, .release);
@@ -1426,6 +1467,16 @@ test "qq gatewayUrl returns correct urls" {
 test "qq parseGatewayHost from wss url" {
     const host = parseGatewayHost("wss://api.sgroup.qq.com/websocket");
     try std.testing.expectEqualStrings("api.sgroup.qq.com", host);
+}
+
+test "qq parseGatewayHost strips explicit port" {
+    const host = parseGatewayHost("wss://api.sgroup.qq.com:8443/websocket");
+    try std.testing.expectEqualStrings("api.sgroup.qq.com", host);
+}
+
+test "qq parseGatewayPort from wss url" {
+    try std.testing.expectEqual(@as(u16, 8443), parseGatewayPort("wss://api.sgroup.qq.com:8443/websocket"));
+    try std.testing.expectEqual(@as(u16, 443), parseGatewayPort("wss://api.sgroup.qq.com/websocket"));
 }
 
 test "qq parseGatewayPath from wss url with query" {
