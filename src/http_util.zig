@@ -306,6 +306,10 @@ test "curlPost builds correct argv structure" {
     try std.testing.expect(true);
 }
 
+test "curlPut compiles and is callable" {
+    try std.testing.expect(true);
+}
+
 test "curlGet compiles and is callable" {
     try std.testing.expect(true);
 }

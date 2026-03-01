@@ -8,7 +8,8 @@ const log = std.log.scoped(.matrix);
 /// Matrix channel via Client-Server API.
 ///
 /// - Inbound: long-poll /_matrix/client/v3/sync
-/// - Outbound: POST /_matrix/client/v3/rooms/{roomId}/send/m.room.message/{txnId}
+/// - Outbound: PUT /_matrix/client/v3/rooms/{roomId}/send/m.room.message/{txnId}
+/// - Typing: PUT /_matrix/client/v3/rooms/{roomId}/typing/{userId}
 pub const MatrixChannel = struct {
     allocator: std.mem.Allocator,
     account_id: []const u8 = "default",
