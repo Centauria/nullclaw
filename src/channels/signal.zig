@@ -1038,7 +1038,7 @@ pub const SignalChannel = struct {
 
         return try self.processEnvelope(
             allocator,
-            source orelse source_uuid,
+            source_uuid orelse source,
             source_number,
             source_name,
             timestamp_val,
