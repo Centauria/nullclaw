@@ -17,7 +17,7 @@ zig fmt src/                        # format all source files
 zig fmt --check src/                # check formatting (used by pre-commit hook)
 ```
 
-There is no single-test runner. All tests are inline in source files and run together.
+Primary validation command is `zig build test --summary all` (project-wide). Individual files can still be run with `zig test <file>.zig` when needed.
 
 ### Build Flags
 
@@ -79,7 +79,7 @@ Defined in `src/root.zig`. Phases mirror deployment dependencies:
 - `src/tools/` - Tool implementations. Each implements `Tool.VTable` (`execute`, `name`, `description`, `parameters_json`). Tools receive args as `JsonObjectMap` and return `ToolResult`. Factory in `root.zig`.
 - `src/memory/` - Layered architecture: **engines** (SQLite, Markdown, LRU, Redis, PostgreSQL, LanceDB, Lucid, API, None) and **retrieval** (hybrid search, RRF, embeddings). Engines conditionally compiled via build flags.
 - `src/security/` - Policy enforcement (`policy.zig`), pairing (`pairing.zig`), encrypted secrets (`secrets.zig`), sandbox backends (`landlock.zig`, `firejail.zig`, `bubblewrap.zig`, `docker.zig`, `detect.zig`).
-- `src/agent/` - Agent loop internals: `dispatcher.zig` (tool call parsing), `compaction.zig` (history trimming), `prompt.zig` (system prompt builder), `memory_loader.zig` (context injection), `commands.zig` (agent-mode commands). Default: 25 max tool iterations per turn, 50 message history limit.
+- `src/agent/` - Agent loop internals: `dispatcher.zig` (tool call parsing), `compaction.zig` (history trimming), `prompt.zig` (system prompt builder), `memory_loader.zig` (context injection), `commands.zig` (agent-mode commands). Config defaults are `max_tool_iterations = 1000` and `max_history_messages = 100` (see `src/config_types.zig`).
 
 ### Dependency Direction
 
@@ -87,7 +87,7 @@ Concrete implementations depend inward on vtable interfaces, config, and util. N
 
 ## Config System
 
-Config loads from `~/.nullclaw/config.json` (or `NULLCLAW_CONFIG` env var). Types are defined in `src/config_types.zig` and re-exported from `src/config.zig`.
+Config loads from `~/.nullclaw/config.json`. Runtime behavior is then adjusted by `NULLCLAW_*` environment overrides (see `Config.applyEnvOverrides()` in `src/config.zig`). Types are defined in `src/config_types.zig` and re-exported from `src/config.zig`.
 
 `Config.load()` heap-allocates an internal `ArenaAllocator`. Always call `defer cfg.deinit()` to free. In tests, wrap in a parent arena:
 
@@ -145,4 +145,3 @@ docker-compose --profile agent up     # interactive agent
 ## License
 
 MIT License.
-
