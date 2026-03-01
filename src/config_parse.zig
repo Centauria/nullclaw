@@ -679,6 +679,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (sch.object.get("max_concurrent")) |v| {
                 if (v == .integer) self.scheduler.max_concurrent = @intCast(v.integer);
             }
+            if (sch.object.get("agent_timeout_secs")) |v| {
+                if (v == .integer and v.integer >= 0) self.scheduler.agent_timeout_secs = @intCast(v.integer);
+            }
         }
     }
 
