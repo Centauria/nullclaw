@@ -8,7 +8,8 @@ const log = std.log.scoped(.matrix);
 /// Matrix channel via Client-Server API.
 ///
 /// - Inbound: long-poll /_matrix/client/v3/sync
-/// - Outbound: POST /_matrix/client/v3/rooms/{roomId}/send/m.room.message/{txnId}
+/// - Outbound: PUT /_matrix/client/v3/rooms/{roomId}/send/m.room.message/{txnId}
+/// - Typing: PUT /_matrix/client/v3/rooms/{roomId}/typing/{userId}
 pub const MatrixChannel = struct {
     allocator: std.mem.Allocator,
     account_id: []const u8 = "default",
@@ -155,7 +156,7 @@ pub const MatrixChannel = struct {
         defer self.allocator.free(auth_header);
 
         const headers = [_][]const u8{auth_header};
-        const resp = try root.http_util.curlPost(self.allocator, url, body_list.items, &headers);
+        const resp = try root.http_util.curlPut(self.allocator, url, body_list.items, &headers);
         defer self.allocator.free(resp);
 
         if (std.mem.indexOf(u8, resp, "\"event_id\"") == null) {
@@ -192,7 +193,7 @@ pub const MatrixChannel = struct {
         defer self.allocator.free(auth_header);
         const headers = [_][]const u8{auth_header};
 
-        const resp = root.http_util.curlPost(
+        const resp = root.http_util.curlPut(
             self.allocator,
             url,
             "{\"typing\":true,\"timeout\":15000}",
