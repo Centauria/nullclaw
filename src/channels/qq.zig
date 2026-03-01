@@ -212,35 +212,6 @@ fn extractImageMarkers(allocator: std.mem.Allocator, payload: std.json.Value) ![
 /// Runtime dedup capacity, aligned with zeroclaw (10k keys, evict half).
 pub const DEDUP_CAPACITY: usize = 10_000;
 
-pub const DEDUP_RING_SIZE: usize = 1024;
-
-/// Ring buffer for message ID deduplication.
-/// Stores the last DEDUP_RING_SIZE message IDs in a circular buffer.
-pub const DedupRing = struct {
-    buf: [DEDUP_RING_SIZE]u64 = [_]u64{0} ** DEDUP_RING_SIZE,
-    idx: u32 = 0,
-    count: u32 = 0,
-
-    /// Check if message_id was already seen. If not, record it and return false.
-    /// Returns true if the message is a duplicate.
-    pub fn isDuplicate(self: *DedupRing, message_id: u64) bool {
-        const check_count = @min(self.count, DEDUP_RING_SIZE);
-        for (0..check_count) |i| {
-            if (self.buf[i] == message_id) return true;
-        }
-        self.buf[self.idx] = message_id;
-        self.idx = @intCast((self.idx + 1) % @as(u32, DEDUP_RING_SIZE));
-        if (self.count < DEDUP_RING_SIZE) self.count += 1;
-        return false;
-    }
-
-    /// Reset the ring buffer.
-    pub fn reset(self: *DedupRing) void {
-        self.idx = 0;
-        self.count = 0;
-    }
-};
-
 pub const StringDedupSet = struct {
     seen: std.StringHashMapUnmanaged(void) = .empty,
     order: std.ArrayListUnmanaged([]u8) = .empty,
@@ -747,8 +718,8 @@ pub const QQChannel = struct {
     config: config_types.QQConfig,
     allocator: std.mem.Allocator,
     event_bus: ?*bus.Bus,
-    dedup_ring: DedupRing,
     dedup_set: StringDedupSet = .{},
+    dedup_allocator: std.mem.Allocator,
     sequence: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
     has_sequence: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     heartbeat_interval_ms: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -773,7 +744,7 @@ pub const QQChannel = struct {
             .config = config,
             .allocator = allocator,
             .event_bus = null,
-            .dedup_ring = .{},
+            .dedup_allocator = if (builtin.is_test) std.heap.page_allocator else allocator,
             .session_id = null,
         };
     }
@@ -820,11 +791,7 @@ pub const QQChannel = struct {
 
     fn isDuplicateMessageId(self: *QQChannel, msg_id: []const u8) bool {
         if (msg_id.len == 0) return false;
-
-        if (comptime builtin.is_test) {
-            return self.dedup_ring.isDuplicate(std.hash.Fnv1a_64.hash(msg_id));
-        }
-        return self.dedup_set.isDuplicate(self.allocator, msg_id) catch false;
+        return self.dedup_set.isDuplicate(self.dedup_allocator, msg_id) catch false;
     }
 
     // ── Incoming event handling ──────────────────────────────────────
@@ -1438,8 +1405,7 @@ pub const QQChannel = struct {
             self.allocator.free(tok);
             self.access_token = null;
         }
-        self.dedup_ring.reset();
-        self.dedup_set.deinit(self.allocator);
+        self.dedup_set.deinit(self.dedup_allocator);
         self.dedup_set = .{};
         log.info("QQ channel stopped", .{});
     }
@@ -1787,34 +1753,29 @@ test "qq extractMentionQQ malformed returns null" {
     try std.testing.expect(extractMentionQQ("[CQ:at,qq=") == null);
 }
 
-test "qq dedup ring basic" {
-    var ring = DedupRing{};
-    try std.testing.expect(!ring.isDuplicate(100));
-    try std.testing.expect(ring.isDuplicate(100));
-    try std.testing.expect(!ring.isDuplicate(200));
-    try std.testing.expect(ring.isDuplicate(200));
+test "qq string dedup set basic behavior" {
+    const alloc = std.testing.allocator;
+    var dedup = StringDedupSet{};
+    defer dedup.deinit(alloc);
+
+    try std.testing.expect(!(try dedup.isDuplicate(alloc, "msg-1")));
+    try std.testing.expect(try dedup.isDuplicate(alloc, "msg-1"));
+    try std.testing.expect(!(try dedup.isDuplicate(alloc, "msg-2")));
 }
 
-test "qq dedup ring wraps around" {
-    var ring = DedupRing{};
-    for (1..DEDUP_RING_SIZE + 1) |i| {
-        try std.testing.expect(!ring.isDuplicate(@intCast(i)));
-    }
-    for (1..DEDUP_RING_SIZE + 1) |i| {
-        try std.testing.expect(ring.isDuplicate(@intCast(i)));
-    }
-    // Push one more — should evict the oldest (1)
-    try std.testing.expect(!ring.isDuplicate(DEDUP_RING_SIZE + 1));
-    // ID 1 was evicted, so it should no longer be found
-    try std.testing.expect(!ring.isDuplicate(1));
-}
+test "qq string dedup set evicts half at capacity" {
+    const alloc = std.testing.allocator;
+    var dedup = StringDedupSet{};
+    defer dedup.deinit(alloc);
 
-test "qq dedup ring reset" {
-    var ring = DedupRing{};
-    _ = ring.isDuplicate(42);
-    try std.testing.expect(ring.isDuplicate(42));
-    ring.reset();
-    try std.testing.expect(!ring.isDuplicate(42));
+    var i: usize = 0;
+    while (i < DEDUP_CAPACITY + 1) : (i += 1) {
+        const key = try std.fmt.allocPrint(alloc, "msg-{d}", .{i});
+        defer alloc.free(key);
+        try std.testing.expect(!(try dedup.isDuplicate(alloc, key)));
+    }
+
+    try std.testing.expect(dedup.order.items.len <= DEDUP_CAPACITY);
 }
 
 test "qq buildIdentifyPayload" {
