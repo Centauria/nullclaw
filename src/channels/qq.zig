@@ -331,6 +331,7 @@ pub const QQChannel = struct {
     gateway_thread: ?std.Thread = null,
     heartbeat_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     ws_fd: std.atomic.Value(std.posix.socket_t) = std.atomic.Value(std.posix.socket_t).init(invalid_socket),
+    token_mu: std.Thread.Mutex = .{},
 
     // ── Access token state ──
     access_token: ?[]u8 = null,
@@ -372,17 +373,18 @@ pub const QQChannel = struct {
     /// Ensure a valid access_token is available, fetching or refreshing as needed.
     /// Returns the current access_token slice (owned by self).
     fn ensureAccessToken(self: *QQChannel) ![]const u8 {
+        self.token_mu.lock();
+        defer self.token_mu.unlock();
+
         const now = std.time.timestamp();
         if (self.access_token) |tok| {
             if (now < self.token_expires_at - TOKEN_REFRESH_MARGIN_SECS) {
                 return tok;
             }
-            // Token expired or about to expire — free and re-fetch
-            self.allocator.free(tok);
-            self.access_token = null;
         }
 
         const result = try fetchAccessToken(self.allocator, self.config.app_id, self.config.app_secret);
+        if (self.access_token) |old| self.allocator.free(old);
         self.access_token = result.token;
         self.token_expires_at = now + result.expires_in;
         log.info("Access token obtained (expires_in={d}s)", .{result.expires_in});
@@ -546,7 +548,7 @@ pub const QQChannel = struct {
 
         // Extract content and strip CQ codes
         const raw_content = getJsonStringFromObj(d, "content") orelse "";
-        log.info("handleMessageCreate: raw_content='{s}'", .{raw_content});
+        log.debug("handleMessageCreate: raw_content_len={d}", .{raw_content.len});
         const content = stripCqCodes(self.allocator, raw_content) catch |err| {
             log.info("handleMessageCreate: DROPPED — stripCqCodes failed: {}", .{err});
             return;
@@ -669,8 +671,6 @@ pub const QQChannel = struct {
         const body = try buildSendBody(self.allocator, text, msg_id);
         defer self.allocator.free(body);
 
-        log.info("sendChunk: body={s}", .{body});
-
         const token = self.ensureAccessToken() catch |err| {
             log.err("Access token fetch failed for sendChunk: {}", .{err});
             return error.QQApiError;
@@ -686,7 +686,7 @@ pub const QQChannel = struct {
             log.err("QQ API POST failed: {}", .{err});
             return error.QQApiError;
         };
-        log.info("sendChunk: API response={s}", .{resp});
+        log.debug("sendChunk: API response_len={d}", .{resp.len});
         self.allocator.free(resp);
     }
 
@@ -721,6 +721,8 @@ pub const QQChannel = struct {
             self.allocator.free(sid);
             self.session_id = null;
         }
+        self.token_mu.lock();
+        defer self.token_mu.unlock();
         if (self.access_token) |tok| {
             self.allocator.free(tok);
             self.access_token = null;
@@ -818,7 +820,7 @@ pub const QQChannel = struct {
         // Read HELLO (first message from server)
         const hello_text = try ws.readTextMessage() orelse return error.ConnectionClosed;
         defer self.allocator.free(hello_text);
-        log.info("Received HELLO: {s}", .{hello_text[0..@min(hello_text.len, 200)]});
+        log.info("Received HELLO frame", .{});
         try self.handleGatewayEvent(hello_text);
 
         if (self.heartbeat_interval_ms == 0) {
@@ -839,7 +841,7 @@ pub const QQChannel = struct {
         // Read READY (dispatch with t=READY)
         const ready_text = try ws.readTextMessage() orelse return error.ConnectionClosed;
         defer self.allocator.free(ready_text);
-        log.info("Received: {s}", .{ready_text[0..@min(ready_text.len, 200)]});
+        log.info("Received READY frame", .{});
         try self.handleGatewayEvent(ready_text);
 
         // INVALID_SESSION after IDENTIFY means token/credentials are wrong
@@ -864,10 +866,7 @@ pub const QQChannel = struct {
             };
             defer self.allocator.free(text);
 
-            // Debug: show received event (truncated)
-            if (text.len > 0) {
-                log.info("Event: {s}", .{text[0..@min(text.len, 300)]});
-            }
+            log.debug("Gateway event received: len={d}", .{text.len});
 
             self.handleGatewayEvent(text) catch |err| {
                 log.err("Gateway event error: {}", .{err});
