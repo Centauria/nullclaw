@@ -1,8 +1,8 @@
 """Deploy nullclaw Matrix gateway on Modal.
 
 Secrets are loaded from .env via modal.Secret.from_dotenv() and injected
-into config.json at container startup — they never touch the config file
-on disk.
+into config.json at container startup. The patched config is written only
+inside the running container filesystem.
 
 Optional Tailscale integration: set TAILSCALE_AUTHKEY in .env to join
 your tailnet and SSH into the container.

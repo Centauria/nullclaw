@@ -6,7 +6,7 @@ Deploy nullclaw with multiple agents in a shared Matrix room on [Modal](https://
 
 Two agents — planner and builder — run as separate Matrix bot accounts in the same room. Messages from each bot are visible in the room, so you can watch the agents collaborate.
 
-Secrets flow: `.env` (local) → `modal.Secret.from_dotenv()` → container env vars → `inject_secrets()` patches config in-memory → nullclaw starts with real credentials. Secrets never touch config files on disk.
+Secrets flow: `.env` (local) → `modal.Secret.from_dotenv()` → container env vars → `inject_secrets()` patches config at startup → nullclaw starts with real credentials. Patched config is written only inside the running container (`/nullclaw-data/.nullclaw/config.json`) and is not tracked in git.
 
 ## Prerequisites
 
