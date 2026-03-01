@@ -714,7 +714,9 @@ pub const QQChannel = struct {
     }
 
     pub fn healthCheck(self: *QQChannel) bool {
-        return self.running.load(.acquire);
+        const result = fetchAccessToken(self.allocator, self.config.app_id, self.config.app_secret) catch return false;
+        self.allocator.free(result.token);
+        return true;
     }
 
     /// Set the event bus for publishing inbound messages.
@@ -924,7 +926,7 @@ pub const QQChannel = struct {
         }
 
         // Allowlist check
-        if (self.config.allow_from.len > 0 and !root.isAllowed(self.config.allow_from, sender_id)) {
+        if (!root.isAllowed(self.config.allow_from, sender_id)) {
             log.info("handleMessageCreate: DROPPED — sender '{s}' not in allow_from", .{sender_id});
             return;
         }
@@ -1042,7 +1044,7 @@ pub const QQChannel = struct {
     ///   "group:<group_openid>"  — group message
     ///   "c2c:<user_openid>"     — C2C private message
     ///   "user:<user_openid>"    — alias for c2c
-    ///   "<channel_id>"          — defaults to guild channel
+    ///   "<user_openid>"         — defaults to c2c (zeroclaw parity)
     pub fn sendMessage(self: *QQChannel, target: []const u8, text: []const u8) !void {
         const parsed_target = parseTarget(target);
         const msg_type = parsed_target[0];
@@ -1494,7 +1496,7 @@ pub const QQChannel = struct {
 /// "dm:12345"                   -> ("dm", "12345", null)
 /// "group:<openid>:<msg_id>"    -> ("group", "<openid>", "<msg_id>")
 /// "c2c:<openid>:<msg_id>"      -> ("c2c", "<openid>", "<msg_id>")
-/// "12345"                      -> ("channel", "12345", null)
+/// "12345"                      -> ("c2c", "12345", null)
 fn parseTarget(target: []const u8) struct { []const u8, []const u8, ?[]const u8 } {
     if (std.mem.indexOf(u8, target, ":")) |first_colon| {
         const raw_msg_type = target[0..first_colon];
@@ -1508,7 +1510,7 @@ fn parseTarget(target: []const u8) struct { []const u8, []const u8, ?[]const u8 
         }
         return .{ msg_type, rest, null };
     }
-    return .{ "channel", target, null };
+    return .{ "c2c", target, null };
 }
 
 /// Get a string field from a JSON object value.
@@ -1820,9 +1822,9 @@ test "qq parseTarget dm prefix" {
     try std.testing.expect(mid == null);
 }
 
-test "qq parseTarget no prefix defaults to channel" {
+test "qq parseTarget no prefix defaults to c2c" {
     const msg_type, const id, const mid = parseTarget("12345");
-    try std.testing.expectEqualStrings("channel", msg_type);
+    try std.testing.expectEqualStrings("c2c", msg_type);
     try std.testing.expectEqualStrings("12345", id);
     try std.testing.expect(mid == null);
 }
@@ -1876,7 +1878,7 @@ test "qq QQChannel init stores config" {
     try std.testing.expectEqualStrings("mytoken", ch.config.bot_token);
     try std.testing.expect(ch.config.sandbox);
     try std.testing.expectEqualStrings("qq", ch.channelName());
-    try std.testing.expect(!ch.healthCheck());
+    try std.testing.expect(ch.healthCheck());
     try std.testing.expect(!ch.has_sequence.load(.acquire));
     try std.testing.expectEqual(@as(u32, 0), ch.heartbeat_interval_ms.load(.acquire));
 }
@@ -1928,7 +1930,7 @@ test "qq handleGatewayEvent MESSAGE_CREATE" {
     var event_bus_inst = bus.Bus.init();
     defer event_bus_inst.close();
 
-    var ch = QQChannel.init(alloc, .{ .account_id = "qq-main" });
+    var ch = QQChannel.init(alloc, .{ .account_id = "qq-main", .allow_from = &.{"*"} });
     ch.setBus(&event_bus_inst);
     ch.running.store(true, .release);
 
@@ -1958,7 +1960,7 @@ test "qq handleGatewayEvent MESSAGE_CREATE accepts msg_id fallback" {
     var event_bus_inst = bus.Bus.init();
     defer event_bus_inst.close();
 
-    var ch = QQChannel.init(alloc, .{ .account_id = "qq-main" });
+    var ch = QQChannel.init(alloc, .{ .account_id = "qq-main", .allow_from = &.{"*"} });
     ch.setBus(&event_bus_inst);
     ch.running.store(true, .release);
 
@@ -1977,7 +1979,7 @@ test "qq handleGatewayEvent metadata escapes dynamic strings" {
     var event_bus_inst = bus.Bus.init();
     defer event_bus_inst.close();
 
-    var ch = QQChannel.init(alloc, .{ .account_id = "qq-main" });
+    var ch = QQChannel.init(alloc, .{ .account_id = "qq-main", .allow_from = &.{"*"} });
     ch.setBus(&event_bus_inst);
     ch.running.store(true, .release);
 
@@ -2002,7 +2004,7 @@ test "qq handleGatewayEvent DIRECT_MESSAGE_CREATE" {
     var event_bus_inst = bus.Bus.init();
     defer event_bus_inst.close();
 
-    var ch = QQChannel.init(alloc, .{});
+    var ch = QQChannel.init(alloc, .{ .allow_from = &.{"*"} });
     ch.setBus(&event_bus_inst);
     ch.running.store(true, .release);
 
@@ -2025,7 +2027,7 @@ test "qq handleGatewayEvent deduplication" {
     var event_bus_inst = bus.Bus.init();
     defer event_bus_inst.close();
 
-    var ch = QQChannel.init(alloc, .{});
+    var ch = QQChannel.init(alloc, .{ .allow_from = &.{"*"} });
     ch.setBus(&event_bus_inst);
 
     const msg_json =
@@ -2051,6 +2053,7 @@ test "qq handleGatewayEvent group allowlist filters" {
     var ch = QQChannel.init(alloc, .{
         .group_policy = .allowlist,
         .allowed_groups = &list,
+        .allow_from = &.{"*"},
     });
     ch.setBus(&event_bus_inst);
 
@@ -2070,6 +2073,21 @@ test "qq handleGatewayEvent group allowlist filters" {
 
     var msg = event_bus_inst.consumeInbound().?;
     msg.deinit(alloc);
+}
+
+test "qq handleGatewayEvent drops sender when allow_from empty" {
+    const alloc = std.testing.allocator;
+    var event_bus_inst = bus.Bus.init();
+    defer event_bus_inst.close();
+
+    var ch = QQChannel.init(alloc, .{});
+    ch.setBus(&event_bus_inst);
+
+    const msg_json =
+        \\{"op":0,"s":15,"t":"C2C_MESSAGE_CREATE","d":{"id":"msg-denied","author":{"user_openid":"user-1"},"content":"hello"}}
+    ;
+    try ch.handleGatewayEvent(msg_json);
+    try std.testing.expectEqual(@as(usize, 0), event_bus_inst.inboundDepth());
 }
 
 test "qq handleGatewayEvent RECONNECT sets running false" {
@@ -2125,7 +2143,7 @@ test "qq handleGatewayEvent empty message content ignored" {
     var event_bus_inst = bus.Bus.init();
     defer event_bus_inst.close();
 
-    var ch = QQChannel.init(alloc, .{});
+    var ch = QQChannel.init(alloc, .{ .allow_from = &.{"*"} });
     ch.setBus(&event_bus_inst);
 
     const msg_json =
@@ -2140,7 +2158,7 @@ test "qq handleGatewayEvent strips CQ codes from content" {
     var event_bus_inst = bus.Bus.init();
     defer event_bus_inst.close();
 
-    var ch = QQChannel.init(alloc, .{});
+    var ch = QQChannel.init(alloc, .{ .allow_from = &.{"*"} });
     ch.setBus(&event_bus_inst);
 
     const msg_json =
@@ -2293,7 +2311,7 @@ test "qq handleGatewayEvent C2C_MESSAGE_CREATE" {
     var event_bus_inst = bus.Bus.init();
     defer event_bus_inst.close();
 
-    var ch = QQChannel.init(alloc, .{ .account_id = "qq-test" });
+    var ch = QQChannel.init(alloc, .{ .account_id = "qq-test", .allow_from = &.{"*"} });
     ch.setBus(&event_bus_inst);
     ch.running.store(true, .release);
 
@@ -2316,7 +2334,7 @@ test "qq handleGatewayEvent C2C_MESSAGE_CREATE prefers user_openid sender" {
     var event_bus_inst = bus.Bus.init();
     defer event_bus_inst.close();
 
-    var ch = QQChannel.init(alloc, .{ .account_id = "qq-test" });
+    var ch = QQChannel.init(alloc, .{ .account_id = "qq-test", .allow_from = &.{"*"} });
     ch.setBus(&event_bus_inst);
     ch.running.store(true, .release);
 
@@ -2336,7 +2354,7 @@ test "qq handleGatewayEvent C2C_MESSAGE_CREATE includes image attachment marker"
     var event_bus_inst = bus.Bus.init();
     defer event_bus_inst.close();
 
-    var ch = QQChannel.init(alloc, .{ .account_id = "qq-test" });
+    var ch = QQChannel.init(alloc, .{ .account_id = "qq-test", .allow_from = &.{"*"} });
     ch.setBus(&event_bus_inst);
     ch.running.store(true, .release);
 
@@ -2355,7 +2373,7 @@ test "qq handleGatewayEvent GROUP_AT_MESSAGE_CREATE" {
     var event_bus_inst = bus.Bus.init();
     defer event_bus_inst.close();
 
-    var ch = QQChannel.init(alloc, .{ .account_id = "qq-test" });
+    var ch = QQChannel.init(alloc, .{ .account_id = "qq-test", .allow_from = &.{"*"} });
     ch.setBus(&event_bus_inst);
     ch.running.store(true, .release);
 
@@ -2377,7 +2395,7 @@ test "qq handleGatewayEvent GROUP_AT_MESSAGE_CREATE prefers member_openid sender
     var event_bus_inst = bus.Bus.init();
     defer event_bus_inst.close();
 
-    var ch = QQChannel.init(alloc, .{ .account_id = "qq-test" });
+    var ch = QQChannel.init(alloc, .{ .account_id = "qq-test", .allow_from = &.{"*"} });
     ch.setBus(&event_bus_inst);
     ch.running.store(true, .release);
 
@@ -2397,7 +2415,7 @@ test "qq handleGatewayEvent C2C_MESSAGE_CREATE falls back to author id" {
     var event_bus_inst = bus.Bus.init();
     defer event_bus_inst.close();
 
-    var ch = QQChannel.init(alloc, .{ .account_id = "qq-test" });
+    var ch = QQChannel.init(alloc, .{ .account_id = "qq-test", .allow_from = &.{"*"} });
     ch.setBus(&event_bus_inst);
     ch.running.store(true, .release);
 
@@ -2417,7 +2435,7 @@ test "qq handleGatewayEvent GROUP_AT_MESSAGE_CREATE falls back to group_id" {
     var event_bus_inst = bus.Bus.init();
     defer event_bus_inst.close();
 
-    var ch = QQChannel.init(alloc, .{ .account_id = "qq-test" });
+    var ch = QQChannel.init(alloc, .{ .account_id = "qq-test", .allow_from = &.{"*"} });
     ch.setBus(&event_bus_inst);
     ch.running.store(true, .release);
 
@@ -2436,7 +2454,7 @@ test "qq handleGatewayEvent GROUP_AT_MESSAGE_CREATE drops when group id missing"
     var event_bus_inst = bus.Bus.init();
     defer event_bus_inst.close();
 
-    var ch = QQChannel.init(alloc, .{ .account_id = "qq-test" });
+    var ch = QQChannel.init(alloc, .{ .account_id = "qq-test", .allow_from = &.{"*"} });
     ch.setBus(&event_bus_inst);
     ch.running.store(true, .release);
 
