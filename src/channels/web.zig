@@ -23,6 +23,12 @@ pub const WebChannel = struct {
         generated,
     };
 
+    const LocalTokenSource = enum {
+        config,
+        env,
+        ephemeral,
+    };
+
     const RelayTokenResolution = struct {
         token: []u8,
         source: RelayTokenSource,
@@ -49,6 +55,7 @@ pub const WebChannel = struct {
     const MessageAuthMode = enum {
         pairing,
         token,
+        invalid,
     };
 
     allocator: std.mem.Allocator,
@@ -148,7 +155,8 @@ pub const WebChannel = struct {
 
     fn parseMessageAuthMode(raw: []const u8) MessageAuthMode {
         if (config_types.WebConfig.isTokenMessageAuthMode(raw)) return .token;
-        return .pairing;
+        if (config_types.WebConfig.isValidMessageAuthMode(raw)) return .pairing;
+        return .invalid;
     }
 
     pub fn channel(self: *WebChannel) root.Channel {
@@ -409,17 +417,22 @@ pub const WebChannel = struct {
 
     fn initRelaySecurityState(self: *WebChannel) !void {
         self.deinitRelaySecurityState();
-        if (try self.loadPersistedUiJwtSigningKey()) {
-            log.info("Web UI JWT signing key loaded from persisted store", .{});
-        } else {
-            std.crypto.random.bytes(&self.jwt_signing_key);
-            self.persistUiJwtSigningKey();
-            log.info("Web UI JWT signing key generated and persisted", .{});
-        }
-        self.jwt_ready = true;
         const pairing_enabled = !(self.transport == .local and self.message_auth_mode == .token);
+        if (pairing_enabled) {
+            if (try self.loadPersistedUiJwtSigningKey()) {
+                log.info("Web UI JWT signing key loaded from persisted store", .{});
+            } else {
+                std.crypto.random.bytes(&self.jwt_signing_key);
+                self.persistUiJwtSigningKey();
+                log.info("Web UI JWT signing key generated and persisted", .{});
+            }
+            self.jwt_ready = true;
+        } else {
+            self.jwt_ready = false;
+            @memset(self.jwt_signing_key[0..], 0);
+        }
         self.relay_pairing_guard = try pairing_mod.PairingGuard.init(self.allocator, pairing_enabled, &.{});
-        self.relay_pairing_issued_at = std.time.timestamp();
+        self.relay_pairing_issued_at = if (pairing_enabled) std.time.timestamp() else 0;
 
         if (self.transport == .local) {
             if (pairing_enabled) {
@@ -970,14 +983,29 @@ pub const WebChannel = struct {
 
     fn wsStart(ctx: *anyopaque) anyerror!void {
         const self: *WebChannel = @ptrCast(@alignCast(ctx));
+        if (self.message_auth_mode == .invalid) {
+            log.warn("Web channel start failed: channels.web.message_auth_mode must be 'pairing' or 'token'", .{});
+            return error.InvalidConfiguration;
+        }
+        if (self.transport == .relay and self.message_auth_mode == .token) {
+            log.warn("Web channel start failed: message_auth_mode=token is supported only for local transport", .{});
+            return error.InvalidConfiguration;
+        }
         switch (self.transport) {
             .local => try self.startLocalTransport(),
             .relay => try self.startRelayTransport(),
         }
     }
 
+    fn ensureLocalTokenSourceCompatible(self: *const WebChannel, token_source: LocalTokenSource) !void {
+        if (self.message_auth_mode == .token and token_source == .ephemeral) {
+            log.warn("Web channel message_auth_mode=token requires stable auth token from config (channels.web.auth_token) or env (NULLCLAW_WEB_TOKEN/NULLCLAW_GATEWAY_TOKEN/OPENCLAW_GATEWAY_TOKEN)", .{});
+            return error.InvalidConfiguration;
+        }
+    }
+
     fn startLocalTransport(self: *WebChannel) !void {
-        var token_source: enum { config, env, ephemeral } = .ephemeral;
+        var token_source: LocalTokenSource = .ephemeral;
         if (self.configured_auth_token) |token| {
             try self.setActiveToken(token);
             token_source = .config;
@@ -990,10 +1018,7 @@ pub const WebChannel = struct {
             log.warn("Web channel using ephemeral auth token for this run", .{});
         }
 
-        if (self.message_auth_mode == .token and token_source == .ephemeral) {
-            log.err("Web channel message_auth_mode=token requires stable auth token from config (channels.web.auth_token) or env (NULLCLAW_WEB_TOKEN/NULLCLAW_GATEWAY_TOKEN/OPENCLAW_GATEWAY_TOKEN)", .{});
-            return error.InvalidConfiguration;
-        }
+        try self.ensureLocalTokenSourceCompatible(token_source);
 
         try self.initRelaySecurityState();
         errdefer self.deinitRelaySecurityState();
@@ -1382,6 +1407,10 @@ pub const WebChannel = struct {
                     self.sendRelayError(session_id, request_id, "unauthorized", "auth_token is invalid");
                     return;
                 }
+            },
+            .invalid => {
+                self.sendRelayError(session_id, request_id, "invalid_configuration", "message_auth_mode is invalid");
+                return;
             },
         }
 
@@ -1814,6 +1843,29 @@ test "WebChannel initFromConfig uses custom values" {
     try std.testing.expectEqual(@as(usize, 2), ch.allowed_origins.len);
 }
 
+test "WebChannel parseMessageAuthMode marks unsupported mode as invalid" {
+    try std.testing.expectEqual(WebChannel.MessageAuthMode.pairing, WebChannel.parseMessageAuthMode("pairing"));
+    try std.testing.expectEqual(WebChannel.MessageAuthMode.token, WebChannel.parseMessageAuthMode("token"));
+    try std.testing.expectEqual(WebChannel.MessageAuthMode.invalid, WebChannel.parseMessageAuthMode("jwt"));
+}
+
+test "WebChannel wsStart fails fast for invalid message auth mode" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "local",
+        .message_auth_mode = "jwt",
+    });
+    try std.testing.expectError(error.InvalidConfiguration, ch.channel().vtable.start(ch.channel().ptr));
+}
+
+test "WebChannel wsStart rejects token mode for relay transport" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "relay",
+        .message_auth_mode = "token",
+        .relay_url = "wss://relay.nullclaw.io/ws/agent",
+    });
+    try std.testing.expectError(error.InvalidConfiguration, ch.channel().vtable.start(ch.channel().ptr));
+}
+
 test "WebChannel initFromConfig maps relay transport settings" {
     const ch = WebChannel.initFromConfig(std.testing.allocator, .{
         .transport = "relay",
@@ -2090,6 +2142,30 @@ test "WebChannel local token mode rejects user_message without token" {
     try std.testing.expectEqual(@as(usize, 0), bus.inboundDepth());
 }
 
+test "WebChannel local token mode rejects user_message with invalid token" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "local",
+        .message_auth_mode = "token",
+    });
+    try ch.setActiveToken("token-mode-1234567890");
+
+    var bus = bus_mod.Bus.init();
+    ch.setBus(&bus);
+    ch.handleInboundEvent("{\"v\":1,\"type\":\"user_message\",\"session_id\":\"sess-token\",\"payload\":{\"auth_token\":\"wrong-token-xxxxxxxx\",\"content\":\"hello\"}}", null);
+
+    try std.testing.expectEqual(@as(usize, 0), bus.inboundDepth());
+}
+
+test "WebChannel local token mode requires stable token source before start" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "local",
+        .message_auth_mode = "token",
+    });
+    try std.testing.expectError(error.InvalidConfiguration, ch.ensureLocalTokenSourceCompatible(.ephemeral));
+    try ch.ensureLocalTokenSourceCompatible(.config);
+    try ch.ensureLocalTokenSourceCompatible(.env);
+}
+
 test "WebChannel local token mode ignores pairing_request events" {
     var ch = WebChannel.initFromConfig(std.testing.allocator, .{
         .transport = "local",
@@ -2125,6 +2201,23 @@ test "WebChannel relay UI access token verify and tamper detect" {
     defer std.testing.allocator.free(tampered);
     tampered[tampered.len - 1] = if (tampered[tampered.len - 1] == 'a') 'b' else 'a';
     try std.testing.expect(ch.verifyUiAccessToken(tampered) == null);
+}
+
+test "WebChannel token mode does not initialize JWT signing state" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "local",
+        .message_auth_mode = "token",
+    });
+    defer ch.deinitRelaySecurityState();
+    try ch.initRelaySecurityState();
+
+    try std.testing.expect(!ch.jwt_ready);
+    try std.testing.expect(ch.relay_pairing_guard != null);
+    try std.testing.expect(!ch.relay_pairing_guard.?.requirePairing());
+    try std.testing.expect(ch.relay_pairing_guard.?.pairingCode() == null);
+    for (ch.jwt_signing_key) |b| {
+        try std.testing.expectEqual(@as(u8, 0), b);
+    }
 }
 
 test "WebChannel relay e2e payload helpers roundtrip" {
