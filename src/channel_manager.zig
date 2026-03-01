@@ -31,7 +31,7 @@ const log = std.log.scoped(.channel_manager);
 pub const ListenerType = enum {
     /// Telegram, Signal — poll in a loop
     polling,
-    /// Discord, Mattermost, Slack, IRC, QQ, OneBot — internal socket/WebSocket loop
+    /// Discord, Mattermost, Slack, IRC, QQ(websocket), OneBot — internal socket/WebSocket loop
     gateway_loop,
     /// WhatsApp, Line, Lark — HTTP gateway receives
     webhook_only,
@@ -208,7 +208,10 @@ pub const ChannelManager = struct {
         const account_id = accountIdFromConfig(cfg);
         try self.registry.registerWithAccount(ch, account_id);
 
-        const listener_type = comptime listenerTypeForField(field_name);
+        var listener_type = comptime listenerTypeForField(field_name);
+        if (comptime std.mem.eql(u8, field_name, "qq")) {
+            listener_type = if (cfg.receive_mode == .webhook) .webhook_only else .gateway_loop;
+        }
         try self.entries.append(self.allocator, .{
             .name = field_name,
             .account_id = account_id,
@@ -750,6 +753,7 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
             .app_id = "appid",
             .app_secret = "appsecret",
             .bot_token = "bottoken",
+            .receive_mode = .websocket,
         },
     };
     const onebot_accounts = [_]@import("config_types.zig").OneBotConfig{
@@ -1022,6 +1026,44 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
         try std.testing.expectEqual(@as(usize, 1), slack_ptr.policy.allowlist.len);
         try std.testing.expectEqualStrings("slack-admin", slack_ptr.policy.allowlist[0]);
     }
+}
+
+test "ChannelManager marks qq webhook receive_mode as webhook_only" {
+    if (!channel_catalog.isBuildEnabled(.qq)) return;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const qq_accounts = [_]config_types.QQConfig{
+        .{
+            .account_id = "qq-main",
+            .app_id = "appid",
+            .app_secret = "appsecret",
+            .bot_token = "bottoken",
+            .receive_mode = .webhook,
+        },
+    };
+
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .channels = .{
+            .qq = &qq_accounts,
+        },
+    };
+
+    var reg = dispatch.ChannelRegistry.init(allocator);
+    defer reg.deinit();
+
+    const mgr = try ChannelManager.init(allocator, &config, &reg);
+    defer mgr.deinit();
+
+    try mgr.collectConfiguredChannels();
+    const qq_entry = findEntryByNameAccount(mgr.channelEntries(), "qq", "qq-main") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(ListenerType.webhook_only, qq_entry.listener_type);
 }
 
 test "ChannelManager collects web channel from config" {
