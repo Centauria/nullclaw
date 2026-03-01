@@ -115,6 +115,68 @@ fn isImageFilename(filename: []const u8) bool {
         endsWithIgnoreCase(filename, ".svg");
 }
 
+fn isRemoteMediaUrl(url: []const u8) bool {
+    const trimmed = std.mem.trim(u8, url, " \t\r\n");
+    return std.mem.startsWith(u8, trimmed, "https://") or std.mem.startsWith(u8, trimmed, "http://");
+}
+
+fn parseImageMarkerLine(line: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, line, " \t\r\n");
+    const prefix = "[IMAGE:";
+    if (!std.mem.startsWith(u8, trimmed, prefix)) return null;
+    if (trimmed.len < 8 or trimmed[trimmed.len - 1] != ']') return null;
+    const marker = std.mem.trim(u8, trimmed[prefix.len .. trimmed.len - 1], " \t\r\n");
+    if (marker.len == 0) return null;
+    return marker;
+}
+
+const ParsedOutgoingContent = struct {
+    text: []u8,
+    image_urls: [][]u8,
+
+    pub fn deinit(self: *ParsedOutgoingContent, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        for (self.image_urls) |url| allocator.free(url);
+        allocator.free(self.image_urls);
+    }
+};
+
+/// Split outbound content into text and remote [IMAGE:URL] markers.
+/// Non-remote markers stay in text; remote image URLs are extracted for media upload.
+fn parseOutgoingContent(allocator: std.mem.Allocator, content: []const u8) !ParsedOutgoingContent {
+    var passthrough: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer passthrough.deinit(allocator);
+    var image_urls: std.ArrayListUnmanaged([]u8) = .empty;
+    errdefer {
+        for (image_urls.items) |url| allocator.free(url);
+        image_urls.deinit(allocator);
+    }
+
+    var line_it = std.mem.splitScalar(u8, content, '\n');
+    var first_line = true;
+    while (line_it.next()) |line| {
+        if (parseImageMarkerLine(line)) |marker_target| {
+            if (isRemoteMediaUrl(marker_target)) {
+                try image_urls.append(allocator, try allocator.dupe(u8, marker_target));
+                continue;
+            }
+        }
+
+        if (!first_line) try passthrough.append(allocator, '\n');
+        first_line = false;
+        try passthrough.appendSlice(allocator, line);
+    }
+
+    const trimmed_text = std.mem.trim(u8, passthrough.items, " \t\r\n");
+    const text = try allocator.dupe(u8, trimmed_text);
+    passthrough.deinit(allocator);
+
+    return .{
+        .text = text,
+        .image_urls = try image_urls.toOwnedSlice(allocator),
+    };
+}
+
 /// Extract image attachment markers as newline-joined "[IMAGE:<url>]".
 /// Caller owns returned slice.
 fn extractImageMarkers(allocator: std.mem.Allocator, payload: std.json.Value) ![]u8 {
@@ -242,6 +304,24 @@ pub fn buildC2cSendUrl(buf: []u8, base: []const u8, user_openid: []const u8) ![]
     return fbs.getWritten();
 }
 
+/// Build the REST API URL for uploading a group media file descriptor.
+/// Format: {base}/v2/groups/{group_openid}/files
+pub fn buildGroupFilesUrl(buf: []u8, base: []const u8, group_openid: []const u8) ![]const u8 {
+    var fbs = std.io.fixedBufferStream(buf);
+    const w = fbs.writer();
+    try w.print("{s}/v2/groups/{s}/files", .{ base, group_openid });
+    return fbs.getWritten();
+}
+
+/// Build the REST API URL for uploading a C2C media file descriptor.
+/// Format: {base}/v2/users/{user_openid}/files
+pub fn buildC2cFilesUrl(buf: []u8, base: []const u8, user_openid: []const u8) ![]const u8 {
+    var fbs = std.io.fixedBufferStream(buf);
+    const w = fbs.writer();
+    try w.print("{s}/v2/users/{s}/files", .{ base, user_openid });
+    return fbs.getWritten();
+}
+
 /// Build the REST API URL for resolving gateway endpoint.
 /// Format: {base}/gateway
 pub fn buildGatewayResolveUrl(buf: []u8, base: []const u8) ![]const u8 {
@@ -271,6 +351,45 @@ pub fn buildSendBody(
     }
     if (msg_type) |mt| {
         try body_list.writer(allocator).print(",\"msg_type\":{d}", .{mt});
+    }
+    if (msg_seq) |seq| {
+        try body_list.writer(allocator).print(",\"msg_seq\":{d}", .{seq});
+    }
+    try body_list.appendSlice(allocator, "}");
+
+    return body_list.toOwnedSlice(allocator);
+}
+
+/// Build a media upload body for QQ /files endpoint.
+/// Format: {"file_type":1,"url":"https://...","srv_send_msg":false}
+pub fn buildMediaUploadBody(allocator: std.mem.Allocator, media_url: []const u8) ![]u8 {
+    var body_list: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer body_list.deinit(allocator);
+
+    try body_list.appendSlice(allocator, "{\"file_type\":1,\"url\":");
+    try root.json_util.appendJsonString(&body_list, allocator, media_url);
+    try body_list.appendSlice(allocator, ",\"srv_send_msg\":false}");
+
+    return body_list.toOwnedSlice(allocator);
+}
+
+/// Build a media send body after successful upload to /files.
+/// Format: {"content":" ","msg_type":7,"media":{"file_info":"..."},"msg_id":"...","msg_seq":N}
+pub fn buildMediaSendBody(
+    allocator: std.mem.Allocator,
+    file_info: []const u8,
+    msg_id: ?[]const u8,
+    msg_seq: ?u32,
+) ![]u8 {
+    var body_list: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer body_list.deinit(allocator);
+
+    try body_list.appendSlice(allocator, "{\"content\":\" \",\"msg_type\":7,\"media\":{\"file_info\":");
+    try root.json_util.appendJsonString(&body_list, allocator, file_info);
+    try body_list.appendSlice(allocator, "}");
+    if (msg_id) |mid| {
+        try body_list.appendSlice(allocator, ",\"msg_id\":");
+        try root.json_util.appendJsonString(&body_list, allocator, mid);
     }
     if (msg_seq) |seq| {
         try body_list.writer(allocator).print(",\"msg_seq\":{d}", .{seq});
@@ -322,6 +441,51 @@ pub fn fetchGatewayUrl(allocator: std.mem.Allocator, access_token: []const u8, s
     if (url_str.len == 0) return error.GatewayParseFailed;
 
     return allocator.dupe(u8, url_str);
+}
+
+/// Best-effort QQ API response check.
+/// If payload includes a non-zero "code", treat it as an API failure.
+fn ensureQqApiSuccess(allocator: std.mem.Allocator, resp_body: []const u8) !void {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp_body, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+
+    const code_val = parsed.value.object.get("code") orelse return;
+    const code: i64 = switch (code_val) {
+        .integer => code_val.integer,
+        .string => |s| std.fmt.parseInt(i64, s, 10) catch return error.QQApiError,
+        else => return error.QQApiError,
+    };
+    if (code != 0) return error.QQApiError;
+}
+
+fn parseUploadedFileInfo(allocator: std.mem.Allocator, upload_response: []const u8) ![]u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, upload_response, .{}) catch {
+        return error.QQApiError;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.QQApiError;
+    const file_info = getJsonStringFromObj(parsed.value, "file_info") orelse return error.QQApiError;
+    if (file_info.len == 0) return error.QQApiError;
+    return allocator.dupe(u8, file_info);
+}
+
+fn sanitizeUserOpenId(allocator: std.mem.Allocator, raw_id: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (raw_id) |ch| {
+        if (std.ascii.isAlphanumeric(ch) or ch == '_') {
+            try out.append(allocator, ch);
+        }
+    }
+    if (out.items.len == 0) return error.InvalidTarget;
+    return out.toOwnedSlice(allocator);
+}
+
+fn ensureHttpsMediaUrl(media_url: []const u8) ![]const u8 {
+    const trimmed = std.mem.trim(u8, media_url, " \t\r\n");
+    if (!std.mem.startsWith(u8, trimmed, "https://")) return error.InvalidMediaUrl;
+    return trimmed;
 }
 
 /// Check if a group ID is allowed by the given config.
@@ -880,14 +1044,39 @@ pub const QQChannel = struct {
     ///   "user:<user_openid>"    — alias for c2c
     ///   "<channel_id>"          — defaults to guild channel
     pub fn sendMessage(self: *QQChannel, target: []const u8, text: []const u8) !void {
-        const msg_id = parseTarget(target)[2];
+        const parsed_target = parseTarget(target);
+        const msg_type = parsed_target[0];
+        const msg_id = parsed_target[2];
+        const supports_media_upload = std.mem.eql(u8, msg_type, "group") or std.mem.eql(u8, msg_type, "c2c");
+
         var msg_seq: u32 = 1;
+        if (supports_media_upload) {
+            var parsed = try parseOutgoingContent(self.allocator, text);
+            defer parsed.deinit(self.allocator);
+
+            if (parsed.text.len > 0) {
+                var text_it = root.splitMessage(parsed.text, MAX_MESSAGE_LEN);
+                while (text_it.next()) |chunk| {
+                    try self.sendChunk(target, chunk, if (msg_id != null) msg_seq else null);
+                    if (msg_id != null and msg_seq < std.math.maxInt(u32)) {
+                        msg_seq += 1;
+                    }
+                }
+            }
+
+            for (parsed.image_urls) |image_url| {
+                try self.sendMedia(target, image_url, if (msg_id != null) msg_seq else null);
+                if (msg_id != null and msg_seq < std.math.maxInt(u32)) {
+                    msg_seq += 1;
+                }
+            }
+            return;
+        }
+
         var it = root.splitMessage(text, MAX_MESSAGE_LEN);
         while (it.next()) |chunk| {
             try self.sendChunk(target, chunk, if (msg_id != null) msg_seq else null);
-            if (msg_id != null and msg_seq < std.math.maxInt(u32)) {
-                msg_seq += 1;
-            }
+            if (msg_id != null and msg_seq < std.math.maxInt(u32)) msg_seq += 1;
         }
     }
 
@@ -907,20 +1096,33 @@ pub const QQChannel = struct {
             return error.InvalidTarget;
         }
 
-        log.info("sendChunk: target='{s}' msg_type='{s}' id='{s}' msg_id={s} text_len={d}", .{ target, msg_type, id_str, if (msg_id) |m| m else "(none)", text.len });
+        var sanitized_user_id: ?[]u8 = null;
+        defer if (sanitized_user_id) |sid| self.allocator.free(sid);
+        const target_id = blk: {
+            if (is_c2c) {
+                sanitized_user_id = sanitizeUserOpenId(self.allocator, id_str) catch |err| {
+                    log.warn("sendChunk: invalid c2c user_openid: {}", .{err});
+                    return error.InvalidTarget;
+                };
+                break :blk sanitized_user_id.?;
+            }
+            break :blk id_str;
+        };
+
+        log.info("sendChunk: target='{s}' msg_type='{s}' id='{s}' msg_id={s} text_len={d}", .{ target, msg_type, target_id, if (msg_id) |m| m else "(none)", text.len });
 
         const base = apiBase(self.config.sandbox);
 
         // Build URL based on target type
         var url_buf: [512]u8 = undefined;
         const url = if (is_group)
-            buildGroupSendUrl(&url_buf, base, id_str) catch return
+            buildGroupSendUrl(&url_buf, base, target_id) catch return
         else if (is_c2c)
-            buildC2cSendUrl(&url_buf, base, id_str) catch return
+            buildC2cSendUrl(&url_buf, base, target_id) catch return
         else if (is_dm)
-            try buildDmUrl(&url_buf, base, id_str)
+            try buildDmUrl(&url_buf, base, target_id)
         else
-            try buildSendUrl(&url_buf, base, id_str);
+            try buildSendUrl(&url_buf, base, target_id);
 
         log.info("sendChunk: URL={s}", .{url});
 
@@ -949,8 +1151,95 @@ pub const QQChannel = struct {
             log.err("QQ API POST failed: {}", .{err});
             return error.QQApiError;
         };
+        defer self.allocator.free(resp);
+        ensureQqApiSuccess(self.allocator, resp) catch {
+            log.err("QQ API send returned non-zero code payload", .{});
+            return error.QQApiError;
+        };
         log.debug("sendChunk: API response_len={d}", .{resp.len});
-        self.allocator.free(resp);
+    }
+
+    fn sendMedia(self: *QQChannel, target: []const u8, image_url_raw: []const u8, msg_seq: ?u32) !void {
+        const msg_type, const id_str, const msg_id = parseTarget(target);
+        const is_group = std.mem.eql(u8, msg_type, "group");
+        const is_c2c = std.mem.eql(u8, msg_type, "c2c");
+        if (!is_group and !is_c2c) return error.InvalidTarget;
+        if (id_str.len == 0) return error.InvalidTarget;
+
+        const image_url = ensureHttpsMediaUrl(image_url_raw) catch |err| {
+            log.warn("sendMedia: refusing non-https image url: {}", .{err});
+            return err;
+        };
+
+        var sanitized_user_id: ?[]u8 = null;
+        defer if (sanitized_user_id) |sid| self.allocator.free(sid);
+        const target_id = blk: {
+            if (is_c2c) {
+                sanitized_user_id = sanitizeUserOpenId(self.allocator, id_str) catch |err| {
+                    log.warn("sendMedia: invalid c2c user_openid: {}", .{err});
+                    return error.InvalidTarget;
+                };
+                break :blk sanitized_user_id.?;
+            }
+            break :blk id_str;
+        };
+
+        const base = apiBase(self.config.sandbox);
+        var message_url_buf: [512]u8 = undefined;
+        const message_url = if (is_group)
+            try buildGroupSendUrl(&message_url_buf, base, target_id)
+        else
+            try buildC2cSendUrl(&message_url_buf, base, target_id);
+        var files_url_buf: [512]u8 = undefined;
+        const files_url = if (is_group)
+            try buildGroupFilesUrl(&files_url_buf, base, target_id)
+        else
+            try buildC2cFilesUrl(&files_url_buf, base, target_id);
+
+        const token = self.ensureAccessToken() catch |err| {
+            log.err("Access token fetch failed for sendMedia: {}", .{err});
+            return error.QQApiError;
+        };
+        defer self.allocator.free(token);
+        var auth_buf: [512]u8 = undefined;
+        const auth_header = buildAuthHeader(&auth_buf, token) catch {
+            return error.QQApiError;
+        };
+
+        const upload_body = try buildMediaUploadBody(self.allocator, image_url);
+        defer self.allocator.free(upload_body);
+        const upload_resp = root.http_util.curlPost(self.allocator, files_url, upload_body, &.{auth_header}) catch |err| {
+            log.err("QQ media upload failed: {}", .{err});
+            return error.QQApiError;
+        };
+        defer self.allocator.free(upload_resp);
+        ensureQqApiSuccess(self.allocator, upload_resp) catch {
+            log.err("QQ media upload returned non-zero code payload", .{});
+            return error.QQApiError;
+        };
+
+        const file_info = parseUploadedFileInfo(self.allocator, upload_resp) catch {
+            log.err("QQ media upload response missing file_info", .{});
+            return error.QQApiError;
+        };
+        defer self.allocator.free(file_info);
+
+        const media_body = try buildMediaSendBody(
+            self.allocator,
+            file_info,
+            msg_id,
+            if (msg_id != null) msg_seq else null,
+        );
+        defer self.allocator.free(media_body);
+        const send_resp = root.http_util.curlPost(self.allocator, message_url, media_body, &.{auth_header}) catch |err| {
+            log.err("QQ media send failed: {}", .{err});
+            return error.QQApiError;
+        };
+        defer self.allocator.free(send_resp);
+        ensureQqApiSuccess(self.allocator, send_resp) catch {
+            log.err("QQ media send returned non-zero code payload", .{});
+            return error.QQApiError;
+        };
     }
 
     // ── Channel vtable ──────────────────────────────────────────────
@@ -1430,6 +1719,27 @@ test "qq buildSendBody with msg_seq" {
     try std.testing.expectEqualStrings("{\"content\":\"reply text\",\"msg_id\":\"msg_123\",\"msg_type\":0,\"msg_seq\":2}", body);
 }
 
+test "qq buildMediaUploadBody" {
+    const alloc = std.testing.allocator;
+    const body = try buildMediaUploadBody(alloc, "https://cdn.example.com/a.png");
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings("{\"file_type\":1,\"url\":\"https://cdn.example.com/a.png\",\"srv_send_msg\":false}", body);
+}
+
+test "qq buildMediaSendBody with passive fields" {
+    const alloc = std.testing.allocator;
+    const body = try buildMediaSendBody(alloc, "file-info-abc", "msg_123", 3);
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings("{\"content\":\" \",\"msg_type\":7,\"media\":{\"file_info\":\"file-info-abc\"},\"msg_id\":\"msg_123\",\"msg_seq\":3}", body);
+}
+
+test "qq parseUploadedFileInfo extracts file_info" {
+    const alloc = std.testing.allocator;
+    const file_info = try parseUploadedFileInfo(alloc, "{\"file_info\":\"abc123\"}");
+    defer alloc.free(file_info);
+    try std.testing.expectEqualStrings("abc123", file_info);
+}
+
 test "qq buildAuthHeader" {
     var buf: [256]u8 = undefined;
     const header = try buildAuthHeader(&buf, "my-access-token");
@@ -1522,6 +1832,37 @@ test "qq parseTarget channel keeps extra colon in id" {
     try std.testing.expectEqualStrings("channel", msg_type);
     try std.testing.expectEqualStrings("abc:def", id);
     try std.testing.expect(mid == null);
+}
+
+test "qq parseImageMarkerLine extracts marker target" {
+    const marker = parseImageMarkerLine(" [IMAGE:https://cdn.example.com/a.png] ").?;
+    try std.testing.expectEqualStrings("https://cdn.example.com/a.png", marker);
+}
+
+test "qq parseOutgoingContent extracts remote image markers" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseOutgoingContent(alloc, "hello\n[IMAGE:https://cdn.example.com/a.png]\n[IMAGE:http://cdn.example.com/b.jpg]\nbye");
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectEqualStrings("hello\nbye", parsed.text);
+    try std.testing.expectEqual(@as(usize, 2), parsed.image_urls.len);
+    try std.testing.expectEqualStrings("https://cdn.example.com/a.png", parsed.image_urls[0]);
+    try std.testing.expectEqualStrings("http://cdn.example.com/b.jpg", parsed.image_urls[1]);
+}
+
+test "qq parseOutgoingContent keeps non-remote marker as text" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseOutgoingContent(alloc, "[IMAGE:/tmp/a.png]\nhello");
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectEqualStrings("[IMAGE:/tmp/a.png]\nhello", parsed.text);
+    try std.testing.expectEqual(@as(usize, 0), parsed.image_urls.len);
+}
+
+test "qq ensureHttpsMediaUrl rejects http" {
+    try std.testing.expectError(error.InvalidMediaUrl, ensureHttpsMediaUrl("http://cdn.example.com/a.png"));
+    const ok = try ensureHttpsMediaUrl("  https://cdn.example.com/a.png  ");
+    try std.testing.expectEqualStrings("https://cdn.example.com/a.png", ok);
 }
 
 test "qq QQChannel init stores config" {
@@ -1869,10 +2210,22 @@ test "qq buildGroupSendUrl" {
     try std.testing.expectEqualStrings("https://api.sgroup.qq.com/v2/groups/group_openid_123/messages", url);
 }
 
+test "qq buildGroupFilesUrl" {
+    var buf: [256]u8 = undefined;
+    const url = try buildGroupFilesUrl(&buf, API_BASE, "group_openid_123");
+    try std.testing.expectEqualStrings("https://api.sgroup.qq.com/v2/groups/group_openid_123/files", url);
+}
+
 test "qq buildC2cSendUrl" {
     var buf: [256]u8 = undefined;
     const url = try buildC2cSendUrl(&buf, API_BASE, "user_openid_456");
     try std.testing.expectEqualStrings("https://api.sgroup.qq.com/v2/users/user_openid_456/messages", url);
+}
+
+test "qq buildC2cFilesUrl" {
+    var buf: [256]u8 = undefined;
+    const url = try buildC2cFilesUrl(&buf, API_BASE, "user_openid_456");
+    try std.testing.expectEqualStrings("https://api.sgroup.qq.com/v2/users/user_openid_456/files", url);
 }
 
 test "qq parseTarget group prefix" {
@@ -1920,6 +2273,19 @@ test "qq sendChunk rejects empty target id" {
     const alloc = std.testing.allocator;
     var ch = QQChannel.init(alloc, .{ .app_id = "test-app", .app_secret = "test-secret" });
     try std.testing.expectError(error.InvalidTarget, ch.sendChunk("dm:", "hi", null));
+}
+
+test "qq sanitizeUserOpenId strips unsafe chars" {
+    const alloc = std.testing.allocator;
+    const safe = try sanitizeUserOpenId(alloc, "../u$er_123");
+    defer alloc.free(safe);
+    try std.testing.expectEqualStrings("uer_123", safe);
+}
+
+test "qq sendChunk rejects c2c target with unsafe-only id" {
+    const alloc = std.testing.allocator;
+    var ch = QQChannel.init(alloc, .{ .app_id = "test-app", .app_secret = "test-secret" });
+    try std.testing.expectError(error.InvalidTarget, ch.sendChunk("c2c:../", "hi", null));
 }
 
 test "qq handleGatewayEvent C2C_MESSAGE_CREATE" {
