@@ -568,6 +568,32 @@ pub const CronScheduler = struct {
             const new_cmd = allocator.dupe(u8, cmd) catch return false;
             allocator.free(job.command);
             job.command = new_cmd;
+
+            // Back-compat behavior: for agent jobs, --command should still update
+            // the effective prompt if --prompt was not provided explicitly.
+            if (job.job_type == .agent and patch.prompt == null) {
+                const new_prompt = allocator.dupe(u8, cmd) catch return false;
+                if (job.prompt) |old_prompt| allocator.free(old_prompt);
+                job.prompt = new_prompt;
+            }
+        }
+        if (patch.prompt) |prompt| {
+            const new_prompt = allocator.dupe(u8, prompt) catch return false;
+            if (job.prompt) |old_prompt| allocator.free(old_prompt);
+            job.prompt = new_prompt;
+
+            // Keep command text aligned with prompt for agent jobs so display/list
+            // and fallback behavior stay coherent.
+            if (job.job_type == .agent) {
+                const new_cmd = allocator.dupe(u8, prompt) catch return false;
+                allocator.free(job.command);
+                job.command = new_cmd;
+            }
+        }
+        if (patch.model) |model| {
+            const new_model = allocator.dupe(u8, model) catch return false;
+            if (job.model) |old_model| allocator.free(old_model);
+            job.model = new_model;
         }
         if (patch.enabled) |ena| {
             job.enabled = ena;
@@ -634,9 +660,7 @@ pub const CronScheduler = struct {
     pub fn removeJob(self: *CronScheduler, id: []const u8) bool {
         for (self.jobs.items, 0..) |job, i| {
             if (std.mem.eql(u8, job.id, id)) {
-                self.allocator.free(job.id);
-                self.allocator.free(job.expression);
-                self.allocator.free(job.command);
+                self.freeJobOwned(job);
                 _ = self.jobs.orderedRemove(i);
                 return true;
             }
@@ -1379,6 +1403,8 @@ pub fn cliUpdateJob(
     id: []const u8,
     expression: ?[]const u8,
     command: ?[]const u8,
+    prompt: ?[]const u8,
+    model: ?[]const u8,
     enabled: ?bool,
 ) !void {
     var scheduler = CronScheduler.init(allocator, 1024, true);
@@ -1388,6 +1414,8 @@ pub fn cliUpdateJob(
     const patch = CronJobPatch{
         .expression = expression,
         .command = command,
+        .prompt = prompt,
+        .model = model,
         .enabled = enabled,
     };
     if (scheduler.updateJob(allocator, id, patch)) {
@@ -1691,6 +1719,43 @@ test "updateJob modifies job fields" {
     try std.testing.expectEqualStrings("echo updated", updated.command);
     try std.testing.expect(!updated.enabled);
     try std.testing.expect(updated.paused);
+}
+
+test "updateJob keeps agent command and prompt in sync" {
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    _ = try scheduler.addAgentJob("* * * * *", "old prompt", "model-a");
+    const id = scheduler.listJobs()[0].id;
+
+    // Back-compat: updating command should update agent prompt.
+    try std.testing.expect(scheduler.updateJob(allocator, id, .{ .command = "new command prompt" }));
+    var updated = scheduler.getJob(id).?;
+    try std.testing.expect(updated.prompt != null);
+    try std.testing.expectEqualStrings("new command prompt", updated.command);
+    try std.testing.expectEqualStrings("new command prompt", updated.prompt.?);
+
+    // Explicit prompt/model update should persist both.
+    try std.testing.expect(scheduler.updateJob(allocator, id, .{
+        .prompt = "explicit prompt",
+        .model = "model-b",
+    }));
+    updated = scheduler.getJob(id).?;
+    try std.testing.expect(updated.prompt != null);
+    try std.testing.expectEqualStrings("explicit prompt", updated.command);
+    try std.testing.expectEqualStrings("explicit prompt", updated.prompt.?);
+    try std.testing.expect(updated.model != null);
+    try std.testing.expectEqualStrings("model-b", updated.model.?);
+}
+
+test "CronScheduler remove frees agent job fields" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    const job = try scheduler.addAgentJob("* * * * *", "prompt to free", "model-to-free");
+    try std.testing.expect(scheduler.removeJob(job.id));
+    try std.testing.expectEqual(@as(usize, 0), scheduler.listJobs().len);
 }
 
 test "getMutableJob returns null for unknown id" {

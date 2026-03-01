@@ -315,12 +315,14 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         try yc.cron.cliRunJob(allocator, sub_args[1]);
     } else if (std.mem.eql(u8, subcmd, "update")) {
         if (sub_args.len < 2) {
-            std.debug.print("Usage: nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--enable] [--disable]\n", .{});
+            std.debug.print("Usage: nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--prompt <prompt>] [--model <model>] [--enable] [--disable]\n", .{});
             std.process.exit(1);
         }
         const id = sub_args[1];
         var expression: ?[]const u8 = null;
         var command: ?[]const u8 = null;
+        var prompt: ?[]const u8 = null;
+        var model: ?[]const u8 = null;
         var enabled: ?bool = null;
         var i: usize = 2;
         while (i < sub_args.len) : (i += 1) {
@@ -330,13 +332,19 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             } else if (std.mem.eql(u8, sub_args[i], "--command") and i + 1 < sub_args.len) {
                 i += 1;
                 command = sub_args[i];
+            } else if (std.mem.eql(u8, sub_args[i], "--prompt") and i + 1 < sub_args.len) {
+                i += 1;
+                prompt = sub_args[i];
+            } else if (std.mem.eql(u8, sub_args[i], "--model") and i + 1 < sub_args.len) {
+                i += 1;
+                model = sub_args[i];
             } else if (std.mem.eql(u8, sub_args[i], "--enable")) {
                 enabled = true;
             } else if (std.mem.eql(u8, sub_args[i], "--disable")) {
                 enabled = false;
             }
         }
-        try yc.cron.cliUpdateJob(allocator, id, expression, command, enabled);
+        try yc.cron.cliUpdateJob(allocator, id, expression, command, prompt, model, enabled);
     } else if (std.mem.eql(u8, subcmd, "runs")) {
         if (sub_args.len < 2) {
             std.debug.print("Usage: nullclaw cron runs <id>\n", .{});
