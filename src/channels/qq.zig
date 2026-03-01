@@ -252,14 +252,14 @@ pub fn fetchAccessToken(allocator: std.mem.Allocator, app_id: []const u8, app_se
         return .{ .token = try allocator.dupe(u8, "test-access-token"), .expires_in = 7200 };
     }
 
-    // Build request body: {"appId":"...","clientSecret":"..."}
+    // Build request body with proper JSON escaping.
     var body_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer body_buf.deinit(allocator);
-    try body_buf.appendSlice(allocator, "{\"appId\":\"");
-    try body_buf.appendSlice(allocator, app_id);
-    try body_buf.appendSlice(allocator, "\",\"clientSecret\":\"");
-    try body_buf.appendSlice(allocator, app_secret);
-    try body_buf.appendSlice(allocator, "\"}");
+    try body_buf.appendSlice(allocator, "{\"appId\":");
+    try root.json_util.appendJsonString(&body_buf, allocator, app_id);
+    try body_buf.appendSlice(allocator, ",\"clientSecret\":");
+    try root.json_util.appendJsonString(&body_buf, allocator, app_secret);
+    try body_buf.appendSlice(allocator, "}");
 
     const resp_body = root.http_util.curlPost(allocator, TOKEN_URL, body_buf.items, &.{}) catch |err| {
         log.err("QQ getAppAccessToken request failed: {}", .{err});
