@@ -196,7 +196,13 @@ pub fn buildC2cSendUrl(buf: []u8, base: []const u8, user_openid: []const u8) ![]
 
 /// Build a message send body.
 /// Format: {"content":"...", "msg_id":"..."}
-pub fn buildSendBody(allocator: std.mem.Allocator, content: []const u8, msg_id: ?[]const u8) ![]u8 {
+pub fn buildSendBody(
+    allocator: std.mem.Allocator,
+    content: []const u8,
+    msg_id: ?[]const u8,
+    msg_type: ?u8,
+    msg_seq: ?u32,
+) ![]u8 {
     var body_list: std.ArrayListUnmanaged(u8) = .empty;
     errdefer body_list.deinit(allocator);
 
@@ -205,6 +211,12 @@ pub fn buildSendBody(allocator: std.mem.Allocator, content: []const u8, msg_id: 
     if (msg_id) |mid| {
         try body_list.appendSlice(allocator, ",\"msg_id\":");
         try root.json_util.appendJsonString(&body_list, allocator, mid);
+    }
+    if (msg_type) |mt| {
+        try body_list.writer(allocator).print(",\"msg_type\":{d}", .{mt});
+    }
+    if (msg_seq) |seq| {
+        try body_list.writer(allocator).print(",\"msg_seq\":{d}", .{seq});
     }
     try body_list.appendSlice(allocator, "}");
 
@@ -331,6 +343,7 @@ pub const QQChannel = struct {
     reconnect_requested: bool = false,
     gateway_thread: ?std.Thread = null,
     heartbeat_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    force_heartbeat: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     ws_fd: std.atomic.Value(std.posix.socket_t) = std.atomic.Value(std.posix.socket_t).init(invalid_socket),
     token_mu: std.Thread.Mutex = .{},
 
@@ -461,6 +474,10 @@ pub const QQChannel = struct {
             .heartbeat_ack => {
                 // Heartbeat acknowledged — connection is healthy
             },
+            .heartbeat => {
+                // Server requests an immediate heartbeat.
+                self.force_heartbeat.store(true, .release);
+            },
             .reconnect => {
                 log.info("QQ Gateway RECONNECT requested", .{});
                 self.reconnect_requested = true;
@@ -485,9 +502,10 @@ pub const QQChannel = struct {
             return;
         }
 
-        // Extract message ID for dedup
-        const msg_id_str = getJsonStringFromObj(d, "id") orelse {
-            log.info("handleMessageCreate: DROPPED — missing 'd.id' field", .{});
+        // Extract message ID for dedup (some payloads use msg_id instead of id).
+        const msg_id_str = getJsonStringFromObj(d, "id") orelse
+            getJsonStringFromObj(d, "msg_id") orelse {
+            log.info("handleMessageCreate: DROPPED — missing 'd.id'/'d.msg_id' field", .{});
             return;
         };
         log.info("handleMessageCreate: msg_id='{s}'", .{msg_id_str});
@@ -519,8 +537,12 @@ pub const QQChannel = struct {
         //   - C2C events:   use user_openid as chat id
         //   - Guild events: use channel_id / guild_id
         const channel_id = getJsonStringFromObj(d, "channel_id") orelse "";
-        const group_openid = getJsonStringFromObj(d, "group_openid") orelse "";
-        const user_openid = getJsonStringFromObj(author, "user_openid") orelse "";
+        const group_openid = getJsonStringFromObj(d, "group_openid") orelse
+            getJsonStringFromObj(d, "group_id") orelse
+            "";
+        const user_openid = getJsonStringFromObj(author, "user_openid") orelse
+            getJsonStringFromObj(author, "id") orelse
+            "";
         log.info("handleMessageCreate: channel_id='{s}' group_openid='{s}' user_openid='{s}'", .{ channel_id, group_openid, user_openid });
         if (is_c2c and user_openid.len == 0) {
             log.info("handleMessageCreate: DROPPED — C2C event missing user_openid", .{});
@@ -657,14 +679,32 @@ pub const QQChannel = struct {
     ///   "c2c:<user_openid>"     — C2C private message
     ///   "<channel_id>"          — defaults to guild channel
     pub fn sendMessage(self: *QQChannel, target: []const u8, text: []const u8) !void {
+        const msg_id = parseTarget(target)[2];
+        var msg_seq: u32 = 1;
         var it = root.splitMessage(text, MAX_MESSAGE_LEN);
         while (it.next()) |chunk| {
-            try self.sendChunk(target, chunk);
+            try self.sendChunk(target, chunk, if (msg_id != null) msg_seq else null);
+            if (msg_id != null and msg_seq < std.math.maxInt(u32)) {
+                msg_seq += 1;
+            }
         }
     }
 
-    fn sendChunk(self: *QQChannel, target: []const u8, text: []const u8) !void {
+    fn sendChunk(self: *QQChannel, target: []const u8, text: []const u8, msg_seq: ?u32) !void {
         const msg_type, const id_str, const msg_id = parseTarget(target);
+
+        const is_group = std.mem.eql(u8, msg_type, "group");
+        const is_c2c = std.mem.eql(u8, msg_type, "c2c");
+        const is_dm = std.mem.eql(u8, msg_type, "dm");
+        const is_channel = std.mem.eql(u8, msg_type, "channel");
+        if (!is_group and !is_c2c and !is_dm and !is_channel) {
+            log.warn("sendChunk: unsupported target type '{s}'", .{msg_type});
+            return error.InvalidTarget;
+        }
+        if (id_str.len == 0) {
+            log.warn("sendChunk: empty target id for type '{s}'", .{msg_type});
+            return error.InvalidTarget;
+        }
 
         log.info("sendChunk: target='{s}' msg_type='{s}' id='{s}' msg_id={s} text_len={d}", .{ target, msg_type, id_str, if (msg_id) |m| m else "(none)", text.len });
 
@@ -672,18 +712,24 @@ pub const QQChannel = struct {
 
         // Build URL based on target type
         var url_buf: [512]u8 = undefined;
-        const url = if (std.mem.eql(u8, msg_type, "group"))
+        const url = if (is_group)
             buildGroupSendUrl(&url_buf, base, id_str) catch return
-        else if (std.mem.eql(u8, msg_type, "c2c"))
+        else if (is_c2c)
             buildC2cSendUrl(&url_buf, base, id_str) catch return
-        else if (std.mem.eql(u8, msg_type, "dm"))
+        else if (is_dm)
             try buildDmUrl(&url_buf, base, id_str)
         else
             try buildSendUrl(&url_buf, base, id_str);
 
         log.info("sendChunk: URL={s}", .{url});
 
-        const body = try buildSendBody(self.allocator, text, msg_id);
+        const body = try buildSendBody(
+            self.allocator,
+            text,
+            msg_id,
+            if (is_group or is_c2c) @as(?u8, 0) else null,
+            if (msg_id != null) msg_seq else null,
+        );
         defer self.allocator.free(body);
 
         const token = self.ensureAccessToken() catch |err| {
@@ -822,6 +868,7 @@ pub const QQChannel = struct {
 
         // Start heartbeat thread
         self.heartbeat_stop.store(false, .release);
+        self.force_heartbeat.store(false, .release);
         self.heartbeat_interval_ms.store(0, .release);
         const hbt = std.Thread.spawn(.{ .stack_size = 128 * 1024 }, heartbeatLoop, .{ self, &ws }) catch |err| {
             ws.deinit();
@@ -898,9 +945,22 @@ pub const QQChannel = struct {
     }
 
     /// Heartbeat thread: sends periodic heartbeat frames to keep the connection alive.
+    fn sendHeartbeatNow(self: *QQChannel, ws: *websocket.WsClient) void {
+        var hb_buf: [64]u8 = undefined;
+        const seq: ?i64 = if (self.has_sequence.load(.acquire)) self.sequence.load(.acquire) else null;
+        const hb_payload = buildHeartbeatPayload(&hb_buf, seq) catch return;
+        ws.writeText(hb_payload) catch |err| {
+            log.warn("Heartbeat failed: {}", .{err});
+        };
+    }
+
+    /// Heartbeat thread: sends periodic heartbeat frames to keep the connection alive.
     fn heartbeatLoop(self: *QQChannel, ws: *websocket.WsClient) void {
         // Wait for heartbeat_interval to be set by HELLO handler
         while (!self.heartbeat_stop.load(.acquire) and self.heartbeat_interval_ms.load(.acquire) == 0) {
+            if (self.force_heartbeat.swap(false, .acq_rel)) {
+                self.sendHeartbeatNow(ws);
+            }
             std.Thread.sleep(10 * std.time.ns_per_ms);
         }
         log.info("Heartbeat thread running (interval={d}ms)", .{self.heartbeat_interval_ms.load(.acquire)});
@@ -910,17 +970,16 @@ pub const QQChannel = struct {
             var elapsed: u64 = 0;
             while (elapsed < interval_ms) {
                 if (self.heartbeat_stop.load(.acquire)) return;
+                if (self.force_heartbeat.swap(false, .acq_rel)) {
+                    self.sendHeartbeatNow(ws);
+                    elapsed = 0;
+                    continue;
+                }
                 std.Thread.sleep(100 * std.time.ns_per_ms);
                 elapsed += 100;
             }
             if (self.heartbeat_stop.load(.acquire)) return;
-
-            var hb_buf: [64]u8 = undefined;
-            const seq: ?i64 = if (self.has_sequence.load(.acquire)) self.sequence.load(.acquire) else null;
-            const hb_payload = buildHeartbeatPayload(&hb_buf, seq) catch continue;
-            ws.writeText(hb_payload) catch |err| {
-                log.warn("Heartbeat failed: {}", .{err});
-            };
+            self.sendHeartbeatNow(ws);
         }
     }
 };
@@ -939,9 +998,11 @@ fn parseTarget(target: []const u8) struct { []const u8, []const u8, ?[]const u8 
     if (std.mem.indexOf(u8, target, ":")) |first_colon| {
         const msg_type = target[0..first_colon];
         const rest = target[first_colon + 1 ..];
-        // Look for a second colon to extract msg_id
-        if (std.mem.indexOf(u8, rest, ":")) |second_colon| {
-            return .{ msg_type, rest[0..second_colon], rest[second_colon + 1 ..] };
+        // group/c2c reply targets may include a trailing msg_id after a second colon.
+        if (std.mem.eql(u8, msg_type, "group") or std.mem.eql(u8, msg_type, "c2c")) {
+            if (std.mem.indexOf(u8, rest, ":")) |second_colon| {
+                return .{ msg_type, rest[0..second_colon], rest[second_colon + 1 ..] };
+            }
         }
         return .{ msg_type, rest, null };
     }
@@ -1124,16 +1185,30 @@ test "qq buildDmUrl" {
 
 test "qq buildSendBody" {
     const alloc = std.testing.allocator;
-    const body = try buildSendBody(alloc, "hello world", null);
+    const body = try buildSendBody(alloc, "hello world", null, null, null);
     defer alloc.free(body);
     try std.testing.expectEqualStrings("{\"content\":\"hello world\"}", body);
 }
 
 test "qq buildSendBody with msg_id" {
     const alloc = std.testing.allocator;
-    const body = try buildSendBody(alloc, "reply text", "msg_123");
+    const body = try buildSendBody(alloc, "reply text", "msg_123", null, null);
     defer alloc.free(body);
     try std.testing.expectEqualStrings("{\"content\":\"reply text\",\"msg_id\":\"msg_123\"}", body);
+}
+
+test "qq buildSendBody with msg_type" {
+    const alloc = std.testing.allocator;
+    const body = try buildSendBody(alloc, "reply text", "msg_123", 0, null);
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings("{\"content\":\"reply text\",\"msg_id\":\"msg_123\",\"msg_type\":0}", body);
+}
+
+test "qq buildSendBody with msg_seq" {
+    const alloc = std.testing.allocator;
+    const body = try buildSendBody(alloc, "reply text", "msg_123", 0, 2);
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings("{\"content\":\"reply text\",\"msg_id\":\"msg_123\",\"msg_type\":0,\"msg_seq\":2}", body);
 }
 
 test "qq buildAuthHeader" {
@@ -1188,6 +1263,13 @@ test "qq parseTarget no prefix defaults to channel" {
     const msg_type, const id, const mid = parseTarget("12345");
     try std.testing.expectEqualStrings("channel", msg_type);
     try std.testing.expectEqualStrings("12345", id);
+    try std.testing.expect(mid == null);
+}
+
+test "qq parseTarget channel keeps extra colon in id" {
+    const msg_type, const id, const mid = parseTarget("channel:abc:def");
+    try std.testing.expectEqualStrings("channel", msg_type);
+    try std.testing.expectEqualStrings("abc:def", id);
     try std.testing.expect(mid == null);
 }
 
@@ -1277,6 +1359,25 @@ test "qq handleGatewayEvent MESSAGE_CREATE" {
     try std.testing.expect(meta_parsed.value.object.get("account_id") != null);
     try std.testing.expect(meta_parsed.value.object.get("account_id").? == .string);
     try std.testing.expectEqualStrings("qq-main", meta_parsed.value.object.get("account_id").?.string);
+}
+
+test "qq handleGatewayEvent MESSAGE_CREATE accepts msg_id fallback" {
+    const alloc = std.testing.allocator;
+    var event_bus_inst = bus.Bus.init();
+    defer event_bus_inst.close();
+
+    var ch = QQChannel.init(alloc, .{ .account_id = "qq-main" });
+    ch.setBus(&event_bus_inst);
+    ch.running.store(true, .release);
+
+    const msg_json =
+        \\{"op":0,"s":2,"t":"MESSAGE_CREATE","d":{"msg_id":"msg-fallback-1","channel_id":"ch1","guild_id":"g1","content":"hello qq","author":{"id":"user1"}}}
+    ;
+    try ch.handleGatewayEvent(msg_json);
+
+    var msg = event_bus_inst.consumeInbound() orelse return try std.testing.expect(false);
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("channel:ch1", msg.chat_id);
 }
 
 test "qq handleGatewayEvent metadata escapes dynamic strings" {
@@ -1407,6 +1508,13 @@ test "qq handleGatewayEvent HEARTBEAT_ACK is silent" {
     var ch = QQChannel.init(alloc, .{});
     try ch.handleGatewayEvent("{\"op\":11}");
     // No crash, no state change
+}
+
+test "qq handleGatewayEvent HEARTBEAT requests immediate heartbeat" {
+    const alloc = std.testing.allocator;
+    var ch = QQChannel.init(alloc, .{});
+    try ch.handleGatewayEvent("{\"op\":1}");
+    try std.testing.expect(ch.force_heartbeat.load(.acquire));
 }
 
 test "qq handleGatewayEvent invalid JSON" {
@@ -1544,6 +1652,18 @@ test "qq parseTarget group with msg_id" {
     try std.testing.expectEqualStrings("msg_def456", mid.?);
 }
 
+test "qq sendChunk rejects unsupported target type" {
+    const alloc = std.testing.allocator;
+    var ch = QQChannel.init(alloc, .{ .app_id = "test-app", .app_secret = "test-secret" });
+    try std.testing.expectError(error.InvalidTarget, ch.sendChunk("user:openid_1", "hi", null));
+}
+
+test "qq sendChunk rejects empty target id" {
+    const alloc = std.testing.allocator;
+    var ch = QQChannel.init(alloc, .{ .app_id = "test-app", .app_secret = "test-secret" });
+    try std.testing.expectError(error.InvalidTarget, ch.sendChunk("dm:", "hi", null));
+}
+
 test "qq handleGatewayEvent C2C_MESSAGE_CREATE" {
     const alloc = std.testing.allocator;
     var event_bus_inst = bus.Bus.init();
@@ -1589,7 +1709,7 @@ test "qq handleGatewayEvent GROUP_AT_MESSAGE_CREATE" {
     try std.testing.expect(std.mem.startsWith(u8, msg.session_key, "qq:group:"));
 }
 
-test "qq handleGatewayEvent C2C_MESSAGE_CREATE drops missing user_openid" {
+test "qq handleGatewayEvent C2C_MESSAGE_CREATE falls back to author id" {
     const alloc = std.testing.allocator;
     var event_bus_inst = bus.Bus.init();
     defer event_bus_inst.close();
@@ -1603,10 +1723,13 @@ test "qq handleGatewayEvent C2C_MESSAGE_CREATE drops missing user_openid" {
     ;
     try ch.handleGatewayEvent(msg_json);
 
-    try std.testing.expectEqual(@as(usize, 0), event_bus_inst.inboundDepth());
+    var msg = event_bus_inst.consumeInbound() orelse return try std.testing.expect(false);
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("legacy-id", msg.sender_id);
+    try std.testing.expectEqualStrings("c2c:legacy-id:c2c-missing-openid", msg.chat_id);
 }
 
-test "qq handleGatewayEvent GROUP_AT_MESSAGE_CREATE drops missing group_openid" {
+test "qq handleGatewayEvent GROUP_AT_MESSAGE_CREATE falls back to group_id" {
     const alloc = std.testing.allocator;
     var event_bus_inst = bus.Bus.init();
     defer event_bus_inst.close();
@@ -1616,7 +1739,26 @@ test "qq handleGatewayEvent GROUP_AT_MESSAGE_CREATE drops missing group_openid" 
     ch.running.store(true, .release);
 
     const msg_json =
-        \\{"op":0,"s":13,"t":"GROUP_AT_MESSAGE_CREATE","d":{"id":"grp-missing-openid","author":{"member_openid":"mem_oid_1"},"content":"@bot hello","timestamp":"2025-01-01T00:00:00Z"}}
+        \\{"op":0,"s":13,"t":"GROUP_AT_MESSAGE_CREATE","d":{"id":"grp-missing-openid","group_id":"grp_fallback_1","author":{"member_openid":"mem_oid_1"},"content":"@bot hello","timestamp":"2025-01-01T00:00:00Z"}}
+    ;
+    try ch.handleGatewayEvent(msg_json);
+
+    var msg = event_bus_inst.consumeInbound() orelse return try std.testing.expect(false);
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("group:grp_fallback_1:grp-missing-openid", msg.chat_id);
+}
+
+test "qq handleGatewayEvent GROUP_AT_MESSAGE_CREATE drops when group id missing" {
+    const alloc = std.testing.allocator;
+    var event_bus_inst = bus.Bus.init();
+    defer event_bus_inst.close();
+
+    var ch = QQChannel.init(alloc, .{ .account_id = "qq-test" });
+    ch.setBus(&event_bus_inst);
+    ch.running.store(true, .release);
+
+    const msg_json =
+        \\{"op":0,"s":14,"t":"GROUP_AT_MESSAGE_CREATE","d":{"id":"grp-no-ids","author":{"member_openid":"mem_oid_1"},"content":"@bot hello","timestamp":"2025-01-01T00:00:00Z"}}
     ;
     try ch.handleGatewayEvent(msg_json);
 
