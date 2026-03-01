@@ -251,6 +251,7 @@ pub const StringDedupSet = struct {
         const owned_key = try allocator.dupe(u8, message_id);
         errdefer allocator.free(owned_key);
         try self.seen.put(allocator, owned_key, {});
+        errdefer _ = self.seen.remove(owned_key);
         try self.order.append(allocator, owned_key);
         return false;
     }
@@ -712,7 +713,7 @@ const invalid_socket: std.posix.socket_t = if (builtin.os.tag == .windows) std.o
 /// Connects to the QQ Gateway via WebSocket for real-time messages.
 /// Handles opcodes: HELLO (10), DISPATCH (0), HEARTBEAT_ACK (11), RECONNECT (7).
 /// Sends replies via REST API POST to /channels/{id}/messages or /dms/{id}/messages.
-/// Message deduplication via ring buffer of 1024 recent message IDs.
+/// Message deduplication via 10k-key hash set with half-eviction.
 /// Auto-reconnect with 5s backoff.
 pub const QQChannel = struct {
     config: config_types.QQConfig,

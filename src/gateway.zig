@@ -2347,6 +2347,12 @@ fn handleQqWebhookRoute(ctx: *WebhookHandlerContext) void {
         ctx.response_body = "{\"status\":\"received\"}";
         return;
     };
+    const parsed_probe = std.json.parseFromSlice(std.json.Value, ctx.req_allocator, body, .{}) catch {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"invalid json payload\"}";
+        return;
+    };
+    defer parsed_probe.deinit();
 
     const app_id_header = extractHeader(ctx.raw_request, "X-Bot-Appid");
     const qq_cfg = selectQqConfig(ctx.config_opt, ctx.target, app_id_header) orelse {
@@ -3442,6 +3448,51 @@ test "selectQqConfig falls back to primary account" {
     }
     try std.testing.expect(selected != null);
     try std.testing.expectEqualStrings("default", selected.?.account_id);
+}
+
+test "handleQqWebhookRoute rejects invalid json payload" {
+    if (!build_options.enable_channel_qq) return;
+
+    const qq_accounts = [_]config_types.QQConfig{
+        .{
+            .account_id = "main",
+            .app_id = "app-main",
+            .app_secret = "secret-main",
+            .receive_mode = .webhook,
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .qq = &qq_accounts,
+        },
+    };
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw_request =
+        "POST /qq HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "X-Bot-Appid: app-main\r\n" ++
+        "Content-Type: application/json\r\n\r\n" ++
+        "{invalid";
+    var ctx = WebhookHandlerContext{
+        .root_allocator = std.testing.allocator,
+        .req_allocator = std.testing.allocator,
+        .raw_request = raw_request,
+        .method = "POST",
+        .target = "/qq",
+        .config_opt = &cfg,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+
+    handleQqWebhookRoute(&ctx);
+    try std.testing.expectEqualStrings("400 Bad Request", ctx.response_status);
+    try std.testing.expectEqualStrings("{\"error\":\"invalid json payload\"}", ctx.response_body);
 }
 
 test "whatsappSessionKey builds direct key by sender" {
