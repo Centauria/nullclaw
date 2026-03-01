@@ -98,6 +98,54 @@ pub fn extractMentionQQ(raw: []const u8) ?[]const u8 {
     return raw[val_start..end];
 }
 
+fn endsWithIgnoreCase(haystack: []const u8, suffix: []const u8) bool {
+    if (haystack.len < suffix.len) return false;
+    return std.ascii.eqlIgnoreCase(haystack[haystack.len - suffix.len ..], suffix);
+}
+
+fn isImageFilename(filename: []const u8) bool {
+    return endsWithIgnoreCase(filename, ".png") or
+        endsWithIgnoreCase(filename, ".jpg") or
+        endsWithIgnoreCase(filename, ".jpeg") or
+        endsWithIgnoreCase(filename, ".gif") or
+        endsWithIgnoreCase(filename, ".webp") or
+        endsWithIgnoreCase(filename, ".bmp") or
+        endsWithIgnoreCase(filename, ".heic") or
+        endsWithIgnoreCase(filename, ".heif") or
+        endsWithIgnoreCase(filename, ".svg");
+}
+
+/// Extract image attachment markers as newline-joined "[IMAGE:<url>]".
+/// Caller owns returned slice.
+fn extractImageMarkers(allocator: std.mem.Allocator, payload: std.json.Value) ![]u8 {
+    if (payload != .object) return allocator.dupe(u8, "");
+    const attachments = payload.object.get("attachments") orelse return allocator.dupe(u8, "");
+    if (attachments != .array) return allocator.dupe(u8, "");
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var first = true;
+    for (attachments.array.items) |item| {
+        if (item != .object) continue;
+        const raw_url = getJsonStringFromObj(item, "url") orelse continue;
+        const url = std.mem.trim(u8, raw_url, " \t\r\n");
+        if (url.len == 0) continue;
+
+        const content_type = getJsonStringFromObj(item, "content_type") orelse "";
+        const filename = getJsonStringFromObj(item, "filename") orelse "";
+        const is_image = (content_type.len >= 6 and std.ascii.eqlIgnoreCase(content_type[0..6], "image/")) or isImageFilename(filename);
+        if (!is_image) continue;
+
+        if (!first) try out.append(allocator, '\n');
+        first = false;
+        try out.appendSlice(allocator, "[IMAGE:");
+        try out.appendSlice(allocator, url);
+        try out.append(allocator, ']');
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Message Deduplication (Ring Buffer)
 // ════════════════════════════════════════════════════════════════════════════
@@ -194,6 +242,15 @@ pub fn buildC2cSendUrl(buf: []u8, base: []const u8, user_openid: []const u8) ![]
     return fbs.getWritten();
 }
 
+/// Build the REST API URL for resolving gateway endpoint.
+/// Format: {base}/gateway
+pub fn buildGatewayResolveUrl(buf: []u8, base: []const u8) ![]const u8 {
+    var fbs = std.io.fixedBufferStream(buf);
+    const w = fbs.writer();
+    try w.print("{s}/gateway", .{base});
+    return fbs.getWritten();
+}
+
 /// Build a message send body.
 /// Format: {"content":"...", "msg_id":"..."}
 pub fn buildSendBody(
@@ -229,6 +286,42 @@ pub fn buildAuthHeader(buf: []u8, access_token: []const u8) ![]const u8 {
     const w = fbs.writer();
     try w.print("Authorization: QQBot {s}", .{access_token});
     return fbs.getWritten();
+}
+
+/// Fetch the current gateway URL for this bot/environment.
+/// Caller owns returned memory.
+pub fn fetchGatewayUrl(allocator: std.mem.Allocator, access_token: []const u8, sandbox: bool) ![]u8 {
+    if (comptime builtin.is_test) {
+        // In tests, do not make real network calls
+        return allocator.dupe(u8, gatewayUrl(sandbox));
+    }
+
+    var url_buf: [256]u8 = undefined;
+    const resolve_url = try buildGatewayResolveUrl(&url_buf, apiBase(sandbox));
+
+    var auth_buf: [512]u8 = undefined;
+    const auth_header = try buildAuthHeader(&auth_buf, access_token);
+
+    const resp_body = root.http_util.curlGet(allocator, resolve_url, &.{auth_header}, "15") catch |err| {
+        log.err("QQ gateway resolve request failed: {}", .{err});
+        return error.GatewayFetchFailed;
+    };
+    defer allocator.free(resp_body);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp_body, .{}) catch {
+        log.err("QQ gateway resolve: invalid JSON response", .{});
+        return error.GatewayParseFailed;
+    };
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return error.GatewayParseFailed;
+    const url_str = blk: {
+        const v = parsed.value.object.get("url") orelse return error.GatewayParseFailed;
+        break :blk if (v == .string) v.string else return error.GatewayParseFailed;
+    };
+    if (url_str.len == 0) return error.GatewayParseFailed;
+
+    return allocator.dupe(u8, url_str);
 }
 
 /// Check if a group ID is allowed by the given config.
@@ -316,6 +409,50 @@ pub fn fetchAccessToken(allocator: std.mem.Allocator, app_id: []const u8, app_se
 /// Get the Gateway URL (sandbox or production).
 pub fn gatewayUrl(sandbox: bool) []const u8 {
     return if (sandbox) SANDBOX_GATEWAY_URL else GATEWAY_URL;
+}
+
+/// Parse host from wss:// URL.
+/// "wss://api.sgroup.qq.com/websocket" -> "api.sgroup.qq.com"
+/// "wss://api.sgroup.qq.com/websocket?x=1" -> "api.sgroup.qq.com"
+pub fn parseGatewayHost(wss_url: []const u8) []const u8 {
+    const no_scheme = if (std.mem.startsWith(u8, wss_url, "wss://"))
+        wss_url[6..]
+    else if (std.mem.startsWith(u8, wss_url, "ws://"))
+        wss_url[5..]
+    else
+        wss_url;
+
+    const slash_pos = std.mem.indexOf(u8, no_scheme, "/");
+    const query_pos = std.mem.indexOf(u8, no_scheme, "?");
+
+    const end = blk: {
+        if (slash_pos != null and query_pos != null) {
+            break :blk @min(slash_pos.?, query_pos.?);
+        } else if (slash_pos != null) {
+            break :blk slash_pos.?;
+        } else if (query_pos != null) {
+            break :blk query_pos.?;
+        } else {
+            break :blk no_scheme.len;
+        }
+    };
+    return no_scheme[0..end];
+}
+
+/// Parse path (and optional query) from wss:// URL.
+/// Returns "/websocket" when no explicit path exists.
+pub fn parseGatewayPath(wss_url: []const u8) []const u8 {
+    const no_scheme = if (std.mem.startsWith(u8, wss_url, "wss://"))
+        wss_url[6..]
+    else if (std.mem.startsWith(u8, wss_url, "ws://"))
+        wss_url[5..]
+    else
+        wss_url;
+
+    if (std.mem.indexOf(u8, no_scheme, "/")) |slash_pos| {
+        return no_scheme[slash_pos..];
+    }
+    return "/websocket";
 }
 
 const invalid_socket: std.posix.socket_t = if (builtin.os.tag == .windows) std.os.windows.ws2_32.INVALID_SOCKET else -1;
@@ -526,9 +663,20 @@ pub const QQChannel = struct {
             log.info("handleMessageCreate: DROPPED — missing 'd.author' field", .{});
             return;
         };
-        const sender_id = getJsonStringFromObj(author, "id") orelse
-            getJsonStringFromObj(author, "user_openid") orelse
-            getJsonStringFromObj(author, "member_openid") orelse
+        const author_id = getJsonStringFromObj(author, "id") orelse "";
+        const author_user_openid = getJsonStringFromObj(author, "user_openid") orelse "";
+        const author_member_openid = getJsonStringFromObj(author, "member_openid") orelse "";
+        const sender_id = if (is_c2c)
+            if (author_user_openid.len > 0) author_user_openid else if (author_id.len > 0) author_id else "unknown"
+        else if (is_group)
+            if (author_member_openid.len > 0) author_member_openid else if (author_id.len > 0) author_id else "unknown"
+        else if (author_id.len > 0)
+            author_id
+        else if (author_user_openid.len > 0)
+            author_user_openid
+        else if (author_member_openid.len > 0)
+            author_member_openid
+        else
             "unknown";
         log.info("handleMessageCreate: sender_id='{s}'", .{sender_id});
 
@@ -540,9 +688,7 @@ pub const QQChannel = struct {
         const group_openid = getJsonStringFromObj(d, "group_openid") orelse
             getJsonStringFromObj(d, "group_id") orelse
             "";
-        const user_openid = getJsonStringFromObj(author, "user_openid") orelse
-            getJsonStringFromObj(author, "id") orelse
-            "";
+        const user_openid = if (author_user_openid.len > 0) author_user_openid else author_id;
         log.info("handleMessageCreate: channel_id='{s}' group_openid='{s}' user_openid='{s}'", .{ channel_id, group_openid, user_openid });
         if (is_c2c and user_openid.len == 0) {
             log.info("handleMessageCreate: DROPPED — C2C event missing user_openid", .{});
@@ -582,18 +728,32 @@ pub const QQChannel = struct {
         // Extract content and strip CQ codes
         const raw_content = getJsonStringFromObj(d, "content") orelse "";
         log.debug("handleMessageCreate: raw_content_len={d}", .{raw_content.len});
-        const content = stripCqCodes(self.allocator, raw_content) catch |err| {
+        const stripped_content = stripCqCodes(self.allocator, raw_content) catch |err| {
             log.info("handleMessageCreate: DROPPED — stripCqCodes failed: {}", .{err});
             return;
         };
-        defer self.allocator.free(content);
+        defer self.allocator.free(stripped_content);
 
         // Trim whitespace
-        const trimmed = std.mem.trim(u8, content, " \t\n\r");
-        if (trimmed.len == 0) {
+        const trimmed = std.mem.trim(u8, stripped_content, " \t\n\r");
+        const image_markers = extractImageMarkers(self.allocator, d) catch |err| {
+            log.info("handleMessageCreate: DROPPED — extractImageMarkers failed: {}", .{err});
+            return;
+        };
+        defer self.allocator.free(image_markers);
+
+        if (trimmed.len == 0 and image_markers.len == 0) {
             log.info("handleMessageCreate: DROPPED — content empty after trim", .{});
             return;
         }
+
+        const final_content = if (image_markers.len == 0)
+            self.allocator.dupe(u8, trimmed) catch return
+        else if (trimmed.len == 0)
+            self.allocator.dupe(u8, image_markers) catch return
+        else
+            std.fmt.allocPrint(self.allocator, "{s}\n\n{s}", .{ trimmed, image_markers }) catch return;
+        defer self.allocator.free(final_content);
 
         // Determine the reply target and session key based on event type
         var session_buf: [128]u8 = undefined;
@@ -650,7 +810,7 @@ pub const QQChannel = struct {
             "qq",
             sender_id,
             reply_target,
-            trimmed,
+            final_content,
             session_key,
             &.{},
             metadata,
@@ -677,6 +837,7 @@ pub const QQChannel = struct {
     ///   "dm:<guild_id>"         — guild DM
     ///   "group:<group_openid>"  — group message
     ///   "c2c:<user_openid>"     — C2C private message
+    ///   "user:<user_openid>"    — alias for c2c
     ///   "<channel_id>"          — defaults to guild channel
     pub fn sendMessage(self: *QQChannel, target: []const u8, text: []const u8) !void {
         const msg_id = parseTarget(target)[2];
@@ -855,11 +1016,26 @@ pub const QQChannel = struct {
         // Fresh IDENTIFY session: do not carry sequence from a previous connection.
         self.has_sequence.store(false, .release);
         self.sequence.store(0, .release);
-        const gw_url = gatewayUrl(self.config.sandbox);
-        const host = if (self.config.sandbox) "sandbox.api.sgroup.qq.com" else "api.sgroup.qq.com";
-        const path = "/websocket";
 
-        log.info("Connecting to {s}...", .{gw_url});
+        // Resolve gateway URL via REST API (v2 behavior).
+        const token = self.ensureAccessToken() catch |err| {
+            log.err("QQ access token fetch failed: {}", .{err});
+            return error.TokenFetchFailed;
+        };
+        defer self.allocator.free(token);
+
+        const gw_url = fetchGatewayUrl(self.allocator, token, self.config.sandbox) catch |err| {
+            log.err("QQ gateway URL resolve failed: {}", .{err});
+            return error.GatewayFetchFailed;
+        };
+        defer self.allocator.free(gw_url);
+        if (!std.mem.startsWith(u8, gw_url, "wss://")) {
+            log.err("QQ gateway URL must use wss://", .{});
+            return error.InvalidGatewayUrl;
+        }
+        const host = parseGatewayHost(gw_url);
+        const path = parseGatewayPath(gw_url);
+        log.info("Connecting to gateway: host={s} path={s}", .{ host, path });
 
         var ws = try websocket.WsClient.connect(self.allocator, host, 443, path, &.{});
 
@@ -894,12 +1070,7 @@ pub const QQChannel = struct {
             return error.InvalidHello;
         }
 
-        // Send IDENTIFY — fetch access_token first
-        const token = self.ensureAccessToken() catch |err| {
-            log.err("QQ access token fetch failed: {}", .{err});
-            return error.TokenFetchFailed;
-        };
-        defer self.allocator.free(token);
+        // Send IDENTIFY
         var identify_buf: [2048]u8 = undefined;
         const identify_payload = try buildIdentifyPayload(&identify_buf, token, DEFAULT_INTENTS);
         log.info("Sending IDENTIFY (app_id={s}, auth=QQBot)...", .{self.config.app_id});
@@ -996,7 +1167,8 @@ pub const QQChannel = struct {
 /// "12345"                      -> ("channel", "12345", null)
 fn parseTarget(target: []const u8) struct { []const u8, []const u8, ?[]const u8 } {
     if (std.mem.indexOf(u8, target, ":")) |first_colon| {
-        const msg_type = target[0..first_colon];
+        const raw_msg_type = target[0..first_colon];
+        const msg_type = if (std.mem.eql(u8, raw_msg_type, "user")) "c2c" else raw_msg_type;
         const rest = target[first_colon + 1 ..];
         // group/c2c reply targets may include a trailing msg_id after a second colon.
         if (std.mem.eql(u8, msg_type, "group") or std.mem.eql(u8, msg_type, "c2c")) {
@@ -1183,6 +1355,12 @@ test "qq buildDmUrl" {
     try std.testing.expectEqualStrings("https://api.sgroup.qq.com/dms/guild456/messages", url);
 }
 
+test "qq buildGatewayResolveUrl" {
+    var buf: [256]u8 = undefined;
+    const url = try buildGatewayResolveUrl(&buf, API_BASE);
+    try std.testing.expectEqualStrings("https://api.sgroup.qq.com/gateway", url);
+}
+
 test "qq buildSendBody" {
     const alloc = std.testing.allocator;
     const body = try buildSendBody(alloc, "hello world", null, null, null);
@@ -1243,6 +1421,28 @@ test "qq apiBase returns correct urls" {
 test "qq gatewayUrl returns correct urls" {
     try std.testing.expectEqualStrings("wss://api.sgroup.qq.com/websocket", gatewayUrl(false));
     try std.testing.expectEqualStrings("wss://sandbox.api.sgroup.qq.com/websocket", gatewayUrl(true));
+}
+
+test "qq parseGatewayHost from wss url" {
+    const host = parseGatewayHost("wss://api.sgroup.qq.com/websocket");
+    try std.testing.expectEqualStrings("api.sgroup.qq.com", host);
+}
+
+test "qq parseGatewayPath from wss url with query" {
+    const path = parseGatewayPath("wss://api.sgroup.qq.com/websocket?v=1");
+    try std.testing.expectEqualStrings("/websocket?v=1", path);
+}
+
+test "qq parseGatewayPath defaults when missing explicit path" {
+    const path = parseGatewayPath("wss://api.sgroup.qq.com");
+    try std.testing.expectEqualStrings("/websocket", path);
+}
+
+test "qq fetchGatewayUrl returns static gateway in test mode" {
+    const alloc = std.testing.allocator;
+    const url = try fetchGatewayUrl(alloc, "test-access-token", false);
+    defer alloc.free(url);
+    try std.testing.expectEqualStrings(gatewayUrl(false), url);
 }
 
 test "qq parseTarget channel prefix" {
@@ -1638,6 +1838,13 @@ test "qq parseTarget c2c prefix" {
     try std.testing.expect(mid == null);
 }
 
+test "qq parseTarget user prefix aliases to c2c" {
+    const msg_type, const id, const mid = parseTarget("user:openid_xyz");
+    try std.testing.expectEqualStrings("c2c", msg_type);
+    try std.testing.expectEqualStrings("openid_xyz", id);
+    try std.testing.expect(mid == null);
+}
+
 test "qq parseTarget c2c with msg_id" {
     const msg_type, const id, const mid = parseTarget("c2c:openid_xyz:msg_abc123");
     try std.testing.expectEqualStrings("c2c", msg_type);
@@ -1655,7 +1862,7 @@ test "qq parseTarget group with msg_id" {
 test "qq sendChunk rejects unsupported target type" {
     const alloc = std.testing.allocator;
     var ch = QQChannel.init(alloc, .{ .app_id = "test-app", .app_secret = "test-secret" });
-    try std.testing.expectError(error.InvalidTarget, ch.sendChunk("user:openid_1", "hi", null));
+    try std.testing.expectError(error.InvalidTarget, ch.sendChunk("foo:openid_1", "hi", null));
 }
 
 test "qq sendChunk rejects empty target id" {
@@ -1687,6 +1894,45 @@ test "qq handleGatewayEvent C2C_MESSAGE_CREATE" {
     try std.testing.expect(std.mem.startsWith(u8, msg.session_key, "qq:c2c:"));
 }
 
+test "qq handleGatewayEvent C2C_MESSAGE_CREATE prefers user_openid sender" {
+    const alloc = std.testing.allocator;
+    var event_bus_inst = bus.Bus.init();
+    defer event_bus_inst.close();
+
+    var ch = QQChannel.init(alloc, .{ .account_id = "qq-test" });
+    ch.setBus(&event_bus_inst);
+    ch.running.store(true, .release);
+
+    const msg_json =
+        \\{"op":0,"s":10,"t":"C2C_MESSAGE_CREATE","d":{"id":"c2c002","author":{"id":"legacy-id","user_openid":"openid-id"},"content":"hi from c2c","timestamp":"2025-01-01T00:00:00Z"}}
+    ;
+    try ch.handleGatewayEvent(msg_json);
+
+    var msg = event_bus_inst.consumeInbound() orelse return try std.testing.expect(false);
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("openid-id", msg.sender_id);
+    try std.testing.expectEqualStrings("c2c:openid-id:c2c002", msg.chat_id);
+}
+
+test "qq handleGatewayEvent C2C_MESSAGE_CREATE includes image attachment marker" {
+    const alloc = std.testing.allocator;
+    var event_bus_inst = bus.Bus.init();
+    defer event_bus_inst.close();
+
+    var ch = QQChannel.init(alloc, .{ .account_id = "qq-test" });
+    ch.setBus(&event_bus_inst);
+    ch.running.store(true, .release);
+
+    const msg_json =
+        \\{"op":0,"s":10,"t":"C2C_MESSAGE_CREATE","d":{"id":"c2c-img","author":{"user_openid":"openid-id"},"content":"  ","attachments":[{"content_type":"image/png","url":"https://cdn.example.com/a.png"}],"timestamp":"2025-01-01T00:00:00Z"}}
+    ;
+    try ch.handleGatewayEvent(msg_json);
+
+    var msg = event_bus_inst.consumeInbound() orelse return try std.testing.expect(false);
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("[IMAGE:https://cdn.example.com/a.png]", msg.content);
+}
+
 test "qq handleGatewayEvent GROUP_AT_MESSAGE_CREATE" {
     const alloc = std.testing.allocator;
     var event_bus_inst = bus.Bus.init();
@@ -1707,6 +1953,26 @@ test "qq handleGatewayEvent GROUP_AT_MESSAGE_CREATE" {
     try std.testing.expectEqualStrings("mem_oid_1", msg.sender_id);
     try std.testing.expectEqualStrings("group:grp_oid_1:grp001", msg.chat_id);
     try std.testing.expect(std.mem.startsWith(u8, msg.session_key, "qq:group:"));
+}
+
+test "qq handleGatewayEvent GROUP_AT_MESSAGE_CREATE prefers member_openid sender" {
+    const alloc = std.testing.allocator;
+    var event_bus_inst = bus.Bus.init();
+    defer event_bus_inst.close();
+
+    var ch = QQChannel.init(alloc, .{ .account_id = "qq-test" });
+    ch.setBus(&event_bus_inst);
+    ch.running.store(true, .release);
+
+    const msg_json =
+        \\{"op":0,"s":11,"t":"GROUP_AT_MESSAGE_CREATE","d":{"id":"grp002","group_openid":"grp_oid_2","author":{"id":"legacy-id","member_openid":"mem_oid_2"},"content":"@bot hello","timestamp":"2025-01-01T00:00:00Z"}}
+    ;
+    try ch.handleGatewayEvent(msg_json);
+
+    var msg = event_bus_inst.consumeInbound() orelse return try std.testing.expect(false);
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("mem_oid_2", msg.sender_id);
+    try std.testing.expectEqualStrings("group:grp_oid_2:grp002", msg.chat_id);
 }
 
 test "qq handleGatewayEvent C2C_MESSAGE_CREATE falls back to author id" {
