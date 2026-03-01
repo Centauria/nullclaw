@@ -323,10 +323,11 @@ pub const QQChannel = struct {
     allocator: std.mem.Allocator,
     event_bus: ?*bus.Bus,
     dedup: DedupRing,
-    sequence: ?i64,
-    heartbeat_interval_ms: u32,
+    sequence: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    has_sequence: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    heartbeat_interval_ms: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     session_id: ?[]const u8,
-    running: bool,
+    running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     reconnect_requested: bool = false,
     gateway_thread: ?std.Thread = null,
     heartbeat_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -346,10 +347,7 @@ pub const QQChannel = struct {
             .allocator = allocator,
             .event_bus = null,
             .dedup = .{},
-            .sequence = null,
-            .heartbeat_interval_ms = 0,
             .session_id = null,
-            .running = false,
         };
     }
 
@@ -362,7 +360,7 @@ pub const QQChannel = struct {
     }
 
     pub fn healthCheck(self: *QQChannel) bool {
-        return self.running;
+        return self.running.load(.acquire);
     }
 
     /// Set the event bus for publishing inbound messages.
@@ -414,7 +412,8 @@ pub const QQChannel = struct {
         // Update sequence number
         if (val.object.get("s")) |s_val| {
             if (s_val == .integer) {
-                self.sequence = s_val.integer;
+                self.sequence.store(s_val.integer, .release);
+                self.has_sequence.store(true, .release);
             }
         }
 
@@ -425,12 +424,12 @@ pub const QQChannel = struct {
                     if (d_val == .object) {
                         if (d_val.object.get("heartbeat_interval")) |hb_val| {
                             if (hb_val == .integer and hb_val.integer > 0) {
-                                self.heartbeat_interval_ms = @intCast(@min(hb_val.integer, std.math.maxInt(u32)));
+                                self.heartbeat_interval_ms.store(@intCast(@min(hb_val.integer, std.math.maxInt(u32))), .release);
                             }
                         }
                     }
                 }
-                log.info("QQ Gateway HELLO: heartbeat_interval={d}ms", .{self.heartbeat_interval_ms});
+                log.info("QQ Gateway HELLO: heartbeat_interval={d}ms", .{self.heartbeat_interval_ms.load(.acquire)});
             },
             .dispatch => {
                 const event_type = getJsonString(val, "t") orelse {
@@ -446,7 +445,7 @@ pub const QQChannel = struct {
                             self.session_id = self.allocator.dupe(u8, sid) catch null;
                         }
                     }
-                    self.running = true;
+                    self.running.store(true, .release);
                     log.info("QQ Gateway READY", .{});
                 } else if (std.mem.eql(u8, event_type, "MESSAGE_CREATE") or
                     std.mem.eql(u8, event_type, "AT_MESSAGE_CREATE") or
@@ -706,7 +705,7 @@ pub const QQChannel = struct {
 
     fn vtableStart(ptr: *anyopaque) anyerror!void {
         const self: *QQChannel = @ptrCast(@alignCast(ptr));
-        self.running = true;
+        self.running.store(true, .release);
         self.heartbeat_stop.store(false, .release);
         log.info("QQ channel starting (sandbox={s}, app_id={s})", .{ if (self.config.sandbox) "true" else "false", self.config.app_id });
         self.gateway_thread = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, gatewayLoop, .{self});
@@ -714,7 +713,7 @@ pub const QQChannel = struct {
 
     fn vtableStop(ptr: *anyopaque) void {
         const self: *QQChannel = @ptrCast(@alignCast(ptr));
-        self.running = false;
+        self.running.store(false, .release);
         self.heartbeat_stop.store(true, .release);
         // Close socket to unblock blocking read
         const fd = self.ws_fd.load(.acquire);
@@ -776,22 +775,22 @@ pub const QQChannel = struct {
         log.info("Gateway loop started", .{});
         const MAX_CONSECUTIVE_FAILURES: u32 = 10;
         var consecutive_failures: u32 = 0;
-        while (self.running) {
+        while (self.running.load(.acquire)) {
             const backoff_ms: u64 = if (consecutive_failures < 3) 5000 else 15000;
             self.runGatewayOnce() catch |err| {
                 log.warn("Gateway error: {}", .{err});
                 consecutive_failures += 1;
                 if (consecutive_failures >= MAX_CONSECUTIVE_FAILURES) {
                     log.err("Gateway: {d} consecutive failures, giving up", .{consecutive_failures});
-                    self.running = false;
+                    self.running.store(false, .release);
                     break;
                 }
             };
-            if (!self.running) break;
+            if (!self.running.load(.acquire)) break;
             log.info("Reconnecting in {d}ms (attempt {d}/{d})...", .{ backoff_ms, consecutive_failures + 1, MAX_CONSECUTIVE_FAILURES });
             // Interruptible backoff
             var slept: u64 = 0;
-            while (slept < backoff_ms and self.running) {
+            while (slept < backoff_ms and self.running.load(.acquire)) {
                 std.Thread.sleep(100 * std.time.ns_per_ms);
                 slept += 100;
             }
@@ -802,6 +801,9 @@ pub const QQChannel = struct {
     /// Single connection attempt: connect WS, HELLO, IDENTIFY, read loop.
     fn runGatewayOnce(self: *QQChannel) !void {
         self.reconnect_requested = false;
+        // Fresh IDENTIFY session: do not carry sequence from a previous connection.
+        self.has_sequence.store(false, .release);
+        self.sequence.store(0, .release);
         const gw_url = gatewayUrl(self.config.sandbox);
         const host = if (self.config.sandbox) "sandbox.api.sgroup.qq.com" else "api.sgroup.qq.com";
         const path = "/websocket";
@@ -815,7 +817,7 @@ pub const QQChannel = struct {
 
         // Start heartbeat thread
         self.heartbeat_stop.store(false, .release);
-        self.heartbeat_interval_ms = 0;
+        self.heartbeat_interval_ms.store(0, .release);
         const hbt = std.Thread.spawn(.{ .stack_size = 128 * 1024 }, heartbeatLoop, .{ self, &ws }) catch |err| {
             ws.deinit();
             return err;
@@ -835,7 +837,7 @@ pub const QQChannel = struct {
         log.info("Received HELLO frame", .{});
         try self.handleGatewayEvent(hello_text);
 
-        if (self.heartbeat_interval_ms == 0) {
+        if (self.heartbeat_interval_ms.load(.acquire) == 0) {
             log.info("ERROR: No heartbeat_interval in HELLO", .{});
             return error.InvalidHello;
         }
@@ -862,12 +864,12 @@ pub const QQChannel = struct {
             return error.InvalidSession;
         }
 
-        if (self.running) {
+        if (self.running.load(.acquire)) {
             log.info("Gateway READY — listening for messages (Ctrl+C to stop)", .{});
         }
 
         // Main read loop
-        while (self.running and !self.reconnect_requested) {
+        while (self.running.load(.acquire) and !self.reconnect_requested) {
             const maybe_text = ws.readTextMessage() catch |err| {
                 log.info("Gateway read failed: {}", .{err});
                 break;
@@ -892,12 +894,12 @@ pub const QQChannel = struct {
     /// Heartbeat thread: sends periodic heartbeat frames to keep the connection alive.
     fn heartbeatLoop(self: *QQChannel, ws: *websocket.WsClient) void {
         // Wait for heartbeat_interval to be set by HELLO handler
-        while (!self.heartbeat_stop.load(.acquire) and self.heartbeat_interval_ms == 0) {
+        while (!self.heartbeat_stop.load(.acquire) and self.heartbeat_interval_ms.load(.acquire) == 0) {
             std.Thread.sleep(10 * std.time.ns_per_ms);
         }
-        log.info("Heartbeat thread running (interval={d}ms)", .{self.heartbeat_interval_ms});
+        log.info("Heartbeat thread running (interval={d}ms)", .{self.heartbeat_interval_ms.load(.acquire)});
         while (!self.heartbeat_stop.load(.acquire)) {
-            const interval_ms: u64 = self.heartbeat_interval_ms;
+            const interval_ms: u64 = self.heartbeat_interval_ms.load(.acquire);
             // Interruptible sleep
             var elapsed: u64 = 0;
             while (elapsed < interval_ms) {
@@ -908,7 +910,8 @@ pub const QQChannel = struct {
             if (self.heartbeat_stop.load(.acquire)) return;
 
             var hb_buf: [64]u8 = undefined;
-            const hb_payload = buildHeartbeatPayload(&hb_buf, self.sequence) catch continue;
+            const seq: ?i64 = if (self.has_sequence.load(.acquire)) self.sequence.load(.acquire) else null;
+            const hb_payload = buildHeartbeatPayload(&hb_buf, seq) catch continue;
             ws.writeText(hb_payload) catch |err| {
                 log.warn("Heartbeat failed: {}", .{err});
             };
@@ -1194,8 +1197,8 @@ test "qq QQChannel init stores config" {
     try std.testing.expect(ch.config.sandbox);
     try std.testing.expectEqualStrings("qq", ch.channelName());
     try std.testing.expect(!ch.healthCheck());
-    try std.testing.expect(ch.sequence == null);
-    try std.testing.expectEqual(@as(u32, 0), ch.heartbeat_interval_ms);
+    try std.testing.expect(!ch.has_sequence.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), ch.heartbeat_interval_ms.load(.acquire));
 }
 
 test "qq QQChannel vtable compiles" {
@@ -1221,7 +1224,7 @@ test "qq handleGatewayEvent HELLO" {
         \\{"op":10,"d":{"heartbeat_interval":41250}}
     ;
     try ch.handleGatewayEvent(hello_json);
-    try std.testing.expectEqual(@as(u32, 41250), ch.heartbeat_interval_ms);
+    try std.testing.expectEqual(@as(u32, 41250), ch.heartbeat_interval_ms.load(.acquire));
 }
 
 test "qq handleGatewayEvent READY" {
@@ -1234,9 +1237,10 @@ test "qq handleGatewayEvent READY" {
         \\{"op":0,"s":1,"t":"READY","d":{"session_id":"sess_abc123","user":{"id":"bot1"}}}
     ;
     try ch.handleGatewayEvent(ready_json);
-    try std.testing.expect(ch.running);
+    try std.testing.expect(ch.running.load(.acquire));
     try std.testing.expectEqualStrings("sess_abc123", ch.session_id.?);
-    try std.testing.expectEqual(@as(i64, 1), ch.sequence.?);
+    try std.testing.expect(ch.has_sequence.load(.acquire));
+    try std.testing.expectEqual(@as(i64, 1), ch.sequence.load(.acquire));
 }
 
 test "qq handleGatewayEvent MESSAGE_CREATE" {
@@ -1246,7 +1250,7 @@ test "qq handleGatewayEvent MESSAGE_CREATE" {
 
     var ch = QQChannel.init(alloc, .{ .account_id = "qq-main" });
     ch.setBus(&event_bus_inst);
-    ch.running = true;
+    ch.running.store(true, .release);
 
     const msg_json =
         \\{"op":0,"s":2,"t":"MESSAGE_CREATE","d":{"id":"msg001","channel_id":"ch1","guild_id":"g1","content":"hello qq","author":{"id":"user1","username":"tester"}}}
@@ -1276,7 +1280,7 @@ test "qq handleGatewayEvent DIRECT_MESSAGE_CREATE" {
 
     var ch = QQChannel.init(alloc, .{});
     ch.setBus(&event_bus_inst);
-    ch.running = true;
+    ch.running.store(true, .release);
 
     const msg_json =
         \\{"op":0,"s":3,"t":"DIRECT_MESSAGE_CREATE","d":{"id":"dm001","channel_id":"dch1","guild_id":"dg1","content":"dm hello","author":{"id":"u2"}}}
@@ -1347,24 +1351,24 @@ test "qq handleGatewayEvent group allowlist filters" {
 test "qq handleGatewayEvent RECONNECT sets running false" {
     const alloc = std.testing.allocator;
     var ch = QQChannel.init(alloc, .{});
-    ch.running = true;
+    ch.running.store(true, .release);
     try ch.handleGatewayEvent("{\"op\":7}");
     // RECONNECT triggers a reconnect, not a full stop
     try std.testing.expect(ch.reconnect_requested);
-    try std.testing.expect(ch.running);
+    try std.testing.expect(ch.running.load(.acquire));
 }
 
 test "qq handleGatewayEvent INVALID_SESSION sets running false" {
     const alloc = std.testing.allocator;
     var ch = QQChannel.init(alloc, .{});
-    ch.running = true;
+    ch.running.store(true, .release);
     // Suppress expected warning from INVALID_SESSION opcode
     std.testing.log_level = .err;
     defer std.testing.log_level = .warn;
     try ch.handleGatewayEvent("{\"op\":9}");
     // INVALID_SESSION triggers a reconnect, not a full stop
     try std.testing.expect(ch.reconnect_requested);
-    try std.testing.expect(ch.running);
+    try std.testing.expect(ch.running.load(.acquire));
 }
 
 test "qq handleGatewayEvent HEARTBEAT_ACK is silent" {
@@ -1511,7 +1515,7 @@ test "qq handleGatewayEvent C2C_MESSAGE_CREATE" {
 
     var ch = QQChannel.init(alloc, .{ .account_id = "qq-test" });
     ch.setBus(&event_bus_inst);
-    ch.running = true;
+    ch.running.store(true, .release);
 
     const msg_json =
         \\{"op":0,"s":10,"t":"C2C_MESSAGE_CREATE","d":{"id":"c2c001","author":{"user_openid":"user_oid_1"},"content":"hi from c2c","timestamp":"2025-01-01T00:00:00Z"}}
@@ -1534,7 +1538,7 @@ test "qq handleGatewayEvent GROUP_AT_MESSAGE_CREATE" {
 
     var ch = QQChannel.init(alloc, .{ .account_id = "qq-test" });
     ch.setBus(&event_bus_inst);
-    ch.running = true;
+    ch.running.store(true, .release);
 
     const msg_json =
         \\{"op":0,"s":11,"t":"GROUP_AT_MESSAGE_CREATE","d":{"id":"grp001","group_openid":"grp_oid_1","author":{"member_openid":"mem_oid_1"},"content":"@bot hello","timestamp":"2025-01-01T00:00:00Z"}}
@@ -1556,7 +1560,7 @@ test "qq handleGatewayEvent C2C_MESSAGE_CREATE drops missing user_openid" {
 
     var ch = QQChannel.init(alloc, .{ .account_id = "qq-test" });
     ch.setBus(&event_bus_inst);
-    ch.running = true;
+    ch.running.store(true, .release);
 
     const msg_json =
         \\{"op":0,"s":12,"t":"C2C_MESSAGE_CREATE","d":{"id":"c2c-missing-openid","author":{"id":"legacy-id"},"content":"hi","timestamp":"2025-01-01T00:00:00Z"}}
@@ -1573,7 +1577,7 @@ test "qq handleGatewayEvent GROUP_AT_MESSAGE_CREATE drops missing group_openid" 
 
     var ch = QQChannel.init(alloc, .{ .account_id = "qq-test" });
     ch.setBus(&event_bus_inst);
-    ch.running = true;
+    ch.running.store(true, .release);
 
     const msg_json =
         \\{"op":0,"s":13,"t":"GROUP_AT_MESSAGE_CREATE","d":{"id":"grp-missing-openid","author":{"member_openid":"mem_oid_1"},"content":"@bot hello","timestamp":"2025-01-01T00:00:00Z"}}
