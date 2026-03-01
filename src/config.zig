@@ -806,6 +806,8 @@ pub const Config = struct {
         InvalidWebTransport,
         InvalidWebPath,
         InvalidWebAuthToken,
+        InvalidWebMessageAuthMode,
+        InvalidWebMessageAuthTransport,
         InvalidWebOrigin,
         MissingWebRelayUrl,
         InvalidWebRelayUrl,
@@ -871,6 +873,12 @@ pub const Config = struct {
                     return ValidationError.InvalidWebAuthToken;
                 }
             }
+            if (!config_types.WebConfig.isValidMessageAuthMode(web_cfg.message_auth_mode)) {
+                return ValidationError.InvalidWebMessageAuthMode;
+            }
+            if (relay_transport and config_types.WebConfig.isTokenMessageAuthMode(web_cfg.message_auth_mode)) {
+                return ValidationError.InvalidWebMessageAuthTransport;
+            }
             if (relay_transport) {
                 const relay_url = web_cfg.relay_url orelse return ValidationError.MissingWebRelayUrl;
                 if (!config_types.WebConfig.isValidRelayUrl(relay_url)) {
@@ -927,6 +935,8 @@ pub const Config = struct {
             ValidationError.InvalidWebTransport => std.debug.print("Config error: channels.web.accounts.<id>.transport must be 'local' or 'relay'.\n", .{}),
             ValidationError.InvalidWebPath => std.debug.print("Config error: channels.web.accounts.<id>.path must start with '/'.\n", .{}),
             ValidationError.InvalidWebAuthToken => std.debug.print("Config error: channels.web.accounts.<id>.auth_token/relay_token must be 16-128 printable chars without whitespace.\n", .{}),
+            ValidationError.InvalidWebMessageAuthMode => std.debug.print("Config error: channels.web.accounts.<id>.message_auth_mode must be 'pairing' or 'token'.\n", .{}),
+            ValidationError.InvalidWebMessageAuthTransport => std.debug.print("Config error: channels.web.accounts.<id>.message_auth_mode='token' is supported only when transport='local'.\n", .{}),
             ValidationError.InvalidWebOrigin => std.debug.print("Config error: channels.web.accounts.<id>.allowed_origins entries must be '*', 'null', or absolute origins (scheme://...).\n", .{}),
             ValidationError.MissingWebRelayUrl => std.debug.print("Config error: channels.web.accounts.<id>.relay_url is required when transport='relay'.\n", .{}),
             ValidationError.InvalidWebRelayUrl => std.debug.print("Config error: channels.web.accounts.<id>.relay_url must be an absolute wss:// URL.\n", .{}),
@@ -1970,6 +1980,48 @@ test "validation rejects unknown web transport mode" {
         },
     };
     try std.testing.expectError(Config.ValidationError.InvalidWebTransport, cfg.validate());
+}
+
+test "validation rejects unsupported web message_auth_mode value" {
+    const web_accounts = [_]WebConfig{
+        .{
+            .account_id = "default",
+            .message_auth_mode = "jwt",
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .web = &web_accounts,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidWebMessageAuthMode, cfg.validate());
+}
+
+test "validation rejects token message_auth_mode for relay transport" {
+    const web_accounts = [_]WebConfig{
+        .{
+            .account_id = "default",
+            .transport = "relay",
+            .message_auth_mode = "token",
+            .relay_url = "wss://relay.nullclaw.io/ws/agent",
+            .relay_agent_id = "agent-1",
+            .relay_token = "relay-token-0123456789",
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .web = &web_accounts,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidWebMessageAuthTransport, cfg.validate());
 }
 
 test "validation rejects relay transport without relay_url" {
@@ -3361,6 +3413,7 @@ test "parse web accounts with auth token path and allowed origins" {
     try std.testing.expectEqual(@as(u16, 32123), wc.port);
     try std.testing.expectEqualStrings("/ws", wc.path);
     try std.testing.expectEqualStrings("relay-token-123456", wc.auth_token.?);
+    try std.testing.expectEqualStrings("pairing", wc.message_auth_mode);
     try std.testing.expectEqual(@as(usize, 2), wc.allowed_origins.len);
     try std.testing.expectEqualStrings("https://relay.nullclaw.io", wc.allowed_origins[0]);
     try std.testing.expectEqualStrings("chrome-extension://abc", wc.allowed_origins[1]);
@@ -3371,6 +3424,27 @@ test "parse web accounts with auth token path and allowed origins" {
     allocator.free(wc.auth_token.?);
     for (wc.allowed_origins) |origin| allocator.free(origin);
     allocator.free(wc.allowed_origins);
+    allocator.free(cfg.channels.web);
+}
+
+test "parse web account with token message auth mode" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"channels": {"web": {"accounts": {"default": {"listen": "127.0.0.1", "port": 32123, "path": "/ws", "auth_token": "token-mode-1234567890", "message_auth_mode": "token"}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.channels.web.len);
+    const wc = cfg.channels.web[0];
+    try std.testing.expectEqualStrings("token", wc.message_auth_mode);
+    try std.testing.expectEqualStrings("token-mode-1234567890", wc.auth_token.?);
+
+    allocator.free(wc.account_id);
+    allocator.free(wc.listen);
+    allocator.free(wc.path);
+    allocator.free(wc.auth_token.?);
+    allocator.free(wc.message_auth_mode);
     allocator.free(cfg.channels.web);
 }
 

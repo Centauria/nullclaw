@@ -46,6 +46,11 @@ pub const WebChannel = struct {
         relay,
     };
 
+    const MessageAuthMode = enum {
+        pairing,
+        token,
+    };
+
     allocator: std.mem.Allocator,
     transport: WebTransport,
     port: u16,
@@ -62,6 +67,7 @@ pub const WebChannel = struct {
     relay_pairing_code_ttl_secs: u32,
     relay_ui_token_ttl_secs: u32,
     relay_e2e_required: bool,
+    message_auth_mode: MessageAuthMode,
     bus: ?*bus_mod.Bus = null,
 
     // Active auth token (configured/env/generate).
@@ -131,12 +137,18 @@ pub const WebChannel = struct {
             .relay_pairing_code_ttl_secs = cfg.relay_pairing_code_ttl_secs,
             .relay_ui_token_ttl_secs = cfg.relay_ui_token_ttl_secs,
             .relay_e2e_required = cfg.relay_e2e_required,
+            .message_auth_mode = parseMessageAuthMode(cfg.message_auth_mode),
         };
     }
 
     fn parseTransport(raw: []const u8) WebTransport {
         if (config_types.WebConfig.isRelayTransport(raw)) return .relay;
         return .local;
+    }
+
+    fn parseMessageAuthMode(raw: []const u8) MessageAuthMode {
+        if (config_types.WebConfig.isTokenMessageAuthMode(raw)) return .token;
+        return .pairing;
     }
 
     pub fn channel(self: *WebChannel) root.Channel {
@@ -405,11 +417,14 @@ pub const WebChannel = struct {
             log.info("Web UI JWT signing key generated and persisted", .{});
         }
         self.jwt_ready = true;
-        self.relay_pairing_guard = try pairing_mod.PairingGuard.init(self.allocator, true, &.{});
+        const pairing_enabled = !(self.transport == .local and self.message_auth_mode == .token);
+        self.relay_pairing_guard = try pairing_mod.PairingGuard.init(self.allocator, pairing_enabled, &.{});
         self.relay_pairing_issued_at = std.time.timestamp();
 
         if (self.transport == .local) {
-            self.rotateRelayPairingCode("fixed-local");
+            if (pairing_enabled) {
+                self.rotateRelayPairingCode("fixed-local");
+            }
         } else if (self.relay_pairing_guard) |*guard| {
             if (guard.pairingCode()) |code| {
                 log.info("Web relay pairing code (one-time, {d}s TTL): {s}", .{
@@ -975,6 +990,11 @@ pub const WebChannel = struct {
             log.warn("Web channel using ephemeral auth token for this run", .{});
         }
 
+        if (self.message_auth_mode == .token and token_source == .ephemeral) {
+            log.err("Web channel message_auth_mode=token requires stable auth token from config (channels.web.auth_token) or env (NULLCLAW_WEB_TOKEN/NULLCLAW_GATEWAY_TOKEN/OPENCLAW_GATEWAY_TOKEN)", .{});
+            return error.InvalidConfiguration;
+        }
+
         try self.initRelaySecurityState();
         errdefer self.deinitRelaySecurityState();
 
@@ -1001,6 +1021,9 @@ pub const WebChannel = struct {
         switch (token_source) {
             .ephemeral => log.warn("Web channel one-time optional upgrade token: {s}", .{self.activeToken()}),
             .config, .env => log.info("Web channel optional upgrade auth token active (hidden in logs)", .{}),
+        }
+        if (self.message_auth_mode == .token) {
+            log.info("Web channel user_message auth mode: token", .{});
         }
     }
 
@@ -1318,17 +1341,50 @@ pub const WebChannel = struct {
         }
 
         if (std.mem.eql(u8, event_type, "pairing_request")) {
+            if (self.message_auth_mode == .token and self.transport == .local) {
+                self.sendRelayError(session_id, request_id, "pairing_disabled", "pairing_request is disabled when message_auth_mode=token");
+                return;
+            }
             self.handleRelayPairingRequest(session_id, request_id, payload_obj);
             return;
         }
 
         if (!std.mem.eql(u8, event_type, "user_message")) return;
 
-        const access_token = payloadStringField(payload_obj, "access_token") orelse
-            eventStringField(obj, "access_token") orelse {
-            self.sendRelayError(session_id, request_id, "unauthorized", "access_token is required");
-            return;
-        };
+        const access_token = payloadStringField(payload_obj, "access_token") orelse eventStringField(obj, "access_token");
+        const auth_token = payloadStringField(payload_obj, "auth_token") orelse eventStringField(obj, "auth_token");
+
+        var verified_opt: ?VerifiedJwt = null;
+        defer if (verified_opt) |*verified| verified.deinit(self.allocator);
+
+        switch (self.message_auth_mode) {
+            .pairing => {
+                const ui_access_token = access_token orelse {
+                    self.sendRelayError(session_id, request_id, "unauthorized", "access_token is required");
+                    return;
+                };
+                verified_opt = self.verifyUiAccessToken(ui_access_token) orelse {
+                    self.sendRelayError(session_id, request_id, "unauthorized", "access_token is invalid or expired");
+                    return;
+                };
+
+                self.upsertSessionBinding(session_id, verified_opt.?.sub) catch {
+                    self.sendRelayError(session_id, request_id, "internal_error", "failed to bind session to UI client");
+                    return;
+                };
+            },
+            .token => {
+                const inbound_token = auth_token orelse access_token orelse {
+                    self.sendRelayError(session_id, request_id, "unauthorized", "auth_token is required");
+                    return;
+                };
+                if (!self.validateToken(inbound_token)) {
+                    self.sendRelayError(session_id, request_id, "unauthorized", "auth_token is invalid");
+                    return;
+                }
+            },
+        }
+
         const e2e_obj = blk: {
             if (payload_obj) |p| {
                 if (p.get("e2e")) |value| {
@@ -1336,16 +1392,6 @@ pub const WebChannel = struct {
                 }
             }
             break :blk null;
-        };
-        var verified = self.verifyUiAccessToken(access_token) orelse {
-            self.sendRelayError(session_id, request_id, "unauthorized", "access_token is invalid or expired");
-            return;
-        };
-        defer verified.deinit(self.allocator);
-
-        self.upsertSessionBinding(session_id, verified.sub) catch {
-            self.sendRelayError(session_id, request_id, "internal_error", "failed to bind session to UI client");
-            return;
         };
 
         var decrypted_payload_owned: ?[]u8 = null;
@@ -1358,6 +1404,10 @@ pub const WebChannel = struct {
                     return;
                 }
             }
+            const verified = verified_opt orelse {
+                self.sendRelayError(session_id, request_id, "e2e_requires_pairing", "payload.e2e requires pairing access_token auth");
+                return;
+            };
             const e2e_session = self.e2eSessionByClient(verified.sub) orelse {
                 self.sendRelayError(session_id, request_id, "e2e_not_initialized", "no e2e session is bound to this UI token");
                 return;
@@ -1565,7 +1615,11 @@ pub const WebChannel = struct {
                     log.warn("WS connection rejected: token required for non-loopback bind", .{});
                     return error.Forbidden;
                 }
-                log.info("WS client connected without upgrade token; waiting for pairing_request", .{});
+                if (web_channel.message_auth_mode == .token) {
+                    log.info("WS client connected without upgrade token; waiting for token-authenticated user_message", .{});
+                } else {
+                    log.info("WS client connected without upgrade token; waiting for pairing_request", .{});
+                }
             }
 
             // Extract session_id from query (optional, default to "default")
@@ -1730,6 +1784,7 @@ test "WebChannel initFromConfig uses defaults" {
     try std.testing.expect(ch.relay_url == null);
     try std.testing.expectEqualStrings("default", ch.relay_agent_id);
     try std.testing.expect(ch.configured_relay_token == null);
+    try std.testing.expectEqual(WebChannel.MessageAuthMode.pairing, ch.message_auth_mode);
     try std.testing.expect(ch.bus == null);
     try std.testing.expect(!ch.running.load(.acquire));
 }
@@ -1746,6 +1801,7 @@ test "WebChannel initFromConfig uses custom values" {
         .max_connections = 5,
         .account_id = "web-main",
         .auth_token = "test-token-123456",
+        .message_auth_mode = "token",
         .allowed_origins = &origins,
     });
     try std.testing.expectEqual(@as(u16, 8080), ch.port);
@@ -1754,6 +1810,7 @@ test "WebChannel initFromConfig uses custom values" {
     try std.testing.expectEqual(@as(u16, 5), ch.max_connections);
     try std.testing.expectEqualStrings("web-main", ch.account_id);
     try std.testing.expectEqualStrings("test-token-123456", ch.configured_auth_token.?);
+    try std.testing.expectEqual(WebChannel.MessageAuthMode.token, ch.message_auth_mode);
     try std.testing.expectEqual(@as(usize, 2), ch.allowed_origins.len);
 }
 
@@ -1979,6 +2036,74 @@ test "WebChannel handleInboundEvent parses v1 envelope payload" {
     try std.testing.expectEqualStrings("ui-1", msg.sender_id);
     try std.testing.expect(msg.metadata_json != null);
     try std.testing.expect(std.mem.indexOf(u8, msg.metadata_json.?, "\"request_id\":\"req-7\"") != null);
+}
+
+test "WebChannel local token mode accepts user_message with auth_token" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "local",
+        .account_id = "web-main",
+        .message_auth_mode = "token",
+    });
+    try ch.setActiveToken("token-mode-1234567890");
+
+    var bus = bus_mod.Bus.init();
+    ch.setBus(&bus);
+    ch.handleInboundEvent("{\"v\":1,\"type\":\"user_message\",\"session_id\":\"sess-token\",\"payload\":{\"auth_token\":\"token-mode-1234567890\",\"content\":\"hello token\",\"sender_id\":\"orchestrator\"}}", null);
+
+    try std.testing.expectEqual(@as(usize, 1), bus.inboundDepth());
+    const msg = bus.consumeInbound() orelse return error.TestUnexpectedResult;
+    defer msg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("sess-token", msg.chat_id);
+    try std.testing.expectEqualStrings("orchestrator", msg.sender_id);
+    try std.testing.expectEqualStrings("hello token", msg.content);
+}
+
+test "WebChannel local token mode accepts token in access_token field for compatibility" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "local",
+        .account_id = "web-main",
+        .message_auth_mode = "token",
+    });
+    try ch.setActiveToken("token-mode-1234567890");
+
+    var bus = bus_mod.Bus.init();
+    ch.setBus(&bus);
+    ch.handleInboundEvent("{\"v\":1,\"type\":\"user_message\",\"session_id\":\"sess-token\",\"payload\":{\"access_token\":\"token-mode-1234567890\",\"content\":\"hello token\"}}", null);
+
+    try std.testing.expectEqual(@as(usize, 1), bus.inboundDepth());
+    const msg = bus.consumeInbound() orelse return error.TestUnexpectedResult;
+    defer msg.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("hello token", msg.content);
+}
+
+test "WebChannel local token mode rejects user_message without token" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "local",
+        .message_auth_mode = "token",
+    });
+    try ch.setActiveToken("token-mode-1234567890");
+
+    var bus = bus_mod.Bus.init();
+    ch.setBus(&bus);
+    ch.handleInboundEvent("{\"v\":1,\"type\":\"user_message\",\"session_id\":\"sess-token\",\"payload\":{\"content\":\"hello\"}}", null);
+
+    try std.testing.expectEqual(@as(usize, 0), bus.inboundDepth());
+}
+
+test "WebChannel local token mode ignores pairing_request events" {
+    var ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .transport = "local",
+        .message_auth_mode = "token",
+    });
+    defer ch.deinitRelaySecurityState();
+    try ch.initRelaySecurityState();
+
+    var bus = bus_mod.Bus.init();
+    ch.setBus(&bus);
+    ch.handleInboundEvent("{\"v\":1,\"type\":\"pairing_request\",\"session_id\":\"sess-token\",\"payload\":{\"pairing_code\":\"123456\"}}", null);
+
+    try std.testing.expectEqual(@as(usize, 0), bus.inboundDepth());
+    try std.testing.expect(!ch.relay_pairing_guard.?.isPaired());
 }
 
 test "WebChannel relay UI access token verify and tamper detect" {

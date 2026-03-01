@@ -399,6 +399,7 @@ Use `channels.web` for browser UI events (WebChannel v1):
           "port": 32123,
           "path": "/ws",
           "auth_token": "replace-with-long-random-token",
+          "message_auth_mode": "pairing",
           "allowed_origins": ["http://localhost:5173", "chrome-extension://your-extension-id"]
         }
       }
@@ -408,10 +409,13 @@ Use `channels.web` for browser UI events (WebChannel v1):
 ```
 
 - Local: keep `"listen": "127.0.0.1"`.
-- Local and relay use the same pairing flow: send `pairing_request`, receive `pairing_result`, then include UI `access_token` in every `user_message`.
+- `message_auth_mode` controls inbound `user_message` auth:
+  - `"pairing"` (default): send `pairing_request`, receive `pairing_result`, include UI `access_token` in every `user_message`.
+  - `"token"` (local transport only): include `auth_token` in each `user_message` payload (`access_token` is also accepted for compatibility).
 - `auth_token` is optional hardening for WebSocket upgrade and required when binding non-loopback addresses.
 - Remote host: set `"listen": "0.0.0.0"` and terminate TLS at proxy/CDN (`wss://...`).
 - UI/extension should live in a separate repository and connect via this WebSocket endpoint.
+- For orchestration, use local token mode with a stable token from config or env (`NULLCLAW_WEB_TOKEN`, `NULLCLAW_GATEWAY_TOKEN`, `OPENCLAW_GATEWAY_TOKEN`).
 - Relay transport (outbound agent socket) is configured via:
 
 ```json
