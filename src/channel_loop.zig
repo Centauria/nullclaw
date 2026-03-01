@@ -25,6 +25,7 @@ const provider_runtime = @import("providers/runtime_bundle.zig");
 const signal = @import("channels/signal.zig");
 const matrix = @import("channels/matrix.zig");
 const channels_mod = @import("channels/root.zig");
+const Atomic = @import("portable_atomic.zig").Atomic;
 
 const log = std.log.scoped(.channel_loop);
 const TELEGRAM_OFFSET_STORE_VERSION: i64 = 1;
@@ -187,16 +188,16 @@ fn matrixRoomPeerId(reply_target: ?[]const u8) []const u8 {
 
 pub const TelegramLoopState = struct {
     /// Updated after each pollUpdates() — epoch seconds.
-    last_activity: std.atomic.Value(i64),
+    last_activity: Atomic(i64),
     /// Supervisor sets this to ask the polling thread to stop.
-    stop_requested: std.atomic.Value(bool),
+    stop_requested: Atomic(bool),
     /// Thread handle for join().
     thread: ?std.Thread = null,
 
     pub fn init() TelegramLoopState {
         return .{
-            .last_activity = std.atomic.Value(i64).init(std.time.timestamp()),
-            .stop_requested = std.atomic.Value(bool).init(false),
+            .last_activity = Atomic(i64).init(std.time.timestamp()),
+            .stop_requested = Atomic(bool).init(false),
         };
     }
 };
@@ -269,6 +270,12 @@ pub const ChannelRuntime = struct {
         // Tools
         const tools = tools_mod.allTools(allocator, config.workspace_dir, .{
             .http_enabled = config.http_request.enabled,
+            .http_allowed_domains = config.http_request.allowed_domains,
+            .http_max_response_size = config.http_request.max_response_size,
+            .http_timeout_secs = config.http_request.timeout_secs,
+            .web_search_base_url = config.http_request.search_base_url,
+            .web_search_provider = config.http_request.search_provider,
+            .web_search_fallback_providers = config.http_request.search_fallback_providers,
             .browser_enabled = config.browser.enabled,
             .screenshot_enabled = true,
             .mcp_tools = mcp_tools,
@@ -371,6 +378,10 @@ pub fn runTelegramLoop(
         };
         tg_ptr.transcriber = wt.transcriber();
     }
+    defer if (tg_ptr.transcriber) |t| {
+        allocator.destroy(@as(*voice.WhisperTranscriber, @ptrCast(@alignCast(t.ptr))));
+        tg_ptr.transcriber = null;
+    };
 
     // Restore persisted Telegram offset (OpenClaw parity).
     if (loadTelegramUpdateOffset(allocator, config, tg_ptr.account_id, tg_ptr.bot_token)) |saved_update_id| {
@@ -454,7 +465,7 @@ pub fn runTelegramLoop(
             };
             defer allocator.free(reply);
 
-            tg_ptr.sendMessageWithReply(msg.sender, reply, reply_to_id) catch |err| {
+            tg_ptr.sendAssistantMessageWithReply(msg.sender, msg.id, msg.is_group, reply, reply_to_id) catch |err| {
                 log.warn("Send error: {}", .{err});
             };
         }
@@ -494,16 +505,16 @@ pub fn runTelegramLoop(
 
 pub const SignalLoopState = struct {
     /// Updated after each pollMessages() — epoch seconds.
-    last_activity: std.atomic.Value(i64),
+    last_activity: Atomic(i64),
     /// Supervisor sets this to ask the polling thread to stop.
-    stop_requested: std.atomic.Value(bool),
+    stop_requested: Atomic(bool),
     /// Thread handle for join().
     thread: ?std.Thread = null,
 
     pub fn init() SignalLoopState {
         return .{
-            .last_activity = std.atomic.Value(i64).init(std.time.timestamp()),
-            .stop_requested = std.atomic.Value(bool).init(false),
+            .last_activity = Atomic(i64).init(std.time.timestamp()),
+            .stop_requested = Atomic(bool).init(false),
         };
     }
 };
@@ -628,16 +639,16 @@ pub fn runSignalLoop(
 
 pub const MatrixLoopState = struct {
     /// Updated after each pollMessages() — epoch seconds.
-    last_activity: std.atomic.Value(i64),
+    last_activity: Atomic(i64),
     /// Supervisor sets this to ask the polling thread to stop.
-    stop_requested: std.atomic.Value(bool),
+    stop_requested: Atomic(bool),
     /// Thread handle for join().
     thread: ?std.Thread = null,
 
     pub fn init() MatrixLoopState {
         return .{
-            .last_activity = std.atomic.Value(i64).init(std.time.timestamp()),
-            .stop_requested = std.atomic.Value(bool).init(false),
+            .last_activity = Atomic(i64).init(std.time.timestamp()),
+            .stop_requested = Atomic(bool).init(false),
         };
     }
 };
@@ -665,7 +676,7 @@ pub fn spawnTelegramPolling(
 
     const tg_ptr: *telegram.TelegramChannel = @ptrCast(@alignCast(channel.ptr));
     const thread = try std.Thread.spawn(
-        .{ .stack_size = 512 * 1024 },
+        .{ .stack_size = 2 * 1024 * 1024 },
         runTelegramLoop,
         .{ allocator, config, runtime, tg_ls, tg_ptr },
     );
@@ -689,7 +700,7 @@ pub fn spawnSignalPolling(
 
     const sg_ptr: *signal.SignalChannel = @ptrCast(@alignCast(channel.ptr));
     const thread = try std.Thread.spawn(
-        .{ .stack_size = 512 * 1024 },
+        .{ .stack_size = 2 * 1024 * 1024 },
         runSignalLoop,
         .{ allocator, config, runtime, sg_ls, sg_ptr },
     );
@@ -713,7 +724,7 @@ pub fn spawnMatrixPolling(
 
     const mx_ptr: *matrix.MatrixChannel = @ptrCast(@alignCast(channel.ptr));
     const thread = try std.Thread.spawn(
-        .{ .stack_size = 512 * 1024 },
+        .{ .stack_size = 2 * 1024 * 1024 },
         runMatrixLoop,
         .{ allocator, config, runtime, mx_ls, mx_ptr },
     );

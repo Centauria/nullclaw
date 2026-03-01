@@ -256,7 +256,16 @@ fn parseChannels(self: *Config, channels_value: std.json.Value) !void {
                 },
                 .optional => |opt| {
                     const Child = opt.child;
-                    if (comptime @hasField(Child, "account_id")) {
+                    const info = @typeInfo(Child);
+                    if (info == .pointer and info.pointer.size == .one) {
+                        // ?*T — heap-allocated single config (e.g. NostrConfig)
+                        const Pointee = info.pointer.child;
+                        if (parseInlineChannel(Pointee, self.allocator, channel_value)) |parsed| {
+                            const ptr = try self.allocator.create(Pointee);
+                            ptr.* = parsed;
+                            @field(self.channels, field.name) = ptr;
+                        }
+                    } else if (comptime @hasField(Child, "account_id")) {
                         if (try parseSingleAccountChannel(Child, self.allocator, channel_value)) |parsed| {
                             @field(self.channels, field.name) = parsed;
                         }
@@ -280,6 +289,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
     const root = parsed.value.object;
 
     // Top-level fields
+    if (root.get("workspace")) |v| {
+        if (v == .string) {
+            self.workspace_dir_override = try self.allocator.dupe(u8, v.string);
+            self.workspace_dir = self.workspace_dir_override.?;
+        }
+    }
     if (root.get("default_provider")) |v| {
         if (v == .string) self.legacy_default_provider_detected = true;
     }
@@ -663,6 +678,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             }
             if (sch.object.get("max_concurrent")) |v| {
                 if (v == .integer) self.scheduler.max_concurrent = @intCast(v.integer);
+            }
+            if (sch.object.get("agent_timeout_secs")) |v| {
+                if (v == .integer and v.integer >= 0) self.scheduler.agent_timeout_secs = @intCast(v.integer);
             }
         }
     }
@@ -1404,6 +1422,15 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             }
             if (hr.object.get("allowed_domains")) |v| {
                 if (v == .array) self.http_request.allowed_domains = try parseStringArray(self.allocator, v.array);
+            }
+            if (hr.object.get("search_base_url")) |v| {
+                if (v == .string) self.http_request.search_base_url = try self.allocator.dupe(u8, v.string);
+            }
+            if (hr.object.get("search_provider")) |v| {
+                if (v == .string) self.http_request.search_provider = try self.allocator.dupe(u8, v.string);
+            }
+            if (hr.object.get("search_fallback_providers")) |v| {
+                if (v == .array) self.http_request.search_fallback_providers = try parseStringArray(self.allocator, v.array);
             }
         }
     }

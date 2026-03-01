@@ -6,7 +6,7 @@
 //!   - Body size limits (64KB max)
 //!   - Request timeouts (30s)
 //!   - Bearer token authentication (PairingGuard)
-//!   - Endpoints: /health, /ready, /pair, /webhook, /whatsapp, /telegram, /line, /lark, /slack/events
+//!   - Endpoints: /health, /ready, /pair, /webhook, /whatsapp, /telegram, /line, /lark, /qq, /slack/events
 //!
 //! Uses std.http.Server (built-in, no external deps).
 
@@ -38,6 +38,142 @@ pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 
 /// How often the rate limiter sweeps stale IP entries (5 min).
 const RATE_LIMITER_SWEEP_INTERVAL_SECS: u64 = 300;
+const MAX_OBSERVED_TOOL_EVENTS: usize = 512;
+
+const GatewayObservedToolEventKind = enum { start, result };
+
+const GatewayObservedToolEvent = struct {
+    seq: u64,
+    kind: GatewayObservedToolEventKind,
+    tool: []u8,
+    success: bool = false,
+};
+
+const GatewayTurnToolEvent = struct {
+    kind: GatewayObservedToolEventKind,
+    tool: []const u8,
+    success: bool = false,
+};
+
+/// Thread-safe observer that records tool call events within the gateway.
+/// Used to enrich webhook responses with tool execution summaries.
+const GatewayThreadObserver = struct {
+    allocator: std.mem.Allocator,
+    mutex: std.Thread.Mutex = .{},
+    next_seq: u64 = 0,
+    events: std.ArrayListUnmanaged(GatewayObservedToolEvent) = .empty,
+
+    const vtable = observability.Observer.VTable{
+        .record_event = recordEvent,
+        .record_metric = recordMetric,
+        .flush = flush,
+        .name = name,
+    };
+
+    pub fn init(allocator: std.mem.Allocator) GatewayThreadObserver {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *GatewayThreadObserver) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.events.items) |event| {
+            self.allocator.free(event.tool);
+        }
+        self.events.deinit(self.allocator);
+    }
+
+    pub fn observer(self: *GatewayThreadObserver) observability.Observer {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &vtable,
+        };
+    }
+
+    pub fn currentSeq(self: *GatewayThreadObserver) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.next_seq;
+    }
+
+    pub fn collectSince(
+        self: *GatewayThreadObserver,
+        allocator: std.mem.Allocator,
+        seq: u64,
+    ) ![]GatewayTurnToolEvent {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var count: usize = 0;
+        for (self.events.items) |event| {
+            if (event.seq > seq) count += 1;
+        }
+
+        const out = try allocator.alloc(GatewayTurnToolEvent, count);
+        errdefer allocator.free(out);
+        var out_idx: usize = 0;
+        errdefer {
+            for (out[0..out_idx]) |event| {
+                allocator.free(event.tool);
+            }
+        }
+        for (self.events.items) |event| {
+            if (event.seq <= seq) continue;
+
+            out[out_idx] = .{
+                .kind = event.kind,
+                .tool = try allocator.dupe(u8, event.tool),
+                .success = event.success,
+            };
+            out_idx += 1;
+        }
+
+        return out;
+    }
+
+    fn recordEvent(ptr: *anyopaque, event: *const observability.ObserverEvent) void {
+        const self: *GatewayThreadObserver = @ptrCast(@alignCast(ptr));
+        switch (event.*) {
+            .tool_call_start => |e| self.appendEvent(.start, e.tool, false),
+            .tool_call => |e| self.appendEvent(.result, e.tool, e.success),
+            else => {},
+        }
+    }
+
+    fn recordMetric(_: *anyopaque, _: *const observability.ObserverMetric) void {}
+    fn flush(_: *anyopaque) void {}
+    fn name(_: *anyopaque) []const u8 {
+        return "gateway_thread";
+    }
+
+    fn appendEvent(
+        self: *GatewayThreadObserver,
+        kind: GatewayObservedToolEventKind,
+        tool: []const u8,
+        success: bool,
+    ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const owned_tool = self.allocator.dupe(u8, tool) catch return;
+
+        self.next_seq += 1;
+        self.events.append(self.allocator, .{
+            .seq = self.next_seq,
+            .kind = kind,
+            .tool = owned_tool,
+            .success = success,
+        }) catch {
+            self.allocator.free(owned_tool);
+            return;
+        };
+
+        while (self.events.items.len > MAX_OBSERVED_TOOL_EVENTS) {
+            const oldest = self.events.orderedRemove(0);
+            self.allocator.free(oldest.tool);
+        }
+    }
+};
 
 // ── Rate Limiter ─────────────────────────────────────────────────
 
@@ -231,6 +367,7 @@ pub const GatewayState = struct {
     lark_app_secret: []const u8 = "",
     lark_account_id: []const u8 = "default",
     lark_allow_from: []const []const u8 = &.{},
+    qq_channels: std.ArrayListUnmanaged(channels.qq.QQChannel) = .empty,
     pairing_guard: ?PairingGuard,
     event_bus: ?*bus_mod.Bus = null,
 
@@ -252,6 +389,10 @@ pub const GatewayState = struct {
     }
 
     pub fn deinit(self: *GatewayState) void {
+        for (self.qq_channels.items) |*qq_ch| {
+            qq_ch.channel().stop();
+        }
+        self.qq_channels.deinit(self.allocator);
         self.rate_limiter.deinit(self.allocator);
         self.idempotency.deinit(self.allocator);
         if (self.pairing_guard) |*guard| {
@@ -567,6 +708,55 @@ pub fn jsonWrapResponse(allocator: std.mem.Allocator, response: []const u8) ![]u
     return buf.toOwnedSlice(allocator);
 }
 
+/// Build a JSON array summarizing tool events from a turn.
+fn buildThreadEventsJson(
+    allocator: std.mem.Allocator,
+    tool_events: []const GatewayTurnToolEvent,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+
+    try w.writeByte('[');
+
+    var tool_results: usize = 0;
+    var failed_results: usize = 0;
+    for (tool_events) |event| {
+        if (event.kind != .result) continue;
+        tool_results += 1;
+        if (!event.success) failed_results += 1;
+    }
+
+    if (tool_results > 0) {
+        try w.writeAll("{\"type\":\"tool_summary\",\"total\":");
+        try w.print("{d}", .{tool_results});
+        try w.writeAll(",\"failed\":");
+        try w.print("{d}", .{failed_results});
+        try w.writeByte('}');
+    }
+
+    try w.writeByte(']');
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Build a webhook success response with tool events:
+/// `{"status":"ok","response":"<escaped>","thread_events":[...]}`.
+fn buildWebhookSuccessResponse(
+    allocator: std.mem.Allocator,
+    response_text: []const u8,
+    thread_events_json: []const u8,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("{\"status\":\"ok\",\"response\":\"");
+    try jsonEscapeInto(w, response_text);
+    try w.writeAll("\",\"thread_events\":");
+    try w.writeAll(thread_events_json);
+    try w.writeByte('}');
+    return buf.toOwnedSlice(allocator);
+}
+
 /// Build a JSON challenge response: `{"challenge":"<escaped>"}`.
 /// Returns an owned slice. Caller must free.
 fn jsonWrapChallenge(allocator: std.mem.Allocator, challenge: []const u8) ![]u8 {
@@ -768,6 +958,65 @@ fn selectLarkConfig(
     }
 
     return &cfg.channels.lark[0];
+}
+
+fn findQqConfigByAccountId(cfg: *const Config, account_id: []const u8) ?*const config_types.QQConfig {
+    for (cfg.channels.qq) |*qq_cfg| {
+        if (std.ascii.eqlIgnoreCase(qq_cfg.account_id, account_id)) return qq_cfg;
+    }
+    return null;
+}
+
+fn findQqConfigByAppId(cfg: *const Config, app_id: []const u8) ?*const config_types.QQConfig {
+    for (cfg.channels.qq) |*qq_cfg| {
+        if (std.mem.eql(u8, qq_cfg.app_id, app_id)) return qq_cfg;
+    }
+    return null;
+}
+
+fn selectQqConfig(
+    cfg_opt: ?*const Config,
+    target: []const u8,
+    app_id_header: ?[]const u8,
+) ?*const config_types.QQConfig {
+    if (!build_options.enable_channel_qq) return null;
+    const cfg = cfg_opt orelse return null;
+    if (cfg.channels.qq.len == 0) return null;
+
+    if (parseQueryParam(target, "account_id")) |account_id| {
+        if (findQqConfigByAccountId(cfg, account_id)) |qq_cfg| {
+            return qq_cfg;
+        }
+    }
+    if (parseQueryParam(target, "account")) |account_id| {
+        if (findQqConfigByAccountId(cfg, account_id)) |qq_cfg| {
+            return qq_cfg;
+        }
+    }
+
+    if (app_id_header) |raw_app_id| {
+        const app_id = std.mem.trim(u8, raw_app_id, " \t\r\n");
+        if (app_id.len > 0) {
+            if (findQqConfigByAppId(cfg, app_id)) |qq_cfg| {
+                return qq_cfg;
+            }
+        }
+    }
+
+    if (cfg.channels.qqPrimary()) |primary| {
+        if (findQqConfigByAccountId(cfg, primary.account_id)) |qq_cfg| {
+            return qq_cfg;
+        }
+    }
+
+    return &cfg.channels.qq[0];
+}
+
+fn findQqRuntimeChannel(state: *GatewayState, account_id: []const u8) ?*channels.qq.QQChannel {
+    for (state.qq_channels.items) |*qq_ch| {
+        if (std.ascii.eqlIgnoreCase(qq_ch.config.account_id, account_id)) return qq_ch;
+    }
+    return null;
 }
 
 fn webhookBasePath(target: []const u8) []const u8 {
@@ -1343,6 +1592,7 @@ const webhook_route_descriptors = [_]WebhookRouteDescriptor{
     .{ .path = "/slack/events", .handler = handleSlackWebhookRoute },
     .{ .path = "/line", .handler = handleLineWebhookRoute },
     .{ .path = "/lark", .handler = handleLarkWebhookRoute },
+    .{ .path = "/qq", .handler = handleQqWebhookRoute },
 };
 
 fn findWebhookRouteDescriptor(path: []const u8) ?*const WebhookRouteDescriptor {
@@ -2075,8 +2325,111 @@ fn handleLarkWebhookRoute(ctx: *WebhookHandlerContext) void {
     ctx.response_body = "{\"status\":\"ok\"}";
 }
 
+fn handleQqWebhookRoute(ctx: *WebhookHandlerContext) void {
+    if (!build_options.enable_channel_qq) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"qq channel disabled in this build\"}";
+        return;
+    }
+
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    if (!ctx.state.rate_limiter.allowWebhook(ctx.state.allocator, "qq")) {
+        ctx.response_status = "429 Too Many Requests";
+        ctx.response_body = "{\"error\":\"rate limited\"}";
+        return;
+    }
+
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_body = "{\"status\":\"received\"}";
+        return;
+    };
+    const parsed_probe = std.json.parseFromSlice(std.json.Value, ctx.req_allocator, body, .{}) catch {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"invalid json payload\"}";
+        return;
+    };
+    defer parsed_probe.deinit();
+
+    const app_id_header = extractHeader(ctx.raw_request, "X-Bot-Appid");
+    const qq_cfg = selectQqConfig(ctx.config_opt, ctx.target, app_id_header) orelse {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"qq not configured\"}";
+        return;
+    };
+
+    if (qq_cfg.receive_mode != .webhook) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"qq webhook mode not enabled\"}";
+        return;
+    }
+
+    if (app_id_header) |raw_app_id| {
+        const app_id = std.mem.trim(u8, raw_app_id, " \t\r\n");
+        if (app_id.len > 0 and !std.mem.eql(u8, app_id, qq_cfg.app_id)) {
+            ctx.response_status = "401 Unauthorized";
+            ctx.response_body = "{\"error\":\"invalid X-Bot-Appid\"}";
+            return;
+        }
+    }
+
+    var qq_channel = findQqRuntimeChannel(ctx.state, qq_cfg.account_id) orelse blk: {
+        ctx.state.qq_channels.append(ctx.state.allocator, channels.qq.QQChannel.initFromConfig(ctx.state.allocator, qq_cfg.*)) catch {
+            ctx.response_status = "500 Internal Server Error";
+            ctx.response_body = "{\"error\":\"qq channel init failed\"}";
+            return;
+        };
+        break :blk &ctx.state.qq_channels.items[ctx.state.qq_channels.items.len - 1];
+    };
+
+    if (qq_channel.buildWebhookValidationResponse(ctx.req_allocator, body) catch null) |challenge_resp| {
+        ctx.response_body = challenge_resp;
+        return;
+    }
+
+    const inbound_opt = qq_channel.parseWebhookPayload(ctx.req_allocator, body) catch {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    };
+
+    if (inbound_opt) |inbound| {
+        defer inbound.deinit(qq_channel.allocator);
+
+        if (ctx.state.event_bus) |eb| {
+            _ = publishToBus(
+                eb,
+                ctx.state.allocator,
+                "qq",
+                inbound.sender_id,
+                inbound.chat_id,
+                inbound.content,
+                inbound.session_key,
+                inbound.metadata_json,
+            );
+            ctx.response_body = "{\"status\":\"received\"}";
+            return;
+        }
+
+        if (ctx.session_mgr_opt) |sm| {
+            const reply: ?[]const u8 = sm.processMessage(inbound.session_key, inbound.content, null) catch |err| blk: {
+                qq_channel.sendMessage(inbound.chat_id, userFacingAgentError(err)) catch {};
+                break :blk null;
+            };
+            if (reply) |r| {
+                defer ctx.root_allocator.free(r);
+                qq_channel.sendMessage(inbound.chat_id, r) catch {};
+            }
+        }
+    }
+
+    ctx.response_body = "{\"status\":\"ok\"}";
+}
+
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
-/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark
+/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, POST /qq
 /// If config_ptr is null, loads config internally (for backward compatibility).
 pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr: ?*const Config, event_bus: ?*bus_mod.Bus) !void {
     health.markComponentOk("gateway");
@@ -2105,7 +2458,8 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     var subagent_manager_opt: ?*subagent_mod.SubagentManager = null;
     var sec_tracker_opt: ?security.RateTracker = null;
     var sec_policy_opt: ?security.SecurityPolicy = null;
-    var noop_obs_gateway = observability.NoopObserver{};
+    var gateway_thread_observer = GatewayThreadObserver.init(allocator);
+    defer gateway_thread_observer.deinit();
     const needs_local_agent = event_bus == null;
 
     if (config_opt) |cfg_ptr| {
@@ -2148,6 +2502,11 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             state.lark_allow_from = lark_cfg.allow_from;
             state.lark_account_id = lark_cfg.account_id;
         }
+        if (build_options.enable_channel_qq) {
+            for (cfg.channels.qq) |qq_cfg| {
+                try state.qq_channels.append(allocator, channels.qq.QQChannel.initFromConfig(allocator, qq_cfg));
+            }
+        }
 
         // In daemon mode (`event_bus` is present), inbound processing is delegated to
         // the bus + channel runtime. Avoid creating a second local agent runtime here.
@@ -2182,6 +2541,12 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 // Tools.
                 tools_slice = tools_mod.allTools(allocator, cfg.workspace_dir, .{
                     .http_enabled = cfg.http_request.enabled,
+                    .http_allowed_domains = cfg.http_request.allowed_domains,
+                    .http_max_response_size = cfg.http_request.max_response_size,
+                    .http_timeout_secs = cfg.http_request.timeout_secs,
+                    .web_search_base_url = cfg.http_request.search_base_url,
+                    .web_search_provider = cfg.http_request.search_provider,
+                    .web_search_fallback_providers = cfg.http_request.search_fallback_providers,
                     .browser_enabled = cfg.browser.enabled,
                     .screenshot_enabled = true,
                     .agents = cfg.agents,
@@ -2192,7 +2557,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 }) catch &.{};
 
                 const mem_opt: ?memory_mod.Memory = if (mem_rt) |rt| rt.memory else null;
-                var sm = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, noop_obs_gateway.observer(), if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
+                var sm = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, gateway_thread_observer.observer(), if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
                 if (sec_policy_opt) |*policy| {
                     sm.policy = policy;
                 }
@@ -2350,13 +2715,16 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                                 _ = publishToBus(eb, state.allocator, "webhook", bearer orelse "anon", session_key, msg_text, session_key, null);
                                 response_body = "{\"status\":\"received\"}";
                             } else if (session_mgr_opt) |*sm| {
+                                const start_seq = gateway_thread_observer.currentSeq();
                                 const reply: ?[]const u8 = sm.processMessage(session_key, msg_text, null) catch |err| blk: {
                                     response_body = userFacingAgentErrorJson(err);
                                     break :blk null;
                                 };
                                 if (reply) |r| {
                                     defer allocator.free(r);
-                                    const json_resp = jsonWrapResponse(req_allocator, r) catch null;
+                                    const tool_events = gateway_thread_observer.collectSince(req_allocator, start_seq) catch &.{};
+                                    const thread_events_json = buildThreadEventsJson(req_allocator, tool_events) catch "[]";
+                                    const json_resp = buildWebhookSuccessResponse(req_allocator, r, thread_events_json) catch null;
                                     response_body = json_resp orelse "{\"status\":\"received\"}";
                                 } else {
                                     response_body = "{\"status\":\"received\"}";
@@ -2506,6 +2874,7 @@ test "findWebhookRouteDescriptor resolves known webhook paths" {
     try std.testing.expect(findWebhookRouteDescriptor("/slack/events") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/line") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/lark") != null);
+    try std.testing.expect(findWebhookRouteDescriptor("/qq") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/health") == null);
 }
 
@@ -3017,6 +3386,113 @@ test "selectLarkConfig picks account by verification token" {
     }
     try std.testing.expect(selected != null);
     try std.testing.expectEqualStrings("backup", selected.?.account_id);
+}
+
+test "selectQqConfig picks account by X-Bot-Appid header" {
+    const qq_accounts = [_]config_types.QQConfig{
+        .{
+            .account_id = "main",
+            .app_id = "app-main",
+            .app_secret = "secret-main",
+        },
+        .{
+            .account_id = "backup",
+            .app_id = "app-backup",
+            .app_secret = "secret-backup",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .qq = &qq_accounts,
+        },
+    };
+
+    const selected = selectQqConfig(&cfg, "/qq", "app-backup");
+    if (!build_options.enable_channel_qq) {
+        try std.testing.expect(selected == null);
+        return;
+    }
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("backup", selected.?.account_id);
+}
+
+test "selectQqConfig falls back to primary account" {
+    const qq_accounts = [_]config_types.QQConfig{
+        .{
+            .account_id = "z-last",
+            .app_id = "app-z",
+            .app_secret = "secret-z",
+        },
+        .{
+            .account_id = "default",
+            .app_id = "app-default",
+            .app_secret = "secret-default",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .qq = &qq_accounts,
+        },
+    };
+
+    const selected = selectQqConfig(&cfg, "/qq", null);
+    if (!build_options.enable_channel_qq) {
+        try std.testing.expect(selected == null);
+        return;
+    }
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("default", selected.?.account_id);
+}
+
+test "handleQqWebhookRoute rejects invalid json payload" {
+    if (!build_options.enable_channel_qq) return;
+
+    const qq_accounts = [_]config_types.QQConfig{
+        .{
+            .account_id = "main",
+            .app_id = "app-main",
+            .app_secret = "secret-main",
+            .receive_mode = .webhook,
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .qq = &qq_accounts,
+        },
+    };
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw_request =
+        "POST /qq HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "X-Bot-Appid: app-main\r\n" ++
+        "Content-Type: application/json\r\n\r\n" ++
+        "{invalid";
+    var ctx = WebhookHandlerContext{
+        .root_allocator = std.testing.allocator,
+        .req_allocator = std.testing.allocator,
+        .raw_request = raw_request,
+        .method = "POST",
+        .target = "/qq",
+        .config_opt = &cfg,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+
+    handleQqWebhookRoute(&ctx);
+    try std.testing.expectEqualStrings("400 Bad Request", ctx.response_status);
+    try std.testing.expectEqualStrings("{\"error\":\"invalid json payload\"}", ctx.response_body);
 }
 
 test "whatsappSessionKey builds direct key by sender" {
@@ -4057,6 +4533,111 @@ test "jsonWrapResponse with clean input" {
     const result = try jsonWrapResponse(std.testing.allocator, "simple reply");
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("{\"status\":\"ok\",\"response\":\"simple reply\"}", result);
+}
+
+// ── GatewayThreadObserver tests ─────────────────────────────────
+
+test "GatewayThreadObserver init/deinit no leaks" {
+    var obs = GatewayThreadObserver.init(std.testing.allocator);
+    obs.deinit();
+}
+
+test "GatewayThreadObserver records tool events and collectSince works" {
+    var obs = GatewayThreadObserver.init(std.testing.allocator);
+    defer obs.deinit();
+
+    const seq_before = obs.currentSeq();
+    const start_event = observability.ObserverEvent{ .tool_call_start = .{ .tool = "shell" } };
+    obs.observer().recordEvent(&start_event);
+
+    const done_event = observability.ObserverEvent{ .tool_call = .{ .tool = "shell", .duration_ms = 50, .success = true } };
+    obs.observer().recordEvent(&done_event);
+
+    const events = try obs.collectSince(std.testing.allocator, seq_before);
+    defer {
+        for (events) |e| std.testing.allocator.free(e.tool);
+        std.testing.allocator.free(events);
+    }
+    try std.testing.expectEqual(@as(usize, 2), events.len);
+    try std.testing.expectEqualStrings("shell", events[0].tool);
+    try std.testing.expect(events[0].kind == .start);
+    try std.testing.expect(events[1].kind == .result);
+    try std.testing.expect(events[1].success);
+}
+
+test "GatewayThreadObserver collectSince filters by sequence" {
+    var obs = GatewayThreadObserver.init(std.testing.allocator);
+    defer obs.deinit();
+
+    const event1 = observability.ObserverEvent{ .tool_call = .{ .tool = "shell", .duration_ms = 10, .success = true } };
+    obs.observer().recordEvent(&event1);
+    const mid_seq = obs.currentSeq();
+
+    const event2 = observability.ObserverEvent{ .tool_call = .{ .tool = "web_fetch", .duration_ms = 20, .success = false } };
+    obs.observer().recordEvent(&event2);
+
+    const events = try obs.collectSince(std.testing.allocator, mid_seq);
+    defer {
+        for (events) |e| std.testing.allocator.free(e.tool);
+        std.testing.allocator.free(events);
+    }
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqualStrings("web_fetch", events[0].tool);
+    try std.testing.expect(!events[0].success);
+}
+
+test "GatewayThreadObserver collectSince OOM frees partial output" {
+    var obs = GatewayThreadObserver.init(std.testing.allocator);
+    defer obs.deinit();
+
+    const event1 = observability.ObserverEvent{ .tool_call = .{ .tool = "shell", .duration_ms = 10, .success = true } };
+    obs.observer().recordEvent(&event1);
+    const event2 = observability.ObserverEvent{ .tool_call = .{ .tool = "web_fetch", .duration_ms = 20, .success = false } };
+    obs.observer().recordEvent(&event2);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    // collectSince allocations: out array + first tool dupe + second tool dupe
+    failing.fail_index = failing.alloc_index + 2;
+    try std.testing.expectError(error.OutOfMemory, obs.collectSince(failing.allocator(), 0));
+}
+
+// ── buildThreadEventsJson / buildWebhookSuccessResponse tests ───
+
+test "buildThreadEventsJson empty events" {
+    const result = try buildThreadEventsJson(std.testing.allocator, &.{});
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("[]", result);
+}
+
+test "buildThreadEventsJson with tool results" {
+    const events = [_]GatewayTurnToolEvent{
+        .{ .kind = .start, .tool = "shell", .success = false },
+        .{ .kind = .result, .tool = "shell", .success = true },
+        .{ .kind = .result, .tool = "web_fetch", .success = false },
+    };
+    const result = try buildThreadEventsJson(std.testing.allocator, &events);
+    defer std.testing.allocator.free(result);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .array);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.array.items.len);
+    const summary = parsed.value.array.items[0].object;
+    try std.testing.expectEqualStrings("tool_summary", summary.get("type").?.string);
+    try std.testing.expectEqual(@as(i64, 2), summary.get("total").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), summary.get("failed").?.integer);
+}
+
+test "buildWebhookSuccessResponse includes thread_events" {
+    const result = try buildWebhookSuccessResponse(std.testing.allocator, "hello", "[]");
+    defer std.testing.allocator.free(result);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    try std.testing.expectEqualStrings("ok", parsed.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("hello", parsed.value.object.get("response").?.string);
+    try std.testing.expect(parsed.value.object.get("thread_events").? == .array);
 }
 
 // ── jsonWrapChallenge tests ─────────────────────────────────────

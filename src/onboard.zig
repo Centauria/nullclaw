@@ -3,7 +3,7 @@
 //! Mirrors ZeroClaw's onboard module:
 //!   - Interactive wizard (9-step configuration flow)
 //!   - Quick setup (non-interactive, sensible defaults)
-//!   - Workspace scaffolding (MEMORY.md + prompt context files)
+//!   - Workspace scaffolding (prompt context files + bootstrap lifecycle)
 //!   - Channel configuration
 //!   - Memory backend selection
 //!   - Provider/model selection with curated defaults
@@ -123,6 +123,10 @@ pub const known_providers = [_]ProviderInfo{
     // --- Tier 9: Local/self-hosted ---
     .{ .key = "ollama", .label = "Ollama (local CLI)", .default_model = "llama4", .env_var = "API_KEY" },
     .{ .key = "lm-studio", .label = "LM Studio (local GUI)", .default_model = "local-model", .env_var = "API_KEY" },
+
+    // --- Tier 10: CLI-based providers ---
+    .{ .key = "claude-cli", .label = "Claude CLI (claude code, local)", .default_model = "claude-opus-4-6", .env_var = "ANTHROPIC_API_KEY" },
+    .{ .key = "codex-cli", .label = "Codex CLI (OpenAI codex, local)", .default_model = "codex-mini-latest", .env_var = "OPENAI_API_KEY" },
 };
 
 /// Canonicalize provider name (handle aliases).
@@ -130,6 +134,7 @@ pub fn canonicalProviderName(name: []const u8) []const u8 {
     if (std.mem.eql(u8, name, "grok")) return "xai";
     if (std.mem.eql(u8, name, "together")) return "together-ai";
     if (std.mem.eql(u8, name, "google") or std.mem.eql(u8, name, "google-gemini")) return "gemini";
+    if (std.mem.eql(u8, name, "claude-code")) return "claude-cli";
     return name;
 }
 
@@ -192,6 +197,8 @@ pub fn fallbackModelsForProvider(provider: []const u8) []const []const u8 {
     if (std.mem.eql(u8, canonical, "gemini")) return &gemini_fallback;
     if (std.mem.eql(u8, canonical, "deepseek")) return &deepseek_fallback;
     if (std.mem.eql(u8, canonical, "ollama")) return &ollama_fallback;
+    if (std.mem.eql(u8, canonical, "claude-cli")) return &claude_cli_fallback;
+    if (std.mem.eql(u8, canonical, "codex-cli")) return &codex_cli_fallback;
 
     // For providers without a curated fallback list, return a single-item fallback
     // based on the onboarding default model for that provider.
@@ -266,6 +273,14 @@ const ollama_fallback = [_][]const u8{
     "phi3",
 };
 
+const claude_cli_fallback = [_][]const u8{
+    "claude-opus-4-6",
+};
+
+const codex_cli_fallback = [_][]const u8{
+    "codex-mini-latest",
+};
+
 const MAX_MODELS = 20;
 
 /// Return a heap-allocated copy of the static fallback list for a provider.
@@ -315,7 +330,9 @@ pub fn fetchModelsFromApi(allocator: std.mem.Allocator, provider: []const u8, ap
     if (std.mem.eql(u8, canonical, "anthropic") or
         std.mem.eql(u8, canonical, "gemini") or
         std.mem.eql(u8, canonical, "deepseek") or
-        std.mem.eql(u8, canonical, "ollama"))
+        std.mem.eql(u8, canonical, "ollama") or
+        std.mem.eql(u8, canonical, "claude-cli") or
+        std.mem.eql(u8, canonical, "codex-cli"))
     {
         const fallback = fallbackModelsForProvider(canonical);
         var result: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -793,7 +810,7 @@ fn memoryProfileForBackend(backend: []const u8) []const u8 {
 
 fn isWizardInteractiveChannel(channel_id: channel_catalog.ChannelId) bool {
     return switch (channel_id) {
-        .telegram, .discord, .slack, .webhook, .mattermost, .matrix, .signal => true,
+        .telegram, .discord, .slack, .webhook, .mattermost, .matrix, .signal, .nostr => true,
         else => false,
     };
 }
@@ -908,6 +925,7 @@ fn configureSingleChannel(
         .mattermost => configureMattermostChannel(cfg, out, input_buf, prefix),
         .signal => configureSignalChannel(cfg, out, input_buf, prefix),
         .webhook => configureWebhookChannel(cfg, out, input_buf, prefix),
+        .nostr => configureNostrChannel(cfg, out, input_buf, prefix),
         else => blk: {
             try out.print("{s}  {s}: interactive setup not implemented yet. Edit {s} manually.\n", .{ prefix, meta.label, cfg.config_path });
             break :blk false;
@@ -1153,6 +1171,166 @@ fn configureWebhookChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, p
     return true;
 }
 
+fn configureNostrChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, prefix: []const u8) !bool {
+    const nak_path = "nak";
+
+    // ── Bot keypair ──────────────────────────────────────────────
+    try out.print("{s}  Bot keypair:\n", .{prefix});
+    try out.print("{s}    [Y] Generate new keypair (first-time setup)\n", .{prefix});
+    try out.print("{s}    [n] Import existing nsec1\n", .{prefix});
+    try out.print("{s}  Generate new? [Y/n]: ", .{prefix});
+    const gen_input = prompt(out, input_buf, "", "y") orelse return false;
+    const generate_new = gen_input.len == 0 or gen_input[0] == 'y' or gen_input[0] == 'Y';
+
+    var bot_privkey_hex: ?[]u8 = null;
+    defer if (bot_privkey_hex) |k| cfg.allocator.free(k);
+    var bot_pubkey_hex: ?[]u8 = null;
+    defer if (bot_pubkey_hex) |k| cfg.allocator.free(k);
+
+    if (generate_new) {
+        const argv_gen = [_][]const u8{ nak_path, "key", "generate" };
+        const hex = nakRun(cfg.allocator, &argv_gen) orelse {
+            try out.print("{s}  -> Failed to generate keypair (is nak in PATH?)\n\n", .{prefix});
+            return false;
+        };
+        if (hex.len != 64) {
+            cfg.allocator.free(hex);
+            try out.print("{s}  -> nak key generate returned unexpected output\n\n", .{prefix});
+            return false;
+        }
+        bot_privkey_hex = hex;
+        const argv_pub = [_][]const u8{ nak_path, "key", "public", bot_privkey_hex.? };
+        if (nakRun(cfg.allocator, &argv_pub)) |bph| {
+            bot_pubkey_hex = bph;
+            const argv_enc = [_][]const u8{ nak_path, "encode", "npub", bph };
+            if (nakRun(cfg.allocator, &argv_enc)) |bot_npub| {
+                defer cfg.allocator.free(bot_npub);
+                try out.print("{s}  -> Bot npub: {s}\n", .{ prefix, bot_npub });
+            } else {
+                try out.print("{s}  -> Bot pubkey (hex): {s}\n", .{ prefix, bph });
+            }
+        }
+    } else {
+        try out.print("{s}  Bot nsec1 (paste existing bot identity key): ", .{prefix});
+        const key_input = prompt(out, input_buf, "", "") orelse return false;
+        if (key_input.len == 0) {
+            try out.print("{s}  -> Skipped (no key provided)\n\n", .{prefix});
+            return false;
+        }
+        if (std.mem.startsWith(u8, key_input, "nsec1")) {
+            const argv_dec = [_][]const u8{ nak_path, "decode", key_input };
+            const hex = nakRun(cfg.allocator, &argv_dec) orelse {
+                try out.print("{s}  -> Failed to decode nsec (invalid key?)\n\n", .{prefix});
+                return false;
+            };
+            bot_privkey_hex = hex;
+        } else {
+            bot_privkey_hex = try cfg.allocator.dupe(u8, key_input);
+        }
+        if (bot_privkey_hex) |privhex| {
+            const argv_pub = [_][]const u8{ nak_path, "key", "public", privhex };
+            bot_pubkey_hex = nakRun(cfg.allocator, &argv_pub);
+        }
+    }
+
+    const nostr_mod = @import("channels/nostr.zig");
+    if (bot_pubkey_hex == null or !nostr_mod.NostrChannel.isValidHexKey(bot_pubkey_hex.?)) {
+        try out.print("{s}  -> Failed to derive a valid bot pubkey from the provided key\n\n", .{prefix});
+        return false;
+    }
+
+    // ── Owner pubkey ─────────────────────────────────────────────
+    try out.print("{s}  Your owner pubkey (npub or 64-char hex): ", .{prefix});
+    const owner_input = prompt(out, input_buf, "", "") orelse return false;
+    if (owner_input.len == 0) {
+        try out.print("{s}  -> Skipped (no owner pubkey)\n\n", .{prefix});
+        return false;
+    }
+
+    var owner_hex: ?[]u8 = null;
+    defer if (owner_hex) |k| cfg.allocator.free(k);
+
+    if (std.mem.startsWith(u8, owner_input, "npub1")) {
+        const argv_dec = [_][]const u8{ nak_path, "decode", owner_input };
+        const hex = nakRun(cfg.allocator, &argv_dec) orelse {
+            try out.print("{s}  -> Failed to decode npub (invalid pubkey?)\n\n", .{prefix});
+            return false;
+        };
+        owner_hex = hex;
+    } else {
+        owner_hex = try cfg.allocator.dupe(u8, owner_input);
+    }
+
+    if (!nostr_mod.NostrChannel.isValidHexKey(owner_hex.?)) {
+        try out.print("{s}  -> owner pubkey must be 64-char hex or a valid npub\n\n", .{prefix});
+        return false;
+    }
+
+    const secrets = @import("security/secrets.zig");
+    const config_dir = std.fs.path.dirname(cfg.config_path) orelse ".";
+    const store = secrets.SecretStore.init(config_dir, cfg.secrets.encrypt);
+    const encrypted_key = try store.encryptSecret(cfg.allocator, bot_privkey_hex.?);
+
+    const ns = try cfg.allocator.create(@import("config_types.zig").NostrConfig);
+    ns.* = .{
+        .private_key = encrypted_key,
+        .owner_pubkey = try cfg.allocator.dupe(u8, owner_hex.?),
+        .bot_pubkey = try cfg.allocator.dupe(u8, bot_pubkey_hex.?),
+        .config_dir = config_dir,
+    };
+    cfg.channels.nostr = ns;
+    if (generate_new) {
+        try out.print("{s}  -> Keypair generated and encrypted at rest\n", .{prefix});
+    } else {
+        try out.print("{s}  -> Key encrypted at rest\n", .{prefix});
+    }
+    try out.print("{s}  -> Default relays: relay.damus.io, nos.lol, relay.nostr.band, auth.nostr1.com, relay.primal.net\n", .{prefix});
+    try out.print("{s}  -> Edit config to add: display_name, nip05, lnurl, dm_allowed_pubkeys\n\n", .{prefix});
+    return true;
+}
+
+/// Run a nak subprocess, capture stdout, trim whitespace, return owned slice or null on failure.
+fn nakRun(allocator: std.mem.Allocator, argv: []const []const u8) ?[]u8 {
+    var child = std.process.Child.init(argv, allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+    child.spawn() catch return null;
+    const stdout = child.stdout orelse {
+        _ = child.wait() catch {};
+        return null;
+    };
+    var out = std.ArrayListUnmanaged(u8).empty;
+    var buf: [256]u8 = undefined;
+    while (true) {
+        const n = stdout.read(&buf) catch break;
+        if (n == 0) break;
+        out.appendSlice(allocator, buf[0..n]) catch {
+            out.deinit(allocator);
+            _ = child.wait() catch {};
+            return null;
+        };
+    }
+    const term = child.wait() catch {
+        out.deinit(allocator);
+        return null;
+    };
+    switch (term) {
+        .Exited => |code| if (code != 0) {
+            out.deinit(allocator);
+            return null;
+        },
+        else => {
+            out.deinit(allocator);
+            return null;
+        },
+    }
+    const raw = out.toOwnedSlice(allocator) catch return null;
+    const trimmed = std.mem.trimRight(u8, raw, " \t\r\n");
+    if (trimmed.len == raw.len) return raw;
+    defer allocator.free(raw);
+    return allocator.dupe(u8, trimmed) catch null;
+}
+
 /// Interactive wizard entry point — runs the full setup interactively.
 pub fn runWizard(allocator: std.mem.Allocator) !void {
     var stdout_buf: [4096]u8 = undefined;
@@ -1236,12 +1414,18 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     };
     if (model_input.len == 0) {
         // Default: use first model from the list (or provider default)
-        cfg.default_model = if (live_models.len > 0) live_models[0] else selected_provider.default_model;
+        // Must dupe because live_models will be freed in defer block
+        cfg.default_model = if (live_models.len > 0)
+            try cfg.allocator.dupe(u8, live_models[0])
+        else
+            try cfg.allocator.dupe(u8, selected_provider.default_model);
     } else if (std.fmt.parseInt(usize, model_input, 10)) |num| {
         if (num >= 1 and num <= display_max) {
-            cfg.default_model = live_models[num - 1];
+            // Must dupe because live_models will be freed in defer block
+            cfg.default_model = try cfg.allocator.dupe(u8, live_models[num - 1]);
         } else {
-            cfg.default_model = selected_provider.default_model;
+            // Must dupe because selected_provider.default_model is from const static data
+            cfg.default_model = try cfg.allocator.dupe(u8, selected_provider.default_model);
         }
     } else |_| {
         // Free-form model name typed by user
@@ -1338,6 +1522,7 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     };
     if (ws_input.len > 0) {
         cfg.workspace_dir = try cfg.allocator.dupe(u8, ws_input);
+        cfg.workspace_dir_override = cfg.workspace_dir;
     }
     try out.print("  -> {s}\n\n", .{cfg.workspace_dir});
 
@@ -1542,10 +1727,7 @@ pub fn scaffoldWorkspace(allocator: std.mem.Allocator, workspace_dir: []const u8
         else => return err,
     };
 
-    // MEMORY.md
-    const mem_tmpl = try memoryTemplate(allocator, ctx);
-    defer allocator.free(mem_tmpl);
-    try writeIfMissing(allocator, workspace_dir, "MEMORY.md", mem_tmpl);
+    const had_legacy_user_content = try hasLegacyUserContentIndicators(allocator, workspace_dir);
 
     // SOUL.md (personality traits — loaded by prompt.zig)
     const soul_tmpl = try soulTemplate(allocator, ctx);
@@ -1573,15 +1755,118 @@ pub fn scaffoldWorkspace(allocator: std.mem.Allocator, workspace_dir: []const u8
 
     // BOOTSTRAP.md lifecycle:
     // one-shot onboarding instructions with persisted state marker.
-    try ensureBootstrapLifecycle(allocator, workspace_dir, identity_tmpl, user_tmpl);
+    try ensureBootstrapLifecycle(allocator, workspace_dir, identity_tmpl, user_tmpl, had_legacy_user_content);
+}
 
-    // Ensure memory/ subdirectory
-    const mem_dir = try std.fmt.allocPrint(allocator, "{s}/memory", .{workspace_dir});
-    defer allocator.free(mem_dir);
-    std.fs.makeDirAbsolute(mem_dir) catch |err| switch (err) {
+pub const ResetWorkspacePromptFilesOptions = struct {
+    include_bootstrap: bool = false,
+    clear_memory_markdown: bool = false,
+    dry_run: bool = false,
+};
+
+pub const ResetWorkspacePromptFilesReport = struct {
+    rewritten_files: usize = 0,
+    removed_files: usize = 0,
+};
+
+/// Reset workspace prompt markdown files to bundled defaults.
+/// This intentionally overwrites existing files.
+pub fn resetWorkspacePromptFiles(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+    ctx: *const ProjectContext,
+    options: ResetWorkspacePromptFilesOptions,
+) !ResetWorkspacePromptFilesReport {
+    if (std.fs.path.dirname(workspace_dir)) |parent| {
+        std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    }
+    std.fs.makeDirAbsolute(workspace_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
+
+    var report = ResetWorkspacePromptFilesReport{};
+
+    const soul_tmpl = try soulTemplate(allocator, ctx);
+    defer allocator.free(soul_tmpl);
+    const identity_tmpl = try identityTemplate(allocator, ctx);
+    defer allocator.free(identity_tmpl);
+    const user_tmpl = try userTemplate(allocator, ctx);
+    defer allocator.free(user_tmpl);
+
+    const files = [_]struct {
+        filename: []const u8,
+        content: []const u8,
+    }{
+        .{ .filename = "SOUL.md", .content = soul_tmpl },
+        .{ .filename = "AGENTS.md", .content = agentsTemplate() },
+        .{ .filename = "TOOLS.md", .content = toolsTemplate() },
+        .{ .filename = "IDENTITY.md", .content = identity_tmpl },
+        .{ .filename = "USER.md", .content = user_tmpl },
+        .{ .filename = "HEARTBEAT.md", .content = heartbeatTemplate() },
+    };
+
+    for (files) |entry| {
+        _ = try overwriteWorkspaceFile(allocator, workspace_dir, entry.filename, entry.content, options.dry_run);
+        report.rewritten_files += 1;
+    }
+
+    if (options.include_bootstrap) {
+        _ = try overwriteWorkspaceFile(allocator, workspace_dir, "BOOTSTRAP.md", bootstrapTemplate(), options.dry_run);
+        report.rewritten_files += 1;
+    }
+
+    if (options.clear_memory_markdown) {
+        if (try removeWorkspaceFileIfExists(allocator, workspace_dir, "MEMORY.md", options.dry_run)) {
+            report.removed_files += 1;
+        }
+        if (try removeWorkspaceFileIfExists(allocator, workspace_dir, "memory.md", options.dry_run)) {
+            report.removed_files += 1;
+        }
+    }
+
+    return report;
+}
+
+fn overwriteWorkspaceFile(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+    filename: []const u8,
+    content: []const u8,
+    dry_run: bool,
+) !bool {
+    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ workspace_dir, filename });
+    defer allocator.free(path);
+
+    if (dry_run) return true;
+
+    const file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(content);
+    return true;
+}
+
+fn removeWorkspaceFileIfExists(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+    filename: []const u8,
+    dry_run: bool,
+) !bool {
+    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ workspace_dir, filename });
+    defer allocator.free(path);
+
+    if (dry_run) {
+        return fileExistsAbsolute(path);
+    }
+
+    std.fs.deleteFileAbsolute(path) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
 }
 
 fn writeIfMissing(allocator: std.mem.Allocator, dir: []const u8, filename: []const u8, content: []const u8) !void {
@@ -1610,6 +1895,7 @@ fn ensureBootstrapLifecycle(
     workspace_dir: []const u8,
     identity_template: []const u8,
     user_template: []const u8,
+    had_legacy_user_content: bool,
 ) !void {
     const bootstrap_path = try std.fmt.allocPrint(allocator, "{s}/BOOTSTRAP.md", .{workspace_dir});
     defer allocator.free(bootstrap_path);
@@ -1635,6 +1921,7 @@ fn ensureBootstrapLifecycle(
             workspace_dir,
             identity_template,
             user_template,
+            had_legacy_user_content,
         );
         if (legacy_completed) {
             try markOnboardingCompletedAt(allocator, &state);
@@ -1659,19 +1946,27 @@ fn isLegacyOnboardingCompleted(
     workspace_dir: []const u8,
     identity_template: []const u8,
     user_template: []const u8,
+    had_legacy_user_content: bool,
 ) !bool {
     const identity_path = try std.fmt.allocPrint(allocator, "{s}/IDENTITY.md", .{workspace_dir});
     defer allocator.free(identity_path);
     const user_path = try std.fmt.allocPrint(allocator, "{s}/USER.md", .{workspace_dir});
     defer allocator.free(user_path);
 
-    const identity_content = try readFileIfPresent(allocator, identity_path, 1024 * 1024) orelse return false;
-    defer allocator.free(identity_content);
-    const user_content = try readFileIfPresent(allocator, user_path, 1024 * 1024) orelse return false;
-    defer allocator.free(user_content);
-
-    return !std.mem.eql(u8, identity_content, identity_template) or
-        !std.mem.eql(u8, user_content, user_template);
+    var templates_diverged = false;
+    if (try readFileIfPresent(allocator, identity_path, 1024 * 1024)) |identity_content| {
+        defer allocator.free(identity_content);
+        if (!std.mem.eql(u8, identity_content, identity_template)) {
+            templates_diverged = true;
+        }
+    }
+    if (try readFileIfPresent(allocator, user_path, 1024 * 1024)) |user_content| {
+        defer allocator.free(user_content);
+        if (!std.mem.eql(u8, user_content, user_template)) {
+            templates_diverged = true;
+        }
+    }
+    return templates_diverged or had_legacy_user_content;
 }
 
 fn workspaceStatePath(allocator: std.mem.Allocator, workspace_dir: []const u8) ![]u8 {
@@ -1808,6 +2103,24 @@ fn fileExistsAbsolute(path: []const u8) bool {
     return true;
 }
 
+fn pathExistsAbsolute(path: []const u8) bool {
+    std.fs.accessAbsolute(path, .{}) catch return false;
+    return true;
+}
+
+fn hasLegacyUserContentIndicators(allocator: std.mem.Allocator, workspace_dir: []const u8) !bool {
+    const memory_dir_path = try std.fmt.allocPrint(allocator, "{s}/memory", .{workspace_dir});
+    defer allocator.free(memory_dir_path);
+    const memory_file_path = try std.fmt.allocPrint(allocator, "{s}/MEMORY.md", .{workspace_dir});
+    defer allocator.free(memory_file_path);
+    const git_dir_path = try std.fmt.allocPrint(allocator, "{s}/.git", .{workspace_dir});
+    defer allocator.free(git_dir_path);
+
+    return pathExistsAbsolute(memory_dir_path) or
+        pathExistsAbsolute(memory_file_path) or
+        pathExistsAbsolute(git_dir_path);
+}
+
 fn makeIsoTimestamp(allocator: std.mem.Allocator) ![]u8 {
     var ts_buf: [32]u8 = undefined;
     const ts = util.timestamp(&ts_buf);
@@ -1913,6 +2226,7 @@ test "canonicalProviderName handles aliases" {
     try std.testing.expectEqualStrings("together-ai", canonicalProviderName("together"));
     try std.testing.expectEqualStrings("gemini", canonicalProviderName("google"));
     try std.testing.expectEqualStrings("gemini", canonicalProviderName("google-gemini"));
+    try std.testing.expectEqualStrings("claude-cli", canonicalProviderName("claude-code"));
     try std.testing.expectEqualStrings("openai", canonicalProviderName("openai"));
 }
 
@@ -1992,6 +2306,7 @@ test "isWizardInteractiveChannel includes supported onboarding channels" {
     try std.testing.expect(isWizardInteractiveChannel(.slack));
     try std.testing.expect(isWizardInteractiveChannel(.matrix));
     try std.testing.expect(isWizardInteractiveChannel(.signal));
+    try std.testing.expect(isWizardInteractiveChannel(.nostr));
     try std.testing.expect(!isWizardInteractiveChannel(.whatsapp));
 }
 
@@ -2058,7 +2373,7 @@ test "BANNER contains descriptive text" {
     try std.testing.expect(std.mem.indexOf(u8, BANNER, "smallest AI assistant") != null);
 }
 
-test "scaffoldWorkspace creates files in temp dir" {
+test "scaffoldWorkspace creates core files and leaves MEMORY.md optional" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2068,19 +2383,15 @@ test "scaffoldWorkspace creates files in temp dir" {
     const ctx = ProjectContext{};
     try scaffoldWorkspace(std.testing.allocator, base, &ctx);
 
-    // Verify files were created
-    const file = try tmp.dir.openFile("MEMORY.md", .{});
-    defer file.close();
-    const content = try file.readToEndAlloc(std.testing.allocator, 4096);
-    defer std.testing.allocator.free(content);
-    try std.testing.expect(content.len > 0);
-    try std.testing.expect(std.mem.indexOf(u8, content, "Memory") != null);
-
+    // Verify core files were created
     const agents = try tmp.dir.openFile("AGENTS.md", .{});
     defer agents.close();
     const agents_content = try agents.readToEndAlloc(std.testing.allocator, 16 * 1024);
     defer std.testing.allocator.free(agents_content);
     try std.testing.expect(std.mem.indexOf(u8, agents_content, "AGENTS.md - Your Workspace") != null);
+
+    // OpenClaw-style scaffold keeps MEMORY.md optional (created on demand by memory writes).
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("MEMORY.md", .{}));
 }
 
 test "scaffoldWorkspace is idempotent" {
@@ -2094,6 +2405,103 @@ test "scaffoldWorkspace is idempotent" {
     try scaffoldWorkspace(std.testing.allocator, base, &ctx);
     // Running again should not fail
     try scaffoldWorkspace(std.testing.allocator, base, &ctx);
+}
+
+test "resetWorkspacePromptFiles overwrites prompt files with defaults" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("AGENTS.md", .{});
+        defer f.close();
+        try f.writeAll("custom-agents-content");
+    }
+    {
+        const f = try tmp.dir.createFile("USER.md", .{});
+        defer f.close();
+        try f.writeAll("custom-user-content");
+    }
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    const report = try resetWorkspacePromptFiles(std.testing.allocator, base, &ProjectContext{}, .{});
+    try std.testing.expectEqual(@as(usize, 6), report.rewritten_files);
+    try std.testing.expectEqual(@as(usize, 0), report.removed_files);
+
+    const agents_content = try tmp.dir.readFileAlloc(std.testing.allocator, "AGENTS.md", 64 * 1024);
+    defer std.testing.allocator.free(agents_content);
+    try std.testing.expect(std.mem.indexOf(u8, agents_content, "AGENTS.md - Your Workspace") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agents_content, "custom-agents-content") == null);
+
+    const user_content = try tmp.dir.readFileAlloc(std.testing.allocator, "USER.md", 64 * 1024);
+    defer std.testing.allocator.free(user_content);
+    try std.testing.expect(std.mem.indexOf(u8, user_content, "USER.md - About Your Human") != null);
+    try std.testing.expect(std.mem.indexOf(u8, user_content, "custom-user-content") == null);
+}
+
+test "resetWorkspacePromptFiles supports dry-run and clearing memory markdown files" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("MEMORY.md", .{});
+        defer f.close();
+        try f.writeAll("custom-memory");
+    }
+
+    var has_distinct_case_memory_file = true;
+    const alt = tmp.dir.createFile("memory.md", .{ .exclusive = true }) catch |err| switch (err) {
+        error.PathAlreadyExists => blk: {
+            has_distinct_case_memory_file = false;
+            break :blk null;
+        },
+        else => return err,
+    };
+    if (alt) |f| {
+        defer f.close();
+        try f.writeAll("custom-memory-lower");
+    }
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    const dry_report = try resetWorkspacePromptFiles(std.testing.allocator, base, &ProjectContext{}, .{
+        .clear_memory_markdown = true,
+        .dry_run = true,
+    });
+    try std.testing.expectEqual(@as(usize, 6), dry_report.rewritten_files);
+    try std.testing.expect(dry_report.removed_files >= 1);
+    const memory_file = try tmp.dir.openFile("MEMORY.md", .{});
+    memory_file.close();
+
+    const reset_report = try resetWorkspacePromptFiles(std.testing.allocator, base, &ProjectContext{}, .{
+        .clear_memory_markdown = true,
+    });
+    try std.testing.expectEqual(@as(usize, 6), reset_report.rewritten_files);
+    try std.testing.expect(reset_report.removed_files >= 1);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("MEMORY.md", .{}));
+    if (has_distinct_case_memory_file) {
+        try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("memory.md", .{}));
+    }
+}
+
+test "resetWorkspacePromptFiles creates missing workspace directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const nested = try std.fmt.allocPrint(std.testing.allocator, "{s}/nested/workspace", .{base});
+    defer std.testing.allocator.free(nested);
+
+    const report = try resetWorkspacePromptFiles(std.testing.allocator, nested, &ProjectContext{}, .{});
+    try std.testing.expectEqual(@as(usize, 6), report.rewritten_files);
+
+    const agents_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/AGENTS.md", .{nested});
+    defer std.testing.allocator.free(agents_path);
+    const agents_file = try std.fs.openFileAbsolute(agents_path, .{});
+    agents_file.close();
 }
 
 test "scaffoldWorkspace seeds bootstrap marker for new workspace" {
@@ -2176,6 +2584,64 @@ test "scaffoldWorkspace does not seed BOOTSTRAP for legacy completed workspace" 
     try std.testing.expect(state.onboarding_completed_at != null);
 }
 
+test "scaffoldWorkspace treats memory-backed workspace as existing and skips BOOTSTRAP" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("memory");
+    try tmp.dir.writeFile(.{
+        .sub_path = "memory/2026-02-25.md",
+        .data = "# Daily log\nSome notes",
+    });
+    try tmp.dir.writeFile(.{
+        .sub_path = "MEMORY.md",
+        .data = "# Long-term memory\nImportant stuff",
+    });
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
+
+    const identity_file = try tmp.dir.openFile("IDENTITY.md", .{});
+    identity_file.close();
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("BOOTSTRAP.md", .{}));
+
+    const memory_file = try tmp.dir.openFile("MEMORY.md", .{});
+    defer memory_file.close();
+    const memory_content = try memory_file.readToEndAlloc(std.testing.allocator, 4 * 1024);
+    defer std.testing.allocator.free(memory_content);
+    try std.testing.expectEqualStrings("# Long-term memory\nImportant stuff", memory_content);
+
+    var state = try readWorkspaceOnboardingState(std.testing.allocator, base);
+    defer state.deinit(std.testing.allocator);
+    try std.testing.expect(state.onboarding_completed_at != null);
+}
+
+test "scaffoldWorkspace treats git-backed workspace as existing and skips BOOTSTRAP" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath(".git");
+    try tmp.dir.writeFile(.{
+        .sub_path = ".git/HEAD",
+        .data = "ref: refs/heads/main\n",
+    });
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
+
+    const identity_file = try tmp.dir.openFile("IDENTITY.md", .{});
+    identity_file.close();
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("BOOTSTRAP.md", .{}));
+
+    var state = try readWorkspaceOnboardingState(std.testing.allocator, base);
+    defer state.deinit(std.testing.allocator);
+    try std.testing.expect(state.onboarding_completed_at != null);
+}
+
 // ── Additional onboard tests ────────────────────────────────────
 
 test "canonicalProviderName passthrough for known providers" {
@@ -2184,6 +2650,8 @@ test "canonicalProviderName passthrough for known providers" {
     try std.testing.expectEqualStrings("deepseek", canonicalProviderName("deepseek"));
     try std.testing.expectEqualStrings("groq", canonicalProviderName("groq"));
     try std.testing.expectEqualStrings("ollama", canonicalProviderName("ollama"));
+    try std.testing.expectEqualStrings("claude-cli", canonicalProviderName("claude-cli"));
+    try std.testing.expectEqualStrings("codex-cli", canonicalProviderName("codex-cli"));
 }
 
 test "canonicalProviderName unknown returns as-is" {
@@ -2308,7 +2776,7 @@ test "memoryTemplate uses context values" {
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "TestBot") != null);
 }
 
-test "scaffoldWorkspace creates memory subdirectory" {
+test "scaffoldWorkspace does not create memory subdirectory by default" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2316,10 +2784,7 @@ test "scaffoldWorkspace creates memory subdirectory" {
     defer std.testing.allocator.free(base);
 
     try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
-
-    // Verify memory/ subdirectory exists
-    var d = try tmp.dir.openDir("memory", .{});
-    d.close();
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openDir("memory", .{}));
 }
 
 test "BANNER is non-empty and contains nullclaw branding" {
@@ -2396,7 +2861,7 @@ test "catalog_providers names are unique" {
 test "wizard promptChoice returns default for out-of-range" {
     // This tests the logic without actual I/O by validating the
     // boundary: max providers is known_providers.len
-    try std.testing.expect(known_providers.len == 30);
+    try std.testing.expect(known_providers.len == 32);
     // The wizard would clamp to default (0) for out of range input
 }
 
@@ -2466,7 +2931,7 @@ test "bootstrapTemplate is non-empty" {
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "BOOTSTRAP.md - Hello, World") != null);
 }
 
-test "scaffoldWorkspace creates all prompt.zig files" {
+test "scaffoldWorkspace creates core prompt.zig files" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -2475,11 +2940,12 @@ test "scaffoldWorkspace creates all prompt.zig files" {
 
     try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
 
-    // Verify all files that prompt.zig tries to load exist
+    // Verify core files that prompt.zig always loads exist.
     const files = [_][]const u8{
-        "MEMORY.md",    "SOUL.md",      "AGENTS.md",
-        "TOOLS.md",     "IDENTITY.md",  "USER.md",
-        "HEARTBEAT.md", "BOOTSTRAP.md",
+        "SOUL.md",      "AGENTS.md",
+        "TOOLS.md",     "IDENTITY.md",
+        "USER.md",      "HEARTBEAT.md",
+        "BOOTSTRAP.md",
     };
     for (files) |filename| {
         const file = tmp.dir.openFile(filename, .{}) catch |err| {
@@ -2508,6 +2974,14 @@ test "fallbackModelsForProvider returns models for known providers" {
 
     const gemini_models = fallbackModelsForProvider("gemini");
     try std.testing.expect(gemini_models.len >= 2);
+
+    const claude_cli_models = fallbackModelsForProvider("claude-cli");
+    try std.testing.expect(claude_cli_models.len >= 1);
+    try std.testing.expectEqualStrings("claude-opus-4-6", claude_cli_models[0]);
+
+    const codex_cli_models = fallbackModelsForProvider("codex-cli");
+    try std.testing.expect(codex_cli_models.len >= 1);
+    try std.testing.expectEqualStrings("codex-mini-latest", codex_cli_models[0]);
 }
 
 test "fallbackModelsForProvider handles aliases" {

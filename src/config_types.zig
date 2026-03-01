@@ -120,12 +120,14 @@ pub const SchedulerConfig = struct {
     enabled: bool = true,
     max_tasks: u32 = 64,
     max_concurrent: u32 = 4,
+    /// Hard timeout for cron agent subprocess execution. 0 = no timeout.
+    agent_timeout_secs: u64 = 0,
 };
 
 pub const AgentConfig = struct {
     compact_context: bool = false,
-    max_tool_iterations: u32 = 25,
-    max_history_messages: u32 = 50,
+    max_tool_iterations: u32 = 1000,
+    max_history_messages: u32 = 100,
     parallel_tools: bool = false,
     tool_dispatcher: []const u8 = "auto",
     token_limit: u64 = DEFAULT_AGENT_TOKEN_LIMIT,
@@ -137,14 +139,14 @@ pub const AgentConfig = struct {
     compaction_max_summary_chars: u32 = 2_000,
     compaction_max_source_chars: u32 = 12_000,
     /// Max seconds to wait for an LLM HTTP response (curl --max-time). 0 = no limit.
-    message_timeout_secs: u64 = 300,
+    message_timeout_secs: u64 = 600,
 };
 
 pub const ToolsConfig = struct {
     shell_timeout_secs: u64 = 60,
     shell_max_output_bytes: u32 = 1_048_576, // 1MB
     max_file_size_bytes: u32 = 10_485_760, // 10MB — shared file_read/edit/append
-    web_fetch_max_chars: u32 = 50_000,
+    web_fetch_max_chars: u32 = 100_000,
 };
 
 pub const ModelRouteConfig = struct {
@@ -167,6 +169,13 @@ pub const CronConfig = struct {
 
 // ── Channel configs ─────────────────────────────────────────────
 
+pub const TelegramInteractiveConfig = struct {
+    enabled: bool = false,
+    ttl_secs: u64 = 900,
+    owner_only: bool = true,
+    remove_on_click: bool = true,
+};
+
 pub const TelegramConfig = struct {
     account_id: []const u8 = "default",
     bot_token: []const u8,
@@ -177,6 +186,7 @@ pub const TelegramConfig = struct {
     reply_in_private: bool = true,
     /// Optional SOCKS5/HTTP proxy URL for all Telegram API requests (e.g. "socks5://host:port").
     proxy: ?[]const u8 = null,
+    interactive: TelegramInteractiveConfig = .{},
 };
 
 pub const DiscordConfig = struct {
@@ -335,12 +345,18 @@ pub const QQGroupPolicy = enum {
     allowlist,
 };
 
+pub const QQReceiveMode = enum {
+    websocket,
+    webhook,
+};
+
 pub const QQConfig = struct {
     account_id: []const u8 = "default",
     app_id: []const u8 = "",
     app_secret: []const u8 = "",
     bot_token: []const u8 = "",
     sandbox: bool = false,
+    receive_mode: QQReceiveMode = .webhook,
     group_policy: QQGroupPolicy = .allow,
     allowed_groups: []const []const u8 = &.{},
     allow_from: []const []const u8 = &.{},
@@ -362,6 +378,208 @@ pub const MaixCamConfig = struct {
     name: []const u8 = "maixcam",
 };
 
+pub const WebConfig = struct {
+    pub const DEFAULT_PATH: []const u8 = "/ws";
+    pub const DEFAULT_TRANSPORT: []const u8 = "local";
+    pub const DEFAULT_MESSAGE_AUTH_MODE: []const u8 = "pairing";
+    pub const MIN_AUTH_TOKEN_LEN: usize = 16;
+    pub const MAX_AUTH_TOKEN_LEN: usize = 128;
+    pub const MAX_RELAY_AGENT_ID_LEN: usize = 64;
+    pub const MIN_RELAY_PAIRING_CODE_TTL_SECS: u32 = 60;
+    pub const MAX_RELAY_PAIRING_CODE_TTL_SECS: u32 = 300;
+    pub const MIN_RELAY_UI_TOKEN_TTL_SECS: u32 = 300;
+    pub const MAX_RELAY_UI_TOKEN_TTL_SECS: u32 = 2_592_000; // 30 days
+    pub const MIN_RELAY_TOKEN_TTL_SECS: u32 = 3_600;
+    pub const MAX_RELAY_TOKEN_TTL_SECS: u32 = 31_536_000; // 365 days
+
+    account_id: []const u8 = "default",
+    /// "local" starts an inbound WS listener in nullclaw.
+    /// "relay" keeps a single outbound WS connection to a relay service.
+    transport: []const u8 = DEFAULT_TRANSPORT,
+    port: u16 = 32123,
+    listen: []const u8 = "127.0.0.1",
+    path: []const u8 = DEFAULT_PATH,
+    max_connections: u16 = 10,
+    /// Optional WebSocket-upgrade auth token for browser/extension clients.
+    /// Used for WebSocket-upgrade hardening and for `message_auth_mode="token"`.
+    /// If null, WebChannel falls back to env (NULLCLAW_WEB_TOKEN/NULLCLAW_GATEWAY_TOKEN/OPENCLAW_GATEWAY_TOKEN),
+    /// then to an ephemeral runtime token.
+    auth_token: ?[]const u8 = null,
+    /// Authentication mode for inbound user_message events.
+    /// - "pairing": require UI JWT access_token from pairing flow.
+    /// - "token": require channel auth token in auth_token (or access_token for compatibility).
+    message_auth_mode: []const u8 = DEFAULT_MESSAGE_AUTH_MODE,
+    /// Optional allowlist for Origin header values (exact match, supports "*").
+    /// Empty = allow any origin.
+    allowed_origins: []const []const u8 = &.{},
+    /// Relay endpoint for transport="relay" (must be wss://...).
+    relay_url: ?[]const u8 = null,
+    /// Stable logical agent identity on relay side.
+    relay_agent_id: []const u8 = "default",
+    /// Optional dedicated relay auth token.
+    /// If omitted, relay lifecycle resolves token from NULLCLAW_RELAY_TOKEN,
+    /// then persisted `web-relay-<account_id>` credential, then generates one.
+    relay_token: ?[]const u8 = null,
+    /// Expiry for persisted relay token lifecycle (seconds).
+    relay_token_ttl_secs: u32 = 2_592_000,
+    /// One-time pairing code lifetime for relay UI binding (seconds).
+    relay_pairing_code_ttl_secs: u32 = 300,
+    /// UI access token (JWT) TTL in relay mode (seconds).
+    relay_ui_token_ttl_secs: u32 = 86_400,
+    /// Require E2E payload encryption for relay user_message events.
+    relay_e2e_required: bool = false,
+
+    fn trimTrailingSlash(value: []const u8) []const u8 {
+        if (value.len <= 1) return value;
+        if (value[value.len - 1] == '/') return value[0 .. value.len - 1];
+        return value;
+    }
+
+    pub fn normalizePath(raw: []const u8) []const u8 {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0 or trimmed[0] != '/') return DEFAULT_PATH;
+        return trimTrailingSlash(trimmed);
+    }
+
+    pub fn isPathWellFormed(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0 or trimmed[0] != '/') return false;
+        if (std.mem.indexOfAny(u8, trimmed, "?#")) |_| return false;
+        return true;
+    }
+
+    pub fn isValidTransport(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        return std.mem.eql(u8, trimmed, "local") or std.mem.eql(u8, trimmed, "relay");
+    }
+
+    pub fn isRelayTransport(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        return std.mem.eql(u8, trimmed, "relay");
+    }
+
+    pub fn isValidMessageAuthMode(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        return std.mem.eql(u8, trimmed, "pairing") or std.mem.eql(u8, trimmed, "token");
+    }
+
+    pub fn isTokenMessageAuthMode(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        return std.mem.eql(u8, trimmed, "token");
+    }
+
+    fn isAllowedTokenByte(byte: u8) bool {
+        return byte >= 0x21 and byte <= 0x7e and !std.ascii.isWhitespace(byte);
+    }
+
+    pub fn isValidAuthToken(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len < MIN_AUTH_TOKEN_LEN or trimmed.len > MAX_AUTH_TOKEN_LEN) return false;
+        for (trimmed) |byte| {
+            if (!isAllowedTokenByte(byte)) return false;
+        }
+        return true;
+    }
+
+    pub fn isValidAllowedOrigin(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) return false;
+        if (std.mem.eql(u8, trimmed, "*")) return true;
+        if (std.mem.eql(u8, trimmed, "null")) return true;
+        if (std.mem.indexOfAny(u8, trimmed, " \t\r\n")) |_| return false;
+        const normalized = trimTrailingSlash(trimmed);
+        const scheme_sep = std.mem.indexOf(u8, normalized, "://") orelse return false;
+        if (scheme_sep == 0) return false;
+        const authority = normalized[scheme_sep + 3 ..];
+        if (authority.len == 0) return false;
+        if (std.mem.indexOfAny(u8, authority, "/?#")) |_| return false;
+        return true;
+    }
+
+    pub fn isValidRelayUrl(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (!std.mem.startsWith(u8, trimmed, "wss://")) return false;
+        const no_scheme = trimmed["wss://".len..];
+        if (no_scheme.len == 0) return false;
+        const path_pos = std.mem.indexOfAny(u8, no_scheme, "/?");
+        const authority = if (path_pos) |idx| no_scheme[0..idx] else no_scheme;
+        if (authority.len == 0) return false;
+        if (std.mem.indexOfAny(u8, authority, " \t\r\n")) |_| return false;
+        if (path_pos) |idx| {
+            const tail = no_scheme[idx..];
+            // Keep runtime parser contract: optional path must start with '/'.
+            if (tail.len > 0 and tail[0] != '/') return false;
+            if (std.mem.indexOfScalar(u8, tail, '#') != null) return false;
+        }
+        return true;
+    }
+
+    pub fn isValidRelayAgentId(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0 or trimmed.len > MAX_RELAY_AGENT_ID_LEN) return false;
+        if (std.mem.indexOfAny(u8, trimmed, " \t\r\n")) |_| return false;
+        return true;
+    }
+
+    pub fn isValidRelayPairingCodeTtl(ttl_secs: u32) bool {
+        return ttl_secs >= MIN_RELAY_PAIRING_CODE_TTL_SECS and ttl_secs <= MAX_RELAY_PAIRING_CODE_TTL_SECS;
+    }
+
+    pub fn isValidRelayUiTokenTtl(ttl_secs: u32) bool {
+        return ttl_secs >= MIN_RELAY_UI_TOKEN_TTL_SECS and ttl_secs <= MAX_RELAY_UI_TOKEN_TTL_SECS;
+    }
+
+    pub fn isValidRelayTokenTtl(ttl_secs: u32) bool {
+        return ttl_secs >= MIN_RELAY_TOKEN_TTL_SECS and ttl_secs <= MAX_RELAY_TOKEN_TTL_SECS;
+    }
+};
+
+pub const NostrConfig = struct {
+    /// Private key: must be enc2:-encrypted via SecretStore (use onboarding wizard or SecretStore.encryptSecret).
+    /// Not required when bunker_uri is set (external bunker handles signing).
+    private_key: []const u8,
+    /// Owner's public key — must be 64-char lowercase hex (not npub). Always allowed through DM policy.
+    owner_pubkey: []const u8,
+    /// Bot's own public key — must be 64-char lowercase hex. Derived from private_key during onboarding.
+    /// Used as the -p filter for the listener so incoming gift wraps reach the bot, not the owner.
+    /// Empty string means not set (old config — re-run onboarding to populate).
+    bot_pubkey: []const u8 = "",
+    /// Relay URLs for publishing and subscribing.
+    relays: []const []const u8 = &.{
+        "wss://relay.damus.io",
+        "wss://nos.lol",
+        "wss://relay.nostr.band",
+        "wss://auth.nostr1.com",
+        "wss://relay.primal.net",
+    },
+    /// Relay URLs announced in kind:10050 (NIP-17 DM inbox).
+    /// Senders look up this event to know where to address gift-wrapped DMs.
+    /// The listener subscribes here in addition to `relays`, so the bot
+    /// receives DMs on whichever relay the sender used.
+    dm_relays: []const []const u8 = &.{"wss://auth.nostr1.com"},
+    /// Pubkeys allowed to send DMs. Empty = deny all. ["*"] = allow all.
+    /// Owner is always implicitly allowed regardless of this list.
+    dm_allowed_pubkeys: []const []const u8 = &.{},
+    /// Display name for kind:0 metadata.
+    display_name: []const u8 = "NullClaw",
+    /// About text for kind:0 metadata.
+    about: []const u8 = "AI assistant",
+    /// Path to profile picture file. Published in kind:0 metadata as "picture" field.
+    display_pic: ?[]const u8 = null,
+    /// LNURL for Lightning Network & Cashu zaps (NIP-57). Published in kind:0 metadata as "lud16" field.
+    lnurl: ?[]const u8 = null,
+    /// NIP-05 identifier (e.g. "user@domain.com"). Published in kind:0 metadata as "nip05" field.
+    nip05: ?[]const u8 = null,
+    /// Path to the nak binary.
+    nak_path: []const u8 = "nak",
+    /// Bunker URI (auto-populated at first start, or manually set for external bunker).
+    bunker_uri: ?[]const u8 = null,
+    /// Directory containing the config file and .secret_key.
+    /// Set at construction time by the config loader or onboarding wizard.
+    /// Used by vtableStart to instantiate SecretStore for key decryption.
+    config_dir: []const u8 = ".",
+};
+
 pub const ChannelsConfig = struct {
     cli: bool = true,
     telegram: []const TelegramConfig = &.{},
@@ -381,6 +599,8 @@ pub const ChannelsConfig = struct {
     qq: []const QQConfig = &.{},
     onebot: []const OneBotConfig = &.{},
     maixcam: []const MaixCamConfig = &.{},
+    web: []const WebConfig = &.{},
+    nostr: ?*NostrConfig = null,
 
     fn primaryAccount(comptime T: type, items: []const T) ?T {
         if (items.len == 0) return null;
@@ -444,6 +664,9 @@ pub const ChannelsConfig = struct {
     }
     pub fn maixcamPrimary(self: *const ChannelsConfig) ?MaixCamConfig {
         return primaryAccount(MaixCamConfig, self.maixcam);
+    }
+    pub fn webPrimary(self: *const ChannelsConfig) ?WebConfig {
+        return primaryAccount(WebConfig, self.web);
     }
 };
 
@@ -780,6 +1003,68 @@ pub const HttpRequestConfig = struct {
     max_response_size: u32 = 1_000_000,
     timeout_secs: u64 = 30,
     allowed_domains: []const []const u8 = &.{},
+    /// Optional SearXNG instance URL used by web_search as a fallback when
+    /// BRAVE_API_KEY is not available.
+    /// Examples:
+    ///   - "https://searx.example.com"
+    ///   - "https://searx.example.com/search"
+    search_base_url: ?[]const u8 = null,
+    /// Search provider for web_search.
+    /// Supported: auto, searxng, duckduckgo (ddg), brave, firecrawl,
+    /// tavily, perplexity, exa, jina.
+    search_provider: []const u8 = "auto",
+    /// Optional fallback provider chain used when the primary provider fails.
+    search_fallback_providers: []const []const u8 = &.{},
+
+    /// Validate optional SearXNG base URL accepted by web_search.
+    /// Allowed forms:
+    ///   - https://host
+    ///   - https://host/
+    ///   - https://host/search
+    ///   - https://host/search/
+    pub fn isValidSearchBaseUrl(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (!std.mem.startsWith(u8, trimmed, "https://")) return false;
+        if (std.mem.indexOfAny(u8, trimmed, "?#") != null) return false;
+
+        const no_scheme = trimmed["https://".len..];
+        if (no_scheme.len == 0 or no_scheme[0] == '/') return false;
+
+        const slash_pos = std.mem.indexOfScalar(u8, no_scheme, '/');
+        const authority = if (slash_pos) |idx| no_scheme[0..idx] else no_scheme;
+        if (authority.len == 0) return false;
+        if (std.mem.indexOfAny(u8, authority, " \t\r\n")) |_| return false;
+
+        if (slash_pos) |idx| {
+            var path = no_scheme[idx..];
+            if (std.mem.eql(u8, path, "/")) return true;
+            while (path.len > 1 and path[path.len - 1] == '/') {
+                path = path[0 .. path.len - 1];
+            }
+            if (!std.mem.eql(u8, path, "/search")) return false;
+        }
+        return true;
+    }
+
+    pub fn isValidSearchProviderName(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        return std.ascii.eqlIgnoreCase(trimmed, "auto") or
+            std.ascii.eqlIgnoreCase(trimmed, "searxng") or
+            std.ascii.eqlIgnoreCase(trimmed, "duckduckgo") or
+            std.ascii.eqlIgnoreCase(trimmed, "ddg") or
+            std.ascii.eqlIgnoreCase(trimmed, "brave") or
+            std.ascii.eqlIgnoreCase(trimmed, "firecrawl") or
+            std.ascii.eqlIgnoreCase(trimmed, "tavily") or
+            std.ascii.eqlIgnoreCase(trimmed, "perplexity") or
+            std.ascii.eqlIgnoreCase(trimmed, "exa") or
+            std.ascii.eqlIgnoreCase(trimmed, "jina");
+    }
+
+    pub fn isValidSearchFallbackProviderName(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (std.ascii.eqlIgnoreCase(trimmed, "auto")) return false;
+        return isValidSearchProviderName(trimmed);
+    }
 };
 
 // ── Identity config ─────────────────────────────────────────────
@@ -928,3 +1213,147 @@ pub const SessionConfig = struct {
     identity_links: []const IdentityLink = &.{},
     typing_interval_secs: u32 = 5,
 };
+
+test "WebConfig defaults" {
+    const cfg = WebConfig{};
+    try std.testing.expectEqualStrings("default", cfg.account_id);
+    try std.testing.expectEqualStrings(WebConfig.DEFAULT_TRANSPORT, cfg.transport);
+    try std.testing.expectEqual(@as(u16, 32123), cfg.port);
+    try std.testing.expectEqualStrings("127.0.0.1", cfg.listen);
+    try std.testing.expectEqualStrings(WebConfig.DEFAULT_PATH, cfg.path);
+    try std.testing.expectEqual(@as(u16, 10), cfg.max_connections);
+    try std.testing.expect(cfg.auth_token == null);
+    try std.testing.expectEqualStrings(WebConfig.DEFAULT_MESSAGE_AUTH_MODE, cfg.message_auth_mode);
+    try std.testing.expectEqual(@as(usize, 0), cfg.allowed_origins.len);
+    try std.testing.expect(cfg.relay_url == null);
+    try std.testing.expectEqualStrings("default", cfg.relay_agent_id);
+    try std.testing.expect(cfg.relay_token == null);
+    try std.testing.expectEqual(@as(u32, 2_592_000), cfg.relay_token_ttl_secs);
+    try std.testing.expectEqual(@as(u32, 300), cfg.relay_pairing_code_ttl_secs);
+    try std.testing.expectEqual(@as(u32, 86_400), cfg.relay_ui_token_ttl_secs);
+    try std.testing.expect(!cfg.relay_e2e_required);
+}
+
+test "security defaults stay least-privilege" {
+    const autonomy = AutonomyConfig{};
+    try std.testing.expectEqual(AutonomyLevel.supervised, autonomy.level);
+    try std.testing.expect(autonomy.workspace_only);
+    try std.testing.expectEqual(@as(u32, 20), autonomy.max_actions_per_hour);
+    try std.testing.expect(autonomy.require_approval_for_medium_risk);
+    try std.testing.expect(autonomy.block_high_risk_commands);
+
+    const http_request = HttpRequestConfig{};
+    try std.testing.expect(!http_request.enabled);
+    try std.testing.expect(http_request.search_base_url == null);
+    try std.testing.expectEqualStrings("auto", http_request.search_provider);
+}
+
+test "WebConfig normalizePath trims and normalizes" {
+    try std.testing.expectEqualStrings("/ws", WebConfig.normalizePath("/ws/"));
+    try std.testing.expectEqualStrings("/relay", WebConfig.normalizePath(" /relay/ "));
+    try std.testing.expectEqualStrings(WebConfig.DEFAULT_PATH, WebConfig.normalizePath("relay"));
+    try std.testing.expectEqualStrings(WebConfig.DEFAULT_PATH, WebConfig.normalizePath(""));
+}
+
+test "WebConfig token validation enforces printable no-whitespace constraints" {
+    try std.testing.expect(WebConfig.isValidAuthToken("relay-token-0123456789"));
+    try std.testing.expect(WebConfig.isValidAuthToken("token/with+symbols=0123456789"));
+    try std.testing.expect(!WebConfig.isValidAuthToken("short"));
+    try std.testing.expect(!WebConfig.isValidAuthToken("invalid token with spaces"));
+    try std.testing.expect(!WebConfig.isValidAuthToken("line\nbreak-token-0123456789"));
+}
+
+test "WebConfig origin validation accepts wildcard and absolute origins" {
+    try std.testing.expect(WebConfig.isValidAllowedOrigin("*"));
+    try std.testing.expect(WebConfig.isValidAllowedOrigin("null"));
+    try std.testing.expect(WebConfig.isValidAllowedOrigin("https://relay.nullclaw.io"));
+    try std.testing.expect(WebConfig.isValidAllowedOrigin("https://relay.nullclaw.io/"));
+    try std.testing.expect(WebConfig.isValidAllowedOrigin("chrome-extension://abcdefghijklmnop"));
+    try std.testing.expect(!WebConfig.isValidAllowedOrigin(""));
+    try std.testing.expect(!WebConfig.isValidAllowedOrigin("relay.nullclaw.io"));
+    try std.testing.expect(!WebConfig.isValidAllowedOrigin("https://relay.nullclaw.io/path"));
+}
+
+test "WebConfig transport validation supports local and relay" {
+    try std.testing.expect(WebConfig.isValidTransport("local"));
+    try std.testing.expect(WebConfig.isValidTransport("relay"));
+    try std.testing.expect(!WebConfig.isValidTransport("direct"));
+    try std.testing.expect(WebConfig.isRelayTransport("relay"));
+    try std.testing.expect(!WebConfig.isRelayTransport("local"));
+}
+
+test "WebConfig message auth mode validation supports pairing and token" {
+    try std.testing.expect(WebConfig.isValidMessageAuthMode("pairing"));
+    try std.testing.expect(WebConfig.isValidMessageAuthMode("token"));
+    try std.testing.expect(WebConfig.isTokenMessageAuthMode("token"));
+    try std.testing.expect(!WebConfig.isTokenMessageAuthMode("pairing"));
+    try std.testing.expect(!WebConfig.isValidMessageAuthMode("jwt"));
+}
+
+test "WebConfig relay URL validation requires wss authority" {
+    try std.testing.expect(WebConfig.isValidRelayUrl("wss://relay.nullclaw.io/ws"));
+    try std.testing.expect(WebConfig.isValidRelayUrl("wss://relay.nullclaw.io"));
+    try std.testing.expect(!WebConfig.isValidRelayUrl("ws://relay.nullclaw.io/ws"));
+    try std.testing.expect(!WebConfig.isValidRelayUrl("https://relay.nullclaw.io/ws"));
+    try std.testing.expect(!WebConfig.isValidRelayUrl("wss://"));
+    try std.testing.expect(!WebConfig.isValidRelayUrl("wss://relay.nullclaw.io?x=1"));
+    try std.testing.expect(!WebConfig.isValidRelayUrl("wss://relay.nullclaw.io/ws#frag"));
+}
+
+test "WebConfig relay agent id validation enforces non-empty id" {
+    try std.testing.expect(WebConfig.isValidRelayAgentId("default"));
+    try std.testing.expect(!WebConfig.isValidRelayAgentId(""));
+    try std.testing.expect(!WebConfig.isValidRelayAgentId("agent id with spaces"));
+}
+
+test "WebConfig relay ttl validation enforces documented ranges" {
+    try std.testing.expect(WebConfig.isValidRelayPairingCodeTtl(60));
+    try std.testing.expect(WebConfig.isValidRelayPairingCodeTtl(300));
+    try std.testing.expect(!WebConfig.isValidRelayPairingCodeTtl(59));
+    try std.testing.expect(!WebConfig.isValidRelayPairingCodeTtl(301));
+
+    try std.testing.expect(WebConfig.isValidRelayUiTokenTtl(300));
+    try std.testing.expect(WebConfig.isValidRelayUiTokenTtl(86_400));
+    try std.testing.expect(!WebConfig.isValidRelayUiTokenTtl(299));
+
+    try std.testing.expect(WebConfig.isValidRelayTokenTtl(3_600));
+    try std.testing.expect(WebConfig.isValidRelayTokenTtl(2_592_000));
+    try std.testing.expect(!WebConfig.isValidRelayTokenTtl(3_599));
+}
+
+test "HttpRequestConfig search base URL validation" {
+    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com/"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com/search"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com/search/"));
+
+    try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("http://searx.example.com"));
+    try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("https://"));
+    try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com?x=1"));
+    try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com#frag"));
+    try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com/custom"));
+}
+
+test "HttpRequestConfig search provider validation" {
+    try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("auto"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("searxng"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("duckduckgo"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("ddg"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("brave"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("firecrawl"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("tavily"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("perplexity"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("exa"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("jina"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("BRAVE"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchProviderName("DDG"));
+    try std.testing.expect(!HttpRequestConfig.isValidSearchProviderName("google"));
+}
+
+test "HttpRequestConfig fallback provider validation disallows auto" {
+    try std.testing.expect(HttpRequestConfig.isValidSearchFallbackProviderName("brave"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchFallbackProviderName("ddg"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchFallbackProviderName("JINA"));
+    try std.testing.expect(!HttpRequestConfig.isValidSearchFallbackProviderName("auto"));
+    try std.testing.expect(!HttpRequestConfig.isValidSearchFallbackProviderName("AUTO"));
+}

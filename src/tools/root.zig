@@ -265,6 +265,12 @@ pub fn allTools(
     workspace_dir: []const u8,
     opts: struct {
         http_enabled: bool = false,
+        http_allowed_domains: []const []const u8 = &.{},
+        http_max_response_size: u32 = 1_000_000,
+        http_timeout_secs: u64 = 30,
+        web_search_base_url: ?[]const u8 = null,
+        web_search_provider: []const u8 = "auto",
+        web_search_fallback_providers: []const []const u8 = &.{},
         browser_enabled: bool = false,
         screenshot_enabled: bool = false,
         composio_api_key: ?[]const u8 = null,
@@ -359,8 +365,24 @@ pub fn allTools(
 
     if (opts.http_enabled) {
         const ht = try allocator.create(http_request.HttpRequestTool);
-        ht.* = .{};
+        ht.* = .{
+            .allowed_domains = opts.http_allowed_domains,
+            .max_response_size = opts.http_max_response_size,
+        };
         try list.append(allocator, ht.tool());
+
+        const wst = try allocator.create(web_search.WebSearchTool);
+        wst.* = .{
+            .searxng_base_url = opts.web_search_base_url,
+            .provider = opts.web_search_provider,
+            .fallback_providers = opts.web_search_fallback_providers,
+            .timeout_secs = opts.http_timeout_secs,
+        };
+        try list.append(allocator, wst.tool());
+
+        const wft = try allocator.create(web_fetch.WebFetchTool);
+        wft.* = .{ .default_max_chars = tc.web_fetch_max_chars };
+        try list.append(allocator, wft.tool());
     }
 
     if (opts.browser_enabled) {
@@ -651,58 +673,65 @@ test "all tools includes extras when enabled" {
         .http_enabled = true,
         .browser_enabled = true,
     });
-    defer {
-        // Free all heap-allocated tool structs (mix of types)
-        // Order: shell, file_read, file_write, file_edit, git, image_info,
-        //        memory_store, memory_recall, memory_list, memory_forget, delegate, schedule,
-        //        http_request, browser
-        std.testing.allocator.destroy(@as(*shell.ShellTool, @ptrCast(@alignCast(tools[0].ptr))));
-        std.testing.allocator.destroy(@as(*file_read.FileReadTool, @ptrCast(@alignCast(tools[1].ptr))));
-        std.testing.allocator.destroy(@as(*file_write.FileWriteTool, @ptrCast(@alignCast(tools[2].ptr))));
-        std.testing.allocator.destroy(@as(*file_edit.FileEditTool, @ptrCast(@alignCast(tools[3].ptr))));
-        std.testing.allocator.destroy(@as(*git.GitTool, @ptrCast(@alignCast(tools[4].ptr))));
-        std.testing.allocator.destroy(@as(*image.ImageInfoTool, @ptrCast(@alignCast(tools[5].ptr))));
-        std.testing.allocator.destroy(@as(*memory_store.MemoryStoreTool, @ptrCast(@alignCast(tools[6].ptr))));
-        std.testing.allocator.destroy(@as(*memory_recall.MemoryRecallTool, @ptrCast(@alignCast(tools[7].ptr))));
-        std.testing.allocator.destroy(@as(*memory_list.MemoryListTool, @ptrCast(@alignCast(tools[8].ptr))));
-        std.testing.allocator.destroy(@as(*memory_forget.MemoryForgetTool, @ptrCast(@alignCast(tools[9].ptr))));
-        std.testing.allocator.destroy(@as(*delegate.DelegateTool, @ptrCast(@alignCast(tools[10].ptr))));
-        std.testing.allocator.destroy(@as(*schedule.ScheduleTool, @ptrCast(@alignCast(tools[11].ptr))));
-        std.testing.allocator.destroy(@as(*spawn.SpawnTool, @ptrCast(@alignCast(tools[12].ptr))));
-        std.testing.allocator.destroy(@as(*http_request.HttpRequestTool, @ptrCast(@alignCast(tools[13].ptr))));
-        std.testing.allocator.destroy(@as(*browser.BrowserTool, @ptrCast(@alignCast(tools[14].ptr))));
-        std.testing.allocator.free(tools);
-    }
-    // shell + file_read + file_write + file_edit + git + image_info
-    // + memory_store + memory_recall + memory_list + memory_forget
-    // + delegate + schedule + spawn + http_request + browser = 15
-    try std.testing.expectEqual(@as(usize, 15), tools.len);
+    defer deinitTools(std.testing.allocator, tools);
+
+    // Order: shell, file_read, file_write, file_edit, git, image_info,
+    //        memory_store, memory_recall, memory_list, memory_forget,
+    //        delegate, schedule, spawn, http_request, web_search, web_fetch,
+    //        browser = 17
+    try std.testing.expectEqual(@as(usize, 17), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
     const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{});
-    defer {
-        // Free all heap-allocated tool structs
-        // Order: shell, file_read, file_write, file_edit, git, image_info,
-        //        memory_store, memory_recall, memory_list, memory_forget, delegate, schedule, spawn
-        std.testing.allocator.destroy(@as(*shell.ShellTool, @ptrCast(@alignCast(tools[0].ptr))));
-        std.testing.allocator.destroy(@as(*file_read.FileReadTool, @ptrCast(@alignCast(tools[1].ptr))));
-        std.testing.allocator.destroy(@as(*file_write.FileWriteTool, @ptrCast(@alignCast(tools[2].ptr))));
-        std.testing.allocator.destroy(@as(*file_edit.FileEditTool, @ptrCast(@alignCast(tools[3].ptr))));
-        std.testing.allocator.destroy(@as(*git.GitTool, @ptrCast(@alignCast(tools[4].ptr))));
-        std.testing.allocator.destroy(@as(*image.ImageInfoTool, @ptrCast(@alignCast(tools[5].ptr))));
-        std.testing.allocator.destroy(@as(*memory_store.MemoryStoreTool, @ptrCast(@alignCast(tools[6].ptr))));
-        std.testing.allocator.destroy(@as(*memory_recall.MemoryRecallTool, @ptrCast(@alignCast(tools[7].ptr))));
-        std.testing.allocator.destroy(@as(*memory_list.MemoryListTool, @ptrCast(@alignCast(tools[8].ptr))));
-        std.testing.allocator.destroy(@as(*memory_forget.MemoryForgetTool, @ptrCast(@alignCast(tools[9].ptr))));
-        std.testing.allocator.destroy(@as(*delegate.DelegateTool, @ptrCast(@alignCast(tools[10].ptr))));
-        std.testing.allocator.destroy(@as(*schedule.ScheduleTool, @ptrCast(@alignCast(tools[11].ptr))));
-        std.testing.allocator.destroy(@as(*spawn.SpawnTool, @ptrCast(@alignCast(tools[12].ptr))));
-        std.testing.allocator.free(tools);
-    }
-    // shell + file_read + file_write + file_edit + git + image_info
-    // + memory_store + memory_recall + memory_list + memory_forget + delegate + schedule + spawn = 13
+    defer deinitTools(std.testing.allocator, tools);
+
+    // Order: shell, file_read, file_write, file_edit, git, image_info,
+    //        memory_store, memory_recall, memory_list, memory_forget,
+    //        delegate, schedule, spawn = 13
     try std.testing.expectEqual(@as(usize, 13), tools.len);
+}
+
+test "all tools wires http and web_search config into tool instances" {
+    const domains = [_][]const u8{ "example.com", "api.example.com" };
+    const search_url = "https://searx.example.com";
+    const search_fallbacks = [_][]const u8{ "jina", "duckduckgo" };
+
+    const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{
+        .http_enabled = true,
+        .http_allowed_domains = &domains,
+        .http_max_response_size = 321_000,
+        .http_timeout_secs = 12,
+        .web_search_base_url = search_url,
+        .web_search_provider = "brave",
+        .web_search_fallback_providers = &search_fallbacks,
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    var saw_http = false;
+    var saw_search = false;
+    for (tools) |t| {
+        if (std.mem.eql(u8, t.name(), "http_request")) {
+            const ht: *http_request.HttpRequestTool = @ptrCast(@alignCast(t.ptr));
+            try std.testing.expectEqual(@as(usize, 2), ht.allowed_domains.len);
+            try std.testing.expectEqualStrings("example.com", ht.allowed_domains[0]);
+            try std.testing.expectEqual(@as(u32, 321_000), ht.max_response_size);
+            saw_http = true;
+            continue;
+        }
+        if (std.mem.eql(u8, t.name(), "web_search")) {
+            const wst: *web_search.WebSearchTool = @ptrCast(@alignCast(t.ptr));
+            try std.testing.expectEqualStrings(search_url, wst.searxng_base_url.?);
+            try std.testing.expectEqualStrings("brave", wst.provider);
+            try std.testing.expectEqual(@as(usize, 2), wst.fallback_providers.len);
+            try std.testing.expectEqualStrings("jina", wst.fallback_providers[0]);
+            try std.testing.expectEqual(@as(u64, 12), wst.timeout_secs);
+            saw_search = true;
+        }
+    }
+
+    try std.testing.expect(saw_http);
+    try std.testing.expect(saw_search);
 }
 
 test "all tools wires subagent manager into spawn tool" {

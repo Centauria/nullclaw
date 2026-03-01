@@ -28,6 +28,7 @@ const Command = enum {
     hardware,
     migrate,
     memory,
+    workspace,
     capabilities,
     models,
     auth,
@@ -52,6 +53,7 @@ fn parseCommand(arg: []const u8) ?Command {
         .{ "hardware", .hardware },
         .{ "migrate", .migrate },
         .{ "memory", .memory },
+        .{ "workspace", .workspace },
         .{ "capabilities", .capabilities },
         .{ "models", .models },
         .{ "auth", .auth },
@@ -102,6 +104,7 @@ pub fn main() !void {
         .hardware => try runHardware(allocator, sub_args),
         .migrate => try runMigrate(allocator, sub_args),
         .memory => try runMemory(allocator, sub_args),
+        .workspace => try runWorkspace(allocator, sub_args),
         .capabilities => try runCapabilities(allocator, sub_args),
         .models => try runModels(allocator, sub_args),
         .auth => try runAuth(allocator, sub_args),
@@ -226,7 +229,11 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\Commands:
             \\  list                          List all scheduled tasks
             \\  add <expression> <command>    Add a recurring cron job
+            \\  add-agent <expression> <prompt> [--model <model>]
+            \\                                Add a recurring agent cron job
             \\  once <delay> <command>        Add a one-shot delayed task
+            \\  once-agent <delay> <prompt> [--model <model>]
+            \\                                Add a one-shot delayed agent task
             \\  remove <id>                   Remove a scheduled task
             \\  pause <id>                    Pause a scheduled task
             \\  resume <id>                   Resume a paused task
@@ -248,12 +255,40 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             std.process.exit(1);
         }
         try yc.cron.cliAddJob(allocator, sub_args[1], sub_args[2]);
+    } else if (std.mem.eql(u8, subcmd, "add-agent")) {
+        if (sub_args.len < 3) {
+            std.debug.print("Usage: nullclaw cron add-agent <expression> <prompt> [--model <model>]\n", .{});
+            std.process.exit(1);
+        }
+        var model: ?[]const u8 = null;
+        var i: usize = 3;
+        while (i < sub_args.len) : (i += 1) {
+            if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--model")) {
+                model = sub_args[i + 1];
+                i += 1;
+            }
+        }
+        try yc.cron.cliAddAgentJob(allocator, sub_args[1], sub_args[2], model);
     } else if (std.mem.eql(u8, subcmd, "once")) {
         if (sub_args.len < 3) {
             std.debug.print("Usage: nullclaw cron once <delay> <command>\n", .{});
             std.process.exit(1);
         }
         try yc.cron.cliAddOnce(allocator, sub_args[1], sub_args[2]);
+    } else if (std.mem.eql(u8, subcmd, "once-agent")) {
+        if (sub_args.len < 3) {
+            std.debug.print("Usage: nullclaw cron once-agent <delay> <prompt> [--model <model>]\n", .{});
+            std.process.exit(1);
+        }
+        var model: ?[]const u8 = null;
+        var i: usize = 3;
+        while (i < sub_args.len) : (i += 1) {
+            if (i + 1 < sub_args.len and std.mem.eql(u8, sub_args[i], "--model")) {
+                model = sub_args[i + 1];
+                i += 1;
+            }
+        }
+        try yc.cron.cliAddAgentOnce(allocator, sub_args[1], sub_args[2], model);
     } else if (std.mem.eql(u8, subcmd, "remove")) {
         if (sub_args.len < 2) {
             std.debug.print("Usage: nullclaw cron remove <id>\n", .{});
@@ -280,12 +315,14 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         try yc.cron.cliRunJob(allocator, sub_args[1]);
     } else if (std.mem.eql(u8, subcmd, "update")) {
         if (sub_args.len < 2) {
-            std.debug.print("Usage: nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--enable] [--disable]\n", .{});
+            std.debug.print("Usage: nullclaw cron update <id> [--expression <expr>] [--command <cmd>] [--prompt <prompt>] [--model <model>] [--enable] [--disable]\n", .{});
             std.process.exit(1);
         }
         const id = sub_args[1];
         var expression: ?[]const u8 = null;
         var command: ?[]const u8 = null;
+        var prompt: ?[]const u8 = null;
+        var model: ?[]const u8 = null;
         var enabled: ?bool = null;
         var i: usize = 2;
         while (i < sub_args.len) : (i += 1) {
@@ -295,13 +332,19 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             } else if (std.mem.eql(u8, sub_args[i], "--command") and i + 1 < sub_args.len) {
                 i += 1;
                 command = sub_args[i];
+            } else if (std.mem.eql(u8, sub_args[i], "--prompt") and i + 1 < sub_args.len) {
+                i += 1;
+                prompt = sub_args[i];
+            } else if (std.mem.eql(u8, sub_args[i], "--model") and i + 1 < sub_args.len) {
+                i += 1;
+                model = sub_args[i];
             } else if (std.mem.eql(u8, sub_args[i], "--enable")) {
                 enabled = true;
             } else if (std.mem.eql(u8, sub_args[i], "--disable")) {
                 enabled = false;
             }
         }
-        try yc.cron.cliUpdateJob(allocator, id, expression, command, enabled);
+        try yc.cron.cliUpdateJob(allocator, id, expression, command, prompt, model, enabled);
     } else if (std.mem.eql(u8, subcmd, "runs")) {
         if (sub_args.len < 2) {
             std.debug.print("Usage: nullclaw cron runs <id>\n", .{});
@@ -432,7 +475,12 @@ fn runSkills(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             std.debug.print("Usage: nullclaw skills install <source>\n", .{});
             std.process.exit(1);
         }
-        yc.skills.installSkillFromPath(allocator, sub_args[1], cfg.workspace_dir) catch |err| {
+        var install_error_detail: ?[]u8 = null;
+        defer if (install_error_detail) |msg| allocator.free(msg);
+        yc.skills.installSkillWithDetail(allocator, sub_args[1], cfg.workspace_dir, &install_error_detail) catch |err| {
+            if (install_error_detail) |msg| {
+                std.debug.print("{s}\n", .{msg});
+            }
             std.debug.print("Failed to install skill: {s}\n", .{@errorName(err)});
             std.process.exit(1);
         };
@@ -615,6 +663,21 @@ fn printMemoryUsage() void {
         \\                                List memory entries (default limit: 20)
         \\  drain-outbox                  Drain durable vector outbox queue
         \\  forget <key>                  Delete entry from primary memory (if backend supports)
+        \\
+    , .{});
+}
+
+fn printWorkspaceUsage() void {
+    std.debug.print(
+        \\Usage: nullclaw workspace <command> [args]
+        \\
+        \\Commands:
+        \\  reset-md [--dry-run] [--include-bootstrap] [--clear-memory-md]
+        \\      Reset prompt markdown files (AGENTS/SOUL/TOOLS/IDENTITY/USER/HEARTBEAT)
+        \\      to bundled defaults.
+        \\      --include-bootstrap  Also rewrite BOOTSTRAP.md
+        \\      --clear-memory-md    Remove MEMORY.md and memory.md if present
+        \\      --dry-run            Show what would be changed without modifying files
         \\
     , .{});
 }
@@ -876,6 +939,69 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     std.debug.print("Unknown memory command: {s}\n\n", .{subcmd});
     printMemoryUsage();
     std.process.exit(1);
+}
+
+fn runWorkspace(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    if (sub_args.len < 1) {
+        printWorkspaceUsage();
+        std.process.exit(1);
+    }
+
+    var cfg = yc.config.Config.load(allocator) catch {
+        std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
+        std.process.exit(1);
+    };
+    defer cfg.deinit();
+
+    const subcmd = sub_args[0];
+    if (!std.mem.eql(u8, subcmd, "reset-md")) {
+        std.debug.print("Unknown workspace command: {s}\n\n", .{subcmd});
+        printWorkspaceUsage();
+        std.process.exit(1);
+    }
+
+    var include_bootstrap = false;
+    var clear_memory_md = false;
+    var dry_run = false;
+
+    var i: usize = 1;
+    while (i < sub_args.len) : (i += 1) {
+        const arg = sub_args[i];
+        if (std.mem.eql(u8, arg, "--include-bootstrap")) {
+            include_bootstrap = true;
+        } else if (std.mem.eql(u8, arg, "--clear-memory-md")) {
+            clear_memory_md = true;
+        } else if (std.mem.eql(u8, arg, "--dry-run")) {
+            dry_run = true;
+        } else {
+            std.debug.print("Unknown option for workspace reset-md: {s}\n\n", .{arg});
+            printWorkspaceUsage();
+            std.process.exit(1);
+        }
+    }
+
+    const report = try yc.onboard.resetWorkspacePromptFiles(
+        allocator,
+        cfg.workspace_dir,
+        &yc.onboard.ProjectContext{},
+        .{
+            .include_bootstrap = include_bootstrap,
+            .clear_memory_markdown = clear_memory_md,
+            .dry_run = dry_run,
+        },
+    );
+
+    if (dry_run) {
+        std.debug.print(
+            "Dry run complete: would rewrite {d} file(s), would remove {d} file(s).\n",
+            .{ report.rewritten_files, report.removed_files },
+        );
+    } else {
+        std.debug.print(
+            "Workspace markdown reset complete: rewrote {d} file(s), removed {d} file(s).\n",
+            .{ report.rewritten_files, report.removed_files },
+        );
+    }
 }
 
 fn runCapabilities(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
@@ -1507,6 +1633,12 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
     // Create tools (for system prompt and tool calling)
     const tools = yc.tools.allTools(allocator, config.workspace_dir, .{
         .http_enabled = config.http_request.enabled,
+        .http_allowed_domains = config.http_request.allowed_domains,
+        .http_max_response_size = config.http_request.max_response_size,
+        .http_timeout_secs = config.http_request.timeout_secs,
+        .web_search_base_url = config.http_request.search_base_url,
+        .web_search_provider = config.http_request.search_provider,
+        .web_search_fallback_providers = config.http_request.search_fallback_providers,
         .browser_enabled = config.browser.enabled,
         .screenshot_enabled = true,
         .mcp_tools = mcp_tools,
@@ -1761,6 +1893,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     var tg = yc.channels.telegram.TelegramChannel.init(allocator, telegram_config.bot_token, allowed, telegram_config.group_allow_from, telegram_config.group_policy);
     tg.proxy = telegram_config.proxy;
     tg.account_id = telegram_config.account_id;
+    tg.interactive = telegram_config.interactive;
 
     // Set up transcription — key comes from providers.{audio_media.provider}
     const trans = config.audio_media;
@@ -1809,6 +1942,12 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     // Create tools (for system prompt and tool calling)
     const tools = yc.tools.allTools(allocator, config.workspace_dir, .{
         .http_enabled = config.http_request.enabled,
+        .http_allowed_domains = config.http_request.allowed_domains,
+        .http_max_response_size = config.http_request.max_response_size,
+        .http_timeout_secs = config.http_request.timeout_secs,
+        .web_search_base_url = config.http_request.search_base_url,
+        .web_search_provider = config.http_request.search_provider,
+        .web_search_fallback_providers = config.http_request.search_fallback_providers,
         .browser_enabled = config.browser.enabled,
         .screenshot_enabled = true,
         .mcp_tools = mcp_tools,
@@ -1940,7 +2079,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
             std.debug.print("  -> {s}\n", .{reply});
 
             // Reply on telegram; handles [IMAGE:path] markers + split
-            tg.sendMessageWithReply(msg.sender, reply, reply_to_id) catch |err| {
+            tg.sendAssistantMessageWithReply(msg.sender, msg.id, msg.is_group, reply, reply_to_id) catch |err| {
                 std.debug.print("  Send error: {}\n", .{err});
             };
         }
@@ -2332,6 +2471,7 @@ fn printUsage() void {
         \\  hardware    Discover and manage hardware
         \\  migrate     Migrate data from other agent runtimes
         \\  memory      Inspect and maintain memory subsystem
+        \\  workspace   Maintain workspace markdown/bootstrap files
         \\  capabilities Show runtime capabilities manifest
         \\  models      Manage provider model catalogs
         \\  auth        Manage OAuth authentication (OpenAI Codex)
@@ -2350,6 +2490,7 @@ fn printUsage() void {
         \\  hardware <discover|introspect|info> [ARGS]
         \\  migrate openclaw [--dry-run] [--source PATH]
         \\  memory <stats|count|reindex|search|get|list|drain-outbox|forget> [ARGS]
+        \\  workspace reset-md [--dry-run] [--include-bootstrap] [--clear-memory-md]
         \\  capabilities [--json]
         \\  models refresh
         \\  auth <login|status|logout> <provider> [--import-codex]
@@ -2368,6 +2509,7 @@ test "parse known commands" {
     try std.testing.expectEqual(.service, parseCommand("service").?);
     try std.testing.expectEqual(.migrate, parseCommand("migrate").?);
     try std.testing.expectEqual(.memory, parseCommand("memory").?);
+    try std.testing.expectEqual(.workspace, parseCommand("workspace").?);
     try std.testing.expectEqual(.capabilities, parseCommand("capabilities").?);
     try std.testing.expectEqual(.models, parseCommand("models").?);
     try std.testing.expectEqual(.auth, parseCommand("auth").?);
