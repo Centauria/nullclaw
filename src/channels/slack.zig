@@ -37,6 +37,7 @@ pub const SlackChannel = struct {
     socket_thread: ?std.Thread = null,
     ws_fd: std.atomic.Value(SocketFd) = std.atomic.Value(SocketFd).init(invalid_socket),
     bot_user_id: ?[]u8 = null,
+    bot_api_app_id: ?[]u8 = null,
 
     pub const API_BASE = "https://slack.com/api";
     pub const DEFAULT_WEBHOOK_PATH = "/slack/events";
@@ -45,6 +46,7 @@ pub const SlackChannel = struct {
     pub const POLL_THREAD_STACK_SIZE: usize = 2 * 1024 * 1024;
     pub const SOCKET_THREAD_STACK_SIZE: usize = 2 * 1024 * 1024;
     pub const SOCKET_FAILURE_FALLBACK_THRESHOLD: u32 = 3;
+    pub const TOKEN_TRIM_CHARS = " \t\r\n";
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -294,16 +296,67 @@ pub const SlackChannel = struct {
     }
 
     fn hasValidBotToken(self: *const SlackChannel) bool {
-        return std.mem.trim(u8, self.bot_token, " \t\r\n").len > 0;
+        return self.normalizedBotToken().len > 0;
     }
 
     fn isDirectConversationId(channel_id: []const u8) bool {
         return channel_id.len > 0 and channel_id[0] == 'D';
     }
 
+    fn normalizedBotToken(self: *const SlackChannel) []const u8 {
+        return std.mem.trim(u8, self.bot_token, TOKEN_TRIM_CHARS);
+    }
+
+    fn normalizedAppToken(self: *const SlackChannel) ?[]const u8 {
+        const app_token = self.app_token orelse return null;
+        const trimmed = std.mem.trim(u8, app_token, TOKEN_TRIM_CHARS);
+        if (trimmed.len == 0) return null;
+        return trimmed;
+    }
+
+    fn parseApiAppIdFromAppToken(raw: []const u8) ?[]const u8 {
+        const token = std.mem.trim(u8, raw, TOKEN_TRIM_CHARS);
+        if (token.len == 0) return null;
+
+        var parts = std.mem.splitScalar(u8, token, '-');
+        const prefix = parts.next() orelse return null;
+        if (!std.ascii.eqlIgnoreCase(prefix, "xapp")) return null;
+
+        const version = parts.next() orelse return null;
+        if (version.len == 0) return null;
+        for (version) |ch| {
+            if (!std.ascii.isDigit(ch)) return null;
+        }
+
+        const api_app_id = parts.next() orelse return null;
+        if (api_app_id.len == 0) return null;
+        for (api_app_id) |ch| {
+            if (!std.ascii.isAlphanumeric(ch)) return null;
+        }
+        const remainder = parts.next() orelse return null;
+        if (remainder.len == 0) return null;
+        return api_app_id;
+    }
+
+    fn ensureSocketTokenPairMatches(self: *const SlackChannel) !void {
+        if (self.mode != .socket) return;
+        const app_token = self.normalizedAppToken() orelse return;
+        const bot_api_app_id = self.bot_api_app_id orelse return;
+        const expected_api_app_id = parseApiAppIdFromAppToken(app_token) orelse return;
+        if (std.ascii.eqlIgnoreCase(bot_api_app_id, expected_api_app_id)) return;
+
+        const mismatch_fmt = "Slack token mismatch: bot_token api_app_id={s} but app_token api_app_id={s}";
+        if (builtin.is_test) {
+            log.warn(mismatch_fmt, .{ bot_api_app_id, expected_api_app_id });
+        } else {
+            log.err(mismatch_fmt, .{ bot_api_app_id, expected_api_app_id });
+        }
+        return error.SlackAuthFailed;
+    }
+
     fn fetchBotUserId(self: *SlackChannel) !void {
         const url = API_BASE ++ "/auth.test";
-        const auth_header = try std.fmt.allocPrint(self.allocator, "Authorization: Bearer {s}", .{self.bot_token});
+        const auth_header = try std.fmt.allocPrint(self.allocator, "Authorization: Bearer {s}", .{self.normalizedBotToken()});
         defer self.allocator.free(auth_header);
         const headers = [_][]const u8{auth_header};
         const resp = root.http_util.curlGet(self.allocator, url, &headers, "15") catch return error.SlackApiError;
@@ -315,9 +368,15 @@ pub const SlackChannel = struct {
         try ensureSlackApiOk(parsed.value.object, "auth.test", null);
         const uid_val = parsed.value.object.get("user_id") orelse return error.SlackApiError;
         if (uid_val != .string or uid_val.string.len == 0) return error.SlackApiError;
+        const api_app_id = if (parsed.value.object.get("api_app_id")) |api_app_id_val|
+            if (api_app_id_val == .string and api_app_id_val.string.len > 0) api_app_id_val.string else null
+        else
+            null;
 
         if (self.bot_user_id) |old| self.allocator.free(old);
         self.bot_user_id = try self.allocator.dupe(u8, uid_val.string);
+        if (self.bot_api_app_id) |old| self.allocator.free(old);
+        self.bot_api_app_id = if (api_app_id) |value| try self.allocator.dupe(u8, value) else null;
     }
 
     fn processHistoryMessage(
@@ -406,7 +465,7 @@ pub const SlackChannel = struct {
         try w.print("{s}/conversations.history?channel={s}&oldest={s}&inclusive=false&limit=100", .{ API_BASE, channel_id, oldest });
         const url = fbs.getWritten();
 
-        const auth_header = try std.fmt.allocPrint(self.allocator, "Authorization: Bearer {s}", .{self.bot_token});
+        const auth_header = try std.fmt.allocPrint(self.allocator, "Authorization: Bearer {s}", .{self.normalizedBotToken()});
         defer self.allocator.free(auth_header);
         const headers = [_][]const u8{auth_header};
         const resp = root.http_util.curlGet(self.allocator, url, &headers, "30") catch return error.SlackApiError;
@@ -482,8 +541,7 @@ pub const SlackChannel = struct {
     }
 
     fn hasValidAppToken(self: *const SlackChannel) bool {
-        const app_token = self.app_token orelse return false;
-        return std.mem.trim(u8, app_token, " \t\r\n").len > 0;
+        return self.normalizedAppToken() != null;
     }
 
     fn hasPollingTargets(self: *const SlackChannel) bool {
@@ -569,7 +627,7 @@ pub const SlackChannel = struct {
     }
 
     fn openSocketUrl(self: *SlackChannel) ![]u8 {
-        const app_token = self.app_token orelse return error.SlackAppTokenRequired;
+        const app_token = self.normalizedAppToken() orelse return error.SlackAppTokenRequired;
         const url = API_BASE ++ "/apps.connections.open";
         const auth_header = try std.fmt.allocPrint(self.allocator, "Authorization: Bearer {s}", .{app_token});
         defer self.allocator.free(auth_header);
@@ -732,7 +790,7 @@ pub const SlackChannel = struct {
         // Build auth header: "Authorization: Bearer xoxb-..."
         var auth_buf: [512]u8 = undefined;
         var auth_fbs = std.io.fixedBufferStream(&auth_buf);
-        try auth_fbs.writer().print("Authorization: Bearer {s}", .{self.bot_token});
+        try auth_fbs.writer().print("Authorization: Bearer {s}", .{self.normalizedBotToken()});
         const auth_header = auth_fbs.getWritten();
 
         const resp = root.http_util.curlPost(self.allocator, url, body_list.items, &.{auth_header}) catch |err| {
@@ -767,7 +825,7 @@ pub const SlackChannel = struct {
 
         var auth_buf: [512]u8 = undefined;
         var auth_fbs = std.io.fixedBufferStream(&auth_buf);
-        auth_fbs.writer().print("Authorization: Bearer {s}", .{self.bot_token}) catch return;
+        auth_fbs.writer().print("Authorization: Bearer {s}", .{self.normalizedBotToken()}) catch return;
         const auth_header = auth_fbs.getWritten();
 
         const resp = root.http_util.curlPost(self.allocator, url, body_list.items, &.{auth_header}) catch return;
@@ -808,13 +866,18 @@ pub const SlackChannel = struct {
         self.connected.store(false, .release);
 
         // Best-effort bot identity fetch for mention-only policies.
+        var fetched_bot_identity = true;
         self.fetchBotUserId() catch |err| {
             if (err == error.SlackAuthFailed) {
                 log.err("Slack auth.test failed due authentication error; refusing to start Slack channel.", .{});
                 return err;
             }
             log.warn("Slack auth.test failed: {}", .{err});
+            fetched_bot_identity = false;
         };
+        if (fetched_bot_identity) {
+            try self.ensureSocketTokenPairMatches();
+        }
 
         switch (self.mode) {
             .socket => {
@@ -866,6 +929,10 @@ pub const SlackChannel = struct {
         if (self.bot_user_id) |uid| {
             self.allocator.free(uid);
             self.bot_user_id = null;
+        }
+        if (self.bot_api_app_id) |api_app_id| {
+            self.allocator.free(api_app_id);
+            self.bot_api_app_id = null;
         }
         self.clearChannelCursors();
         if (self.last_ts_owned) {
@@ -1234,6 +1301,50 @@ test "ensureSlackApiOk maps non-auth failures to SlackApiError" {
 test "hasValidBotToken rejects blank token" {
     var ch = SlackChannel.init(std.testing.allocator, "   ", null, null, &.{});
     try std.testing.expect(!ch.hasValidBotToken());
+}
+
+test "normalized token helpers trim whitespace" {
+    var ch = SlackChannel.init(std.testing.allocator, "  xoxb-test \n", "\t xapp-1-A123-xyz  ", null, &.{});
+    try std.testing.expectEqualStrings("xoxb-test", ch.normalizedBotToken());
+    try std.testing.expectEqualStrings("xapp-1-A123-xyz", ch.normalizedAppToken().?);
+}
+
+test "parseApiAppIdFromAppToken extracts id" {
+    const parsed = SlackChannel.parseApiAppIdFromAppToken(" xapp-1-a1b2c3-token ");
+    try std.testing.expect(parsed != null);
+    try std.testing.expectEqualStrings("a1b2c3", parsed.?);
+}
+
+test "parseApiAppIdFromAppToken rejects malformed tokens" {
+    try std.testing.expect(SlackChannel.parseApiAppIdFromAppToken("") == null);
+    try std.testing.expect(SlackChannel.parseApiAppIdFromAppToken("xoxb-123") == null);
+    try std.testing.expect(SlackChannel.parseApiAppIdFromAppToken("xapp-no-version-A123-foo") == null);
+    try std.testing.expect(SlackChannel.parseApiAppIdFromAppToken("xapp-1--foo") == null);
+    try std.testing.expect(SlackChannel.parseApiAppIdFromAppToken("xapp-1-A123") == null);
+}
+
+test "ensureSocketTokenPairMatches rejects mismatched api_app_id" {
+    var ch = SlackChannel.init(std.testing.allocator, "xoxb-test", "xapp-1-B222-foo", null, &.{});
+    ch.mode = .socket;
+    ch.bot_api_app_id = try std.testing.allocator.dupe(u8, "A111");
+    defer {
+        if (ch.bot_api_app_id) |api_app_id| std.testing.allocator.free(api_app_id);
+        ch.bot_api_app_id = null;
+    }
+
+    try std.testing.expectError(error.SlackAuthFailed, ch.ensureSocketTokenPairMatches());
+}
+
+test "ensureSocketTokenPairMatches accepts matching api_app_id ignoring case" {
+    var ch = SlackChannel.init(std.testing.allocator, "xoxb-test", "xapp-1-a111-foo", null, &.{});
+    ch.mode = .socket;
+    ch.bot_api_app_id = try std.testing.allocator.dupe(u8, "A111");
+    defer {
+        if (ch.bot_api_app_id) |api_app_id| std.testing.allocator.free(api_app_id);
+        ch.bot_api_app_id = null;
+    }
+
+    try ch.ensureSocketTokenPairMatches();
 }
 
 test "slack channel user allowed wildcard" {
