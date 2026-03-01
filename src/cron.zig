@@ -788,13 +788,13 @@ pub const CronScheduler = struct {
                         }
                     } else {
                         const exec_result = runAgentJob(self.allocator, self.shell_cwd, agent_output, job.model, self.agent_timeout_secs) catch |err| {
-                            log.err("cron agent job '{s}' failed to start: {}", .{ job.id, err });
+                            log.err("cron agent job '{s}' execution failed: {s}", .{ job.id, @errorName(err) });
                             job.last_run_secs = now;
                             job.last_status = "error";
                             if (job.last_output) |old| self.allocator.free(old);
                             job.last_output = null;
                             if (out_bus) |b| {
-                                _ = deliverResult(self.allocator, job.delivery, "agent job failed to start", false, b) catch {};
+                                _ = deliverResult(self.allocator, job.delivery, "agent job execution failed", false, b) catch {};
                             }
                             continue;
                         };
@@ -911,19 +911,28 @@ fn collectChildOutputWithTimeout(
         if (!keep_polling) break;
 
         if (!timed_out and hasTimeoutExpired(start_ns, timeout_secs)) {
-            if (child.kill()) |_| {
-                // Process terminated and reaped by kill().
-            } else |err| {
-                switch (err) {
-                    error.AlreadyTerminated => {},
-                    else => return err,
-                }
-            }
+            try terminateAgentChildHard(child);
             timed_out = true;
         }
     }
 
     return timed_out;
+}
+
+fn terminateAgentChildHard(child: *std.process.Child) !void {
+    if (comptime builtin.os.tag == .windows) {
+        _ = child.killWindows(1) catch |err| switch (err) {
+            error.AlreadyTerminated => return,
+            else => return err,
+        };
+        return;
+    }
+    if (comptime builtin.os.tag == .wasi) return error.UnsupportedOperation;
+
+    std.posix.kill(child.id, std.posix.SIG.KILL) catch |err| switch (err) {
+        error.ProcessNotFound => return,
+        else => return err,
+    };
 }
 
 fn buildAgentOutput(
