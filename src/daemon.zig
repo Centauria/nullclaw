@@ -278,6 +278,14 @@ fn upsertSchedulerRuntimeJob(
         .last_status = runtime_job.last_status,
         .paused = runtime_job.paused,
         .one_shot = runtime_job.one_shot,
+        .job_type = runtime_job.job_type,
+        .session_target = runtime_job.session_target,
+        .prompt = if (runtime_job.prompt) |p| try allocator.dupe(u8, p) else null,
+        .name = if (runtime_job.name) |n| try allocator.dupe(u8, n) else null,
+        .model = if (runtime_job.model) |m| try allocator.dupe(u8, m) else null,
+        .enabled = runtime_job.enabled,
+        .delete_after_run = runtime_job.delete_after_run,
+        .created_at_s = runtime_job.created_at_s,
     });
 }
 
@@ -317,6 +325,7 @@ fn mergeSchedulerTickChangesAndSave(
 fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState, event_bus: *bus_mod.Bus) void {
     var scheduler = CronScheduler.init(allocator, config.scheduler.max_tasks, config.scheduler.enabled);
     scheduler.setShellCwd(config.workspace_dir);
+    scheduler.setAgentTimeoutSecs(config.scheduler.agent_timeout_secs);
     defer scheduler.deinit();
     var before_tick: std.StringHashMapUnmanaged(SchedulerJobSnapshot) = .empty;
     defer {
@@ -1733,6 +1742,48 @@ test "mergeSchedulerTickChangesAndSave preserves externally added jobs" {
     }
     try std.testing.expect(found_runtime);
     try std.testing.expect(found_external);
+}
+
+test "mergeSchedulerTickChangesAndSave preserves runtime agent fields" {
+    const allocator = std.testing.allocator;
+
+    var runtime = CronScheduler.init(allocator, 32, true);
+    defer runtime.deinit();
+    _ = try runtime.addAgentJob("* * * * *", "summarize merge state", "openrouter/anthropic/claude-sonnet-4");
+    runtime.jobs.items[runtime.jobs.items.len - 1].next_run_secs = 0;
+    try cron.saveJobs(&runtime);
+
+    var loaded = CronScheduler.init(allocator, 32, true);
+    defer loaded.deinit();
+    try cron.loadJobs(&loaded);
+
+    var before_tick: std.StringHashMapUnmanaged(SchedulerJobSnapshot) = .empty;
+    defer {
+        clearSchedulerSnapshot(allocator, &before_tick);
+        before_tick.deinit(allocator);
+    }
+    try buildSchedulerSnapshot(allocator, &loaded, &before_tick);
+
+    // Simulate concurrent rewrite removing jobs from disk; merge should restore
+    // runtime job with all agent fields.
+    var external = CronScheduler.init(allocator, 32, true);
+    defer external.deinit();
+    try cron.saveJobs(&external);
+
+    _ = loaded.tick(std.time.timestamp(), null);
+    try mergeSchedulerTickChangesAndSave(allocator, &loaded, &before_tick);
+
+    var merged = CronScheduler.init(allocator, 32, true);
+    defer merged.deinit();
+    try cron.loadJobsStrict(&merged);
+    try std.testing.expectEqual(@as(usize, 1), merged.listJobs().len);
+
+    const job = merged.listJobs()[0];
+    try std.testing.expectEqual(cron.JobType.agent, job.job_type);
+    try std.testing.expect(job.prompt != null);
+    try std.testing.expectEqualStrings("summarize merge state", job.prompt.?);
+    try std.testing.expect(job.model != null);
+    try std.testing.expectEqualStrings("openrouter/anthropic/claude-sonnet-4", job.model.?);
 }
 
 test "channelSupervisorThread respects shutdown" {
