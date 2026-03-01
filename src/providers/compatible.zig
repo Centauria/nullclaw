@@ -11,6 +11,7 @@ const ContentPart = root.ContentPart;
 const ToolCall = root.ToolCall;
 const TokenUsage = root.TokenUsage;
 
+const log = std.log.scoped(.compatible);
 /// How the provider expects the API key to be sent.
 pub const AuthStyle = enum {
     /// `Authorization: Bearer <key>`
@@ -504,6 +505,8 @@ pub const OpenAiCompatibleProvider = struct {
                     return err;
                 };
             }
+            const truncated_resp_body = if (resp_body.len > 128) resp_body[0..128] else resp_body;
+            log.err("{s} {s}: {s} {s}", .{ self.name, @errorName(err), url, truncated_resp_body });
             return err;
         };
     }
@@ -536,7 +539,11 @@ pub const OpenAiCompatibleProvider = struct {
         } else root.curlPostTimed(allocator, url, body, &.{}, request.timeout_secs) catch return error.CompatibleApiError;
         defer allocator.free(resp_body);
 
-        return parseNativeResponse(allocator, resp_body);
+        return parseNativeResponse(allocator, resp_body) catch |err| {
+            const truncated_resp_body = if (resp_body.len > 128) resp_body[0..128] else resp_body;
+            log.err("{s} {s}: {s} {s}", .{ self.name, @errorName(err), url, truncated_resp_body });
+            return err;
+        };
     }
 
     fn supportsNativeToolsImpl(ptr: *anyopaque) bool {
