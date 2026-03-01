@@ -37,6 +37,7 @@ pub const SlackChannel = struct {
     socket_thread: ?std.Thread = null,
     ws_fd: std.atomic.Value(SocketFd) = std.atomic.Value(SocketFd).init(invalid_socket),
     bot_user_id: ?[]u8 = null,
+    bot_team_id: ?[]u8 = null,
     bot_api_app_id: ?[]u8 = null,
 
     pub const API_BASE = "https://slack.com/api";
@@ -354,6 +355,43 @@ pub const SlackChannel = struct {
         return error.SlackAuthFailed;
     }
 
+    fn shouldDropMismatchedSocketEvent(self: *const SlackChannel, payload_obj: std.json.ObjectMap) bool {
+        const incoming_api_app_id = if (payload_obj.get("api_app_id")) |api_app_id_val|
+            if (api_app_id_val == .string and api_app_id_val.string.len > 0) api_app_id_val.string else null
+        else
+            null;
+        const incoming_team_id = if (payload_obj.get("team_id")) |team_id_val|
+            if (team_id_val == .string and team_id_val.string.len > 0) team_id_val.string else null
+        else
+            null;
+
+        if (self.bot_api_app_id) |expected_api_app_id| {
+            if (incoming_api_app_id) |actual_api_app_id| {
+                if (!std.ascii.eqlIgnoreCase(expected_api_app_id, actual_api_app_id)) {
+                    log.warn(
+                        "Slack socket event dropped: api_app_id={s} expected={s}",
+                        .{ actual_api_app_id, expected_api_app_id },
+                    );
+                    return true;
+                }
+            }
+        }
+
+        if (self.bot_team_id) |expected_team_id| {
+            if (incoming_team_id) |actual_team_id| {
+                if (!std.mem.eql(u8, expected_team_id, actual_team_id)) {
+                    log.warn(
+                        "Slack socket event dropped: team_id={s} expected={s}",
+                        .{ actual_team_id, expected_team_id },
+                    );
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
     fn fetchBotUserId(self: *SlackChannel) !void {
         const url = API_BASE ++ "/auth.test";
         const auth_header = try std.fmt.allocPrint(self.allocator, "Authorization: Bearer {s}", .{self.normalizedBotToken()});
@@ -368,6 +406,10 @@ pub const SlackChannel = struct {
         try ensureSlackApiOk(parsed.value.object, "auth.test", null);
         const uid_val = parsed.value.object.get("user_id") orelse return error.SlackApiError;
         if (uid_val != .string or uid_val.string.len == 0) return error.SlackApiError;
+        const team_id = if (parsed.value.object.get("team_id")) |team_id_val|
+            if (team_id_val == .string and team_id_val.string.len > 0) team_id_val.string else null
+        else
+            null;
         const api_app_id = if (parsed.value.object.get("api_app_id")) |api_app_id_val|
             if (api_app_id_val == .string and api_app_id_val.string.len > 0) api_app_id_val.string else null
         else
@@ -375,6 +417,8 @@ pub const SlackChannel = struct {
 
         if (self.bot_user_id) |old| self.allocator.free(old);
         self.bot_user_id = try self.allocator.dupe(u8, uid_val.string);
+        if (self.bot_team_id) |old| self.allocator.free(old);
+        self.bot_team_id = if (team_id) |value| try self.allocator.dupe(u8, value) else null;
         if (self.bot_api_app_id) |old| self.allocator.free(old);
         self.bot_api_app_id = if (api_app_id) |value| try self.allocator.dupe(u8, value) else null;
     }
@@ -679,6 +723,7 @@ pub const SlackChannel = struct {
 
         const payload_val = parsed.value.object.get("payload") orelse return;
         if (payload_val != .object) return;
+        if (self.shouldDropMismatchedSocketEvent(payload_val.object)) return;
         const event_val = payload_val.object.get("event") orelse return;
         if (event_val != .object) return;
 
@@ -929,6 +974,10 @@ pub const SlackChannel = struct {
         if (self.bot_user_id) |uid| {
             self.allocator.free(uid);
             self.bot_user_id = null;
+        }
+        if (self.bot_team_id) |team_id| {
+            self.allocator.free(team_id);
+            self.bot_team_id = null;
         }
         if (self.bot_api_app_id) |api_app_id| {
             self.allocator.free(api_app_id);
@@ -1345,6 +1394,60 @@ test "ensureSocketTokenPairMatches accepts matching api_app_id ignoring case" {
     }
 
     try ch.ensureSocketTokenPairMatches();
+}
+
+test "shouldDropMismatchedSocketEvent drops api_app_id mismatch" {
+    var ch = SlackChannel.init(std.testing.allocator, "xoxb-test", "xapp-1-A111-foo", null, &.{});
+    ch.bot_api_app_id = try std.testing.allocator.dupe(u8, "A111");
+    defer {
+        if (ch.bot_api_app_id) |api_app_id| std.testing.allocator.free(api_app_id);
+        ch.bot_api_app_id = null;
+    }
+
+    const payload =
+        \\{"api_app_id":"A222","team_id":"T1"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    try std.testing.expect(ch.shouldDropMismatchedSocketEvent(parsed.value.object));
+}
+
+test "shouldDropMismatchedSocketEvent drops team_id mismatch" {
+    var ch = SlackChannel.init(std.testing.allocator, "xoxb-test", "xapp-1-A111-foo", null, &.{});
+    ch.bot_team_id = try std.testing.allocator.dupe(u8, "T111");
+    defer {
+        if (ch.bot_team_id) |team_id| std.testing.allocator.free(team_id);
+        ch.bot_team_id = null;
+    }
+
+    const payload =
+        \\{"api_app_id":"A111","team_id":"T222"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    try std.testing.expect(ch.shouldDropMismatchedSocketEvent(parsed.value.object));
+}
+
+test "shouldDropMismatchedSocketEvent keeps matching scope" {
+    var ch = SlackChannel.init(std.testing.allocator, "xoxb-test", "xapp-1-A111-foo", null, &.{});
+    ch.bot_api_app_id = try std.testing.allocator.dupe(u8, "A111");
+    ch.bot_team_id = try std.testing.allocator.dupe(u8, "T111");
+    defer {
+        if (ch.bot_api_app_id) |api_app_id| std.testing.allocator.free(api_app_id);
+        ch.bot_api_app_id = null;
+        if (ch.bot_team_id) |team_id| std.testing.allocator.free(team_id);
+        ch.bot_team_id = null;
+    }
+
+    const payload =
+        \\{"api_app_id":"A111","team_id":"T111"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, payload, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    try std.testing.expect(!ch.shouldDropMismatchedSocketEvent(parsed.value.object));
 }
 
 test "slack channel user allowed wildcard" {
