@@ -2462,7 +2462,7 @@ fn printUsage() void {
         \\  onboard     Initialize workspace and configuration
         \\  agent       Start the AI agent loop
         \\  gateway     Start the gateway server (HTTP/WebSocket)
-        \\  service     Manage OS service lifecycle (install/start/stop/status/uninstall)
+        \\  service     Manage OS service lifecycle (install/start/stop/restart/status/uninstall)
         \\  status      Show system status
         \\  version     Show CLI version
         \\  doctor      Run diagnostics

@@ -1,6 +1,6 @@
 //! Service management — launchd (macOS), systemd (Linux), and SCM (Windows).
 //!
-//! Mirrors ZeroClaw's service module: install, start, stop, status, uninstall.
+//! Mirrors ZeroClaw's service module: install, start, stop, restart, status, uninstall.
 //! Uses child process execution to interact with launchctl / systemctl / sc.exe.
 
 const std = @import("std");
@@ -91,7 +91,12 @@ fn stopService(allocator: std.mem.Allocator) !void {
 }
 
 fn restartService(allocator: std.mem.Allocator) !void {
-    try stopService(allocator);
+    // Restart should still attempt start when stop returns a non-zero status
+    // (e.g. service already stopped on some platforms).
+    stopService(allocator) catch |err| switch (err) {
+        error.CommandFailed => {},
+        else => return err,
+    };
     try startService(allocator);
 }
 
