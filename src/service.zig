@@ -1,6 +1,6 @@
 //! Service management — launchd (macOS), systemd (Linux), and SCM (Windows).
 //!
-//! Mirrors ZeroClaw's service module: install, start, stop, status, uninstall.
+//! Mirrors ZeroClaw's service module: install, start, stop, restart, status, uninstall.
 //! Uses child process execution to interact with launchctl / systemctl / sc.exe.
 
 const std = @import("std");
@@ -15,6 +15,7 @@ pub const ServiceCommand = enum {
     install,
     start,
     stop,
+    restart,
     status,
     uninstall,
 };
@@ -38,6 +39,7 @@ pub fn handleCommand(
         .install => install(allocator, config_path),
         .start => startService(allocator),
         .stop => stopService(allocator),
+        .restart => restartService(allocator),
         .status => serviceStatus(allocator),
         .uninstall => uninstall(allocator),
     };
@@ -83,6 +85,43 @@ fn stopService(allocator: std.mem.Allocator) !void {
         try runChecked(allocator, &.{ "systemctl", "--user", "stop", "nullclaw.service" });
     } else if (comptime builtin.os.tag == .windows) {
         try runChecked(allocator, &.{ "sc.exe", "stop", WINDOWS_SERVICE_NAME });
+    } else {
+        return error.UnsupportedPlatform;
+    }
+}
+
+fn restartService(allocator: std.mem.Allocator) !void {
+    // Restart should still proceed when stop reports "already stopped"/"not loaded",
+    // but should not mask unrelated stop failures.
+    try stopServiceForRestart(allocator);
+    try startService(allocator);
+}
+
+fn stopServiceForRestart(allocator: std.mem.Allocator) !void {
+    if (comptime builtin.os.tag == .macos) {
+        // launchctl stop/unload can fail when not loaded; treat as best-effort here.
+        const plist = try macosServiceFile(allocator);
+        defer allocator.free(plist);
+        runChecked(allocator, &.{ "launchctl", "stop", SERVICE_LABEL }) catch {};
+        runChecked(allocator, &.{ "launchctl", "unload", "-w", plist }) catch {};
+        return;
+    } else if (comptime builtin.os.tag == .linux) {
+        try assertLinuxSystemdUserAvailable(allocator);
+        const status = try runCaptureStatus(allocator, &.{ "systemctl", "--user", "stop", "nullclaw.service" });
+        defer allocator.free(status.stdout);
+        defer allocator.free(status.stderr);
+        if (status.success) return;
+        const detail = captureStatusDetail(&status);
+        if (isSystemdUnitNotLoadedDetail(detail)) return;
+        return error.CommandFailed;
+    } else if (comptime builtin.os.tag == .windows) {
+        const status = try runCaptureStatus(allocator, &.{ "sc.exe", "stop", WINDOWS_SERVICE_NAME });
+        defer allocator.free(status.stdout);
+        defer allocator.free(status.stderr);
+        if (status.success) return;
+        const detail = captureStatusDetail(&status);
+        if (isWindowsServiceMissingDetail(detail) or isWindowsServiceNotRunningDetail(detail)) return;
+        return error.CommandFailed;
     } else {
         return error.UnsupportedPlatform;
     }
@@ -359,10 +398,21 @@ fn isSystemdUnavailableDetail(detail: []const u8) bool {
         std.ascii.indexOfIgnoreCase(detail, "no such file or directory") != null;
 }
 
+fn isSystemdUnitNotLoadedDetail(detail: []const u8) bool {
+    return std.ascii.indexOfIgnoreCase(detail, "unit nullclaw.service not loaded") != null or
+        std.ascii.indexOfIgnoreCase(detail, "could not be found") != null or
+        std.ascii.indexOfIgnoreCase(detail, "not loaded") != null;
+}
+
 fn isWindowsServiceMissingDetail(detail: []const u8) bool {
     return std.ascii.indexOfIgnoreCase(detail, "1060") != null or
         std.ascii.indexOfIgnoreCase(detail, "does not exist as an installed service") != null or
         std.ascii.indexOfIgnoreCase(detail, "service does not exist") != null;
+}
+
+fn isWindowsServiceNotRunningDetail(detail: []const u8) bool {
+    return std.ascii.indexOfIgnoreCase(detail, "1062") != null or
+        std.ascii.indexOfIgnoreCase(detail, "service has not been started") != null;
 }
 
 fn isWindowsServiceAlreadyExistsDetail(detail: []const u8) bool {
@@ -533,10 +583,23 @@ test "isSystemdUnavailableDetail detects common unavailable errors" {
     try std.testing.expect(!isSystemdUnavailableDetail("permission denied"));
 }
 
+test "isSystemdUnitNotLoadedDetail detects stop-not-loaded patterns" {
+    try std.testing.expect(isSystemdUnitNotLoadedDetail("Unit nullclaw.service not loaded."));
+    try std.testing.expect(isSystemdUnitNotLoadedDetail("Unit nullclaw.service could not be found."));
+    try std.testing.expect(isSystemdUnitNotLoadedDetail("not loaded"));
+    try std.testing.expect(!isSystemdUnitNotLoadedDetail("permission denied"));
+}
+
 test "isWindowsServiceMissingDetail detects missing-service patterns" {
     try std.testing.expect(isWindowsServiceMissingDetail("OpenService FAILED 1060"));
     try std.testing.expect(isWindowsServiceMissingDetail("The specified service does not exist as an installed service."));
     try std.testing.expect(!isWindowsServiceMissingDetail("OpenService FAILED 5: Access is denied."));
+}
+
+test "isWindowsServiceNotRunningDetail detects stop-not-running patterns" {
+    try std.testing.expect(isWindowsServiceNotRunningDetail("ControlService FAILED 1062"));
+    try std.testing.expect(isWindowsServiceNotRunningDetail("The service has not been started."));
+    try std.testing.expect(!isWindowsServiceNotRunningDetail("OpenService FAILED 1060"));
 }
 
 test "isWindowsServiceAlreadyExistsDetail detects duplicate-service patterns" {

@@ -166,7 +166,7 @@ fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
 
 fn runService(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     if (sub_args.len < 1) {
-        std.debug.print("Usage: nullclaw service <install|start|stop|status|uninstall>\n", .{});
+        std.debug.print("Usage: nullclaw service <install|start|stop|restart|status|uninstall>\n", .{});
         std.process.exit(1);
     }
 
@@ -176,6 +176,7 @@ fn runService(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             .{ "install", yc.service.ServiceCommand.install },
             .{ "start", yc.service.ServiceCommand.start },
             .{ "stop", yc.service.ServiceCommand.stop },
+            .{ "restart", yc.service.ServiceCommand.restart },
             .{ "status", yc.service.ServiceCommand.status },
             .{ "uninstall", yc.service.ServiceCommand.uninstall },
         };
@@ -183,7 +184,7 @@ fn runService(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             if (std.mem.eql(u8, subcmd, entry[0])) break :blk entry[1];
         }
         std.debug.print("Unknown service command: {s}\n", .{subcmd});
-        std.debug.print("Usage: nullclaw service <install|start|stop|status|uninstall>\n", .{});
+        std.debug.print("Usage: nullclaw service <install|start|stop|restart|status|uninstall>\n", .{});
         std.process.exit(1);
     };
 
@@ -2461,7 +2462,7 @@ fn printUsage() void {
         \\  onboard     Initialize workspace and configuration
         \\  agent       Start the AI agent loop
         \\  gateway     Start the gateway server (HTTP/WebSocket)
-        \\  service     Manage OS service lifecycle (install/start/stop/status/uninstall)
+        \\  service     Manage OS service lifecycle (install/start/stop/restart/status/uninstall)
         \\  status      Show system status
         \\  version     Show CLI version
         \\  doctor      Run diagnostics
@@ -2483,7 +2484,7 @@ fn printUsage() void {
         \\  agent [-m MESSAGE] [-s SESSION] [--provider PROVIDER] [--model MODEL] [--temperature TEMP]
         \\  gateway [--port PORT] [--host HOST]
         \\  version | --version | -V
-        \\  service <install|start|stop|status|uninstall>
+        \\  service <install|start|stop|restart|status|uninstall>
         \\  cron <list|add|once|remove|pause|resume> [ARGS]
         \\  channel <list|start|status|add|remove> [ARGS]
         \\  skills <list|install|remove> [ARGS]
