@@ -120,6 +120,8 @@ pub const SchedulerConfig = struct {
     enabled: bool = true,
     max_tasks: u32 = 64,
     max_concurrent: u32 = 4,
+    /// Hard timeout for cron agent subprocess execution. 0 = no timeout.
+    agent_timeout_secs: u64 = 0,
 };
 
 pub const AgentConfig = struct {
@@ -343,12 +345,18 @@ pub const QQGroupPolicy = enum {
     allowlist,
 };
 
+pub const QQReceiveMode = enum {
+    websocket,
+    webhook,
+};
+
 pub const QQConfig = struct {
     account_id: []const u8 = "default",
     app_id: []const u8 = "",
     app_secret: []const u8 = "",
     bot_token: []const u8 = "",
     sandbox: bool = false,
+    receive_mode: QQReceiveMode = .webhook,
     group_policy: QQGroupPolicy = .allow,
     allowed_groups: []const []const u8 = &.{},
     allow_from: []const []const u8 = &.{},
@@ -373,6 +381,7 @@ pub const MaixCamConfig = struct {
 pub const WebConfig = struct {
     pub const DEFAULT_PATH: []const u8 = "/ws";
     pub const DEFAULT_TRANSPORT: []const u8 = "local";
+    pub const DEFAULT_MESSAGE_AUTH_MODE: []const u8 = "pairing";
     pub const MIN_AUTH_TOKEN_LEN: usize = 16;
     pub const MAX_AUTH_TOKEN_LEN: usize = 128;
     pub const MAX_RELAY_AGENT_ID_LEN: usize = 64;
@@ -392,11 +401,14 @@ pub const WebConfig = struct {
     path: []const u8 = DEFAULT_PATH,
     max_connections: u16 = 10,
     /// Optional WebSocket-upgrade auth token for browser/extension clients.
-    /// Used as an additional hardening control; pairing/JWT remains required
-    /// for user_message events.
+    /// Used for WebSocket-upgrade hardening and for `message_auth_mode="token"`.
     /// If null, WebChannel falls back to env (NULLCLAW_WEB_TOKEN/NULLCLAW_GATEWAY_TOKEN/OPENCLAW_GATEWAY_TOKEN),
     /// then to an ephemeral runtime token.
     auth_token: ?[]const u8 = null,
+    /// Authentication mode for inbound user_message events.
+    /// - "pairing": require UI JWT access_token from pairing flow.
+    /// - "token": require channel auth token in auth_token (or access_token for compatibility).
+    message_auth_mode: []const u8 = DEFAULT_MESSAGE_AUTH_MODE,
     /// Optional allowlist for Origin header values (exact match, supports "*").
     /// Empty = allow any origin.
     allowed_origins: []const []const u8 = &.{},
@@ -444,6 +456,16 @@ pub const WebConfig = struct {
     pub fn isRelayTransport(raw: []const u8) bool {
         const trimmed = std.mem.trim(u8, raw, " \t\r\n");
         return std.mem.eql(u8, trimmed, "relay");
+    }
+
+    pub fn isValidMessageAuthMode(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        return std.mem.eql(u8, trimmed, "pairing") or std.mem.eql(u8, trimmed, "token");
+    }
+
+    pub fn isTokenMessageAuthMode(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        return std.mem.eql(u8, trimmed, "token");
     }
 
     fn isAllowedTokenByte(byte: u8) bool {
@@ -1201,6 +1223,7 @@ test "WebConfig defaults" {
     try std.testing.expectEqualStrings(WebConfig.DEFAULT_PATH, cfg.path);
     try std.testing.expectEqual(@as(u16, 10), cfg.max_connections);
     try std.testing.expect(cfg.auth_token == null);
+    try std.testing.expectEqualStrings(WebConfig.DEFAULT_MESSAGE_AUTH_MODE, cfg.message_auth_mode);
     try std.testing.expectEqual(@as(usize, 0), cfg.allowed_origins.len);
     try std.testing.expect(cfg.relay_url == null);
     try std.testing.expectEqualStrings("default", cfg.relay_agent_id);
@@ -1257,6 +1280,14 @@ test "WebConfig transport validation supports local and relay" {
     try std.testing.expect(!WebConfig.isValidTransport("direct"));
     try std.testing.expect(WebConfig.isRelayTransport("relay"));
     try std.testing.expect(!WebConfig.isRelayTransport("local"));
+}
+
+test "WebConfig message auth mode validation supports pairing and token" {
+    try std.testing.expect(WebConfig.isValidMessageAuthMode("pairing"));
+    try std.testing.expect(WebConfig.isValidMessageAuthMode("token"));
+    try std.testing.expect(WebConfig.isTokenMessageAuthMode("token"));
+    try std.testing.expect(!WebConfig.isTokenMessageAuthMode("pairing"));
+    try std.testing.expect(!WebConfig.isValidMessageAuthMode("jwt"));
 }
 
 test "WebConfig relay URL validation requires wss authority" {

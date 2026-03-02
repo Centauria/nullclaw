@@ -11,6 +11,22 @@ const ContentPart = root.ContentPart;
 const ToolCall = root.ToolCall;
 const TokenUsage = root.TokenUsage;
 
+const log = std.log.scoped(.compatible);
+
+fn logCompatibleApiError(
+    allocator: std.mem.Allocator,
+    provider_name: []const u8,
+    err: anyerror,
+    url: []const u8,
+    resp_body: []const u8,
+) void {
+    const sanitized = root.sanitizeApiError(allocator, resp_body) catch null;
+    defer if (sanitized) |body| allocator.free(body);
+
+    const preview = sanitized orelse "<api error body unavailable>";
+    log.err("{s} {s}: {s} {s}", .{ provider_name, @errorName(err), url, preview });
+}
+
 /// How the provider expects the API key to be sent.
 pub const AuthStyle = enum {
     /// `Authorization: Bearer <key>`
@@ -501,9 +517,11 @@ pub const OpenAiCompatibleProvider = struct {
             // If chat completions failed and responses fallback is enabled, try the responses API
             if (self.supports_responses_fallback) {
                 return self.chatViaResponses(allocator, eff_system, merged_msg orelse message, effective_model) catch {
+                    logCompatibleApiError(allocator, self.name, err, url, resp_body);
                     return err;
                 };
             }
+            logCompatibleApiError(allocator, self.name, err, url, resp_body);
             return err;
         };
     }
@@ -536,7 +554,10 @@ pub const OpenAiCompatibleProvider = struct {
         } else root.curlPostTimed(allocator, url, body, &.{}, request.timeout_secs) catch return error.CompatibleApiError;
         defer allocator.free(resp_body);
 
-        return parseNativeResponse(allocator, resp_body);
+        return parseNativeResponse(allocator, resp_body) catch |err| {
+            logCompatibleApiError(allocator, self.name, err, url, resp_body);
+            return err;
+        };
     }
 
     fn supportsNativeToolsImpl(ptr: *anyopaque) bool {

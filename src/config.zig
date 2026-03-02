@@ -60,6 +60,7 @@ pub const SignalConfig = config_types.SignalConfig;
 pub const EmailConfig = config_types.EmailConfig;
 pub const LineConfig = config_types.LineConfig;
 pub const QQGroupPolicy = config_types.QQGroupPolicy;
+pub const QQReceiveMode = config_types.QQReceiveMode;
 pub const QQConfig = config_types.QQConfig;
 pub const OneBotConfig = config_types.OneBotConfig;
 pub const MaixCamConfig = config_types.MaixCamConfig;
@@ -806,6 +807,8 @@ pub const Config = struct {
         InvalidWebTransport,
         InvalidWebPath,
         InvalidWebAuthToken,
+        InvalidWebMessageAuthMode,
+        InvalidWebMessageAuthTransport,
         InvalidWebOrigin,
         MissingWebRelayUrl,
         InvalidWebRelayUrl,
@@ -871,6 +874,12 @@ pub const Config = struct {
                     return ValidationError.InvalidWebAuthToken;
                 }
             }
+            if (!config_types.WebConfig.isValidMessageAuthMode(web_cfg.message_auth_mode)) {
+                return ValidationError.InvalidWebMessageAuthMode;
+            }
+            if (relay_transport and config_types.WebConfig.isTokenMessageAuthMode(web_cfg.message_auth_mode)) {
+                return ValidationError.InvalidWebMessageAuthTransport;
+            }
             if (relay_transport) {
                 const relay_url = web_cfg.relay_url orelse return ValidationError.MissingWebRelayUrl;
                 if (!config_types.WebConfig.isValidRelayUrl(relay_url)) {
@@ -927,6 +936,8 @@ pub const Config = struct {
             ValidationError.InvalidWebTransport => std.debug.print("Config error: channels.web.accounts.<id>.transport must be 'local' or 'relay'.\n", .{}),
             ValidationError.InvalidWebPath => std.debug.print("Config error: channels.web.accounts.<id>.path must start with '/'.\n", .{}),
             ValidationError.InvalidWebAuthToken => std.debug.print("Config error: channels.web.accounts.<id>.auth_token/relay_token must be 16-128 printable chars without whitespace.\n", .{}),
+            ValidationError.InvalidWebMessageAuthMode => std.debug.print("Config error: channels.web.accounts.<id>.message_auth_mode must be 'pairing' or 'token'.\n", .{}),
+            ValidationError.InvalidWebMessageAuthTransport => std.debug.print("Config error: channels.web.accounts.<id>.message_auth_mode='token' is supported only when transport='local'.\n", .{}),
             ValidationError.InvalidWebOrigin => std.debug.print("Config error: channels.web.accounts.<id>.allowed_origins entries must be '*', 'null', or absolute origins (scheme://...).\n", .{}),
             ValidationError.MissingWebRelayUrl => std.debug.print("Config error: channels.web.accounts.<id>.relay_url is required when transport='relay'.\n", .{}),
             ValidationError.InvalidWebRelayUrl => std.debug.print("Config error: channels.web.accounts.<id>.relay_url must be an absolute wss:// URL.\n", .{}),
@@ -1476,6 +1487,7 @@ test "save roundtrip preserves extended config sections" {
     cfg.scheduler.enabled = false;
     cfg.scheduler.max_tasks = 32;
     cfg.scheduler.max_concurrent = 2;
+    cfg.scheduler.agent_timeout_secs = 123;
 
     cfg.agent.compact_context = true;
     cfg.agent.max_tool_iterations = 7;
@@ -1599,6 +1611,7 @@ test "save roundtrip preserves extended config sections" {
 
     try std.testing.expectEqualStrings("docker", loaded.runtime.kind);
     try std.testing.expectEqual(@as(u32, 32), loaded.scheduler.max_tasks);
+    try std.testing.expectEqual(@as(u64, 123), loaded.scheduler.agent_timeout_secs);
     try std.testing.expect(loaded.agent.parallel_tools);
 
     try std.testing.expectEqualStrings("openai", loaded.memory.search.provider);
@@ -1970,6 +1983,48 @@ test "validation rejects unknown web transport mode" {
     try std.testing.expectError(Config.ValidationError.InvalidWebTransport, cfg.validate());
 }
 
+test "validation rejects unsupported web message_auth_mode value" {
+    const web_accounts = [_]WebConfig{
+        .{
+            .account_id = "default",
+            .message_auth_mode = "jwt",
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .web = &web_accounts,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidWebMessageAuthMode, cfg.validate());
+}
+
+test "validation rejects token message_auth_mode for relay transport" {
+    const web_accounts = [_]WebConfig{
+        .{
+            .account_id = "default",
+            .transport = "relay",
+            .message_auth_mode = "token",
+            .relay_url = "wss://relay.nullclaw.io/ws/agent",
+            .relay_agent_id = "agent-1",
+            .relay_token = "relay-token-0123456789",
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .web = &web_accounts,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidWebMessageAuthTransport, cfg.validate());
+}
+
 test "validation rejects relay transport without relay_url" {
     const web_accounts = [_]WebConfig{
         .{
@@ -2144,13 +2199,14 @@ test "json parse diagnostics section" {
 test "json parse scheduler section" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"scheduler": {"enabled": false, "max_tasks": 128, "max_concurrent": 8}}
+        \\{"scheduler": {"enabled": false, "max_tasks": 128, "max_concurrent": 8, "agent_timeout_secs": 600}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
     try std.testing.expect(!cfg.scheduler.enabled);
     try std.testing.expectEqual(@as(u32, 128), cfg.scheduler.max_tasks);
     try std.testing.expectEqual(@as(u32, 8), cfg.scheduler.max_concurrent);
+    try std.testing.expectEqual(@as(u64, 600), cfg.scheduler.agent_timeout_secs);
 }
 
 test "json parse agent section" {
@@ -3280,13 +3336,15 @@ test "parse qq accounts include allowlist and allowed_groups" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const json =
-        \\{"channels": {"qq": {"accounts": {"qq-backup": {"app_id": "app2", "bot_token": "tok2"}, "qq-main": {"app_id": "app1", "app_secret": "sec1", "bot_token": "tok1", "group_policy": "allowlist", "allowed_groups": ["group-a", "group-b"], "allow_from": ["user-a"]}}}}}
+        \\{"channels": {"qq": {"accounts": {"qq-backup": {"app_id": "app2", "bot_token": "tok2"}, "qq-main": {"app_id": "app1", "app_secret": "sec1", "bot_token": "tok1", "receive_mode": "websocket", "group_policy": "allowlist", "allowed_groups": ["group-a", "group-b"], "allow_from": ["user-a"]}}}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
     try std.testing.expectEqual(@as(usize, 2), cfg.channels.qq.len);
     try std.testing.expectEqualStrings("qq-backup", cfg.channels.qq[0].account_id);
     try std.testing.expectEqualStrings("qq-main", cfg.channels.qq[1].account_id);
+    try std.testing.expectEqual(config_types.QQReceiveMode.webhook, cfg.channels.qq[0].receive_mode);
+    try std.testing.expectEqual(config_types.QQReceiveMode.websocket, cfg.channels.qq[1].receive_mode);
     try std.testing.expectEqual(config_types.QQGroupPolicy.allowlist, cfg.channels.qq[1].group_policy);
     try std.testing.expectEqual(@as(usize, 2), cfg.channels.qq[1].allowed_groups.len);
     try std.testing.expectEqualStrings("group-a", cfg.channels.qq[1].allowed_groups[0]);
@@ -3358,6 +3416,7 @@ test "parse web accounts with auth token path and allowed origins" {
     try std.testing.expectEqual(@as(u16, 32123), wc.port);
     try std.testing.expectEqualStrings("/ws", wc.path);
     try std.testing.expectEqualStrings("relay-token-123456", wc.auth_token.?);
+    try std.testing.expectEqualStrings("pairing", wc.message_auth_mode);
     try std.testing.expectEqual(@as(usize, 2), wc.allowed_origins.len);
     try std.testing.expectEqualStrings("https://relay.nullclaw.io", wc.allowed_origins[0]);
     try std.testing.expectEqualStrings("chrome-extension://abc", wc.allowed_origins[1]);
@@ -3368,6 +3427,27 @@ test "parse web accounts with auth token path and allowed origins" {
     allocator.free(wc.auth_token.?);
     for (wc.allowed_origins) |origin| allocator.free(origin);
     allocator.free(wc.allowed_origins);
+    allocator.free(cfg.channels.web);
+}
+
+test "parse web account with token message auth mode" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"channels": {"web": {"accounts": {"default": {"listen": "127.0.0.1", "port": 32123, "path": "/ws", "auth_token": "token-mode-1234567890", "message_auth_mode": "token"}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.channels.web.len);
+    const wc = cfg.channels.web[0];
+    try std.testing.expectEqualStrings("token", wc.message_auth_mode);
+    try std.testing.expectEqualStrings("token-mode-1234567890", wc.auth_token.?);
+
+    allocator.free(wc.account_id);
+    allocator.free(wc.listen);
+    allocator.free(wc.path);
+    allocator.free(wc.auth_token.?);
+    allocator.free(wc.message_auth_mode);
     allocator.free(cfg.channels.web);
 }
 

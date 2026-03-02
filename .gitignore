@@ -7,6 +7,7 @@ zig-cache/
 .env
 .env.*
 !.env.example
+!.env.signal.example
 *.swp
 *~
 *.bak
@@ -16,3 +17,4 @@ reference/
 result
 .direnv/
 .worktrees
+config.signal.json
