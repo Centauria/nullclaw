@@ -8,6 +8,7 @@ RUN apk add --no-cache zig musl-dev
 WORKDIR /app
 COPY build.zig build.zig.zon ./
 COPY src/ src/
+COPY vendor/sqlite3/ vendor/sqlite3/
 
 ARG TARGETARCH
 RUN set -eu; \
